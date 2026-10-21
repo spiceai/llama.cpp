@@ -1,0 +1,21 @@
+# Spice.ai packaging: lets Cargo fetch this llama.cpp release as a git dependency, pinned
+# by commit. The package only reports where the sources are; Spice's `llama-cpp` crate
+# builds them. See spiceai/README.md.
+[package]
+name = "llama-cpp-src"
+version = "0.1.11803"
+edition = "2021"
+license = "MIT"
+description = "The llama.cpp sources of release b11803, for Spice.ai's llama-cpp crate to build"
+repository = "https://github.com/spiceai/llama.cpp"
+publish = false
+links = "llama_cpp_src"
+build = "spiceai/build.rs"
+# The C++ tree has examples/, tests/ and benches/ directories of its own; they are not Rust targets.
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+path = "spiceai/lib.rs"
