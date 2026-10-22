@@ -12,7 +12,8 @@ to a new release:
 ```bash
 git fetch https://github.com/ggml-org/llama.cpp refs/tags/<release>:refs/tags/<release>
 git checkout -b spiceai-<release> <release>
-git cherry-pick <release>..spiceai-<previous release>   # the previous branch's packaging commits
+# the previous branch's packaging commits, oldest first, without the merge commits PRs leave
+git rev-list --reverse --topo-order --no-merges <previous release>..spiceai-<previous release> | git cherry-pick --stdin
 # set the release in spiceai/release.rs, and the version and description in Cargo.toml
 git tag <release>-spiceai.1
 git push origin spiceai-<release> refs/tags/<release>-spiceai.1
