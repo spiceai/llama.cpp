@@ -286,9 +286,9 @@ __host__ __device__ constexpr inline void ggml_unused_vars_impl(Args&&...) noexc
 
 #if defined(__cplusplus) && defined(GGML_ABORT_THROWS)
 // Spice.ai: a library that parses files it does not control defines GGML_ABORT_THROWS, so a
-// failed check throws a std::runtime_error that its C API boundary catches and reports,
-// rather than aborting the process. Only that library's C++ sources see this definition;
-// ggml itself, and every other target, still aborts.
+// failed check goes to its ggml_abort_throw. That throws a std::runtime_error only where the
+// library catches it at its C API boundary, and otherwise aborts as ggml_abort does. Only that
+// library's C++ sources see this definition; ggml itself, and every other target, still aborts.
 GGML_NORETURN void ggml_abort_throw(const char * file, int line, const char * fmt, ...)
     GGML_ATTRIBUTE_FORMAT(3, 4);
 #define GGML_ABORT(...) ggml_abort_throw(__FILE__, __LINE__, __VA_ARGS__)

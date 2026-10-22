@@ -213,15 +213,29 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, size_t m
     }
 }
 
-// Spice.ai: GGML_ABORT for libllama's sources, which define GGML_ABORT_THROWS (see ggml.h).
-// llama.cpp's C API functions catch std::exception, so a file whose contents fail a check
-// fails the call that read it instead of aborting the process.
+// Spice.ai: GGML_ABORT for libllama's sources, which define GGML_ABORT_THROWS (see ggml.h). It
+// throws only inside a llama_abort_throws_scope, which model loading opens where its try block
+// catches the exception, so a file whose contents fail a check fails its load. Anywhere else a
+// failed check aborts, since the C API functions that reach it do not catch exceptions.
+static thread_local int g_abort_throws_depth = 0;
+
+llama_abort_throws_scope::llama_abort_throws_scope() {
+    ++g_abort_throws_depth;
+}
+
+llama_abort_throws_scope::~llama_abort_throws_scope() {
+    --g_abort_throws_depth;
+}
+
 void ggml_abort_throw(const char * file, int line, const char * fmt, ...) {
     char message[2048];
     va_list args;
     va_start(args, fmt);
     vsnprintf(message, sizeof(message), fmt, args);
     va_end(args);
+    if (g_abort_throws_depth == 0) {
+        ggml_abort(file, line, "%s", message);
+    }
     char located[2304];
     snprintf(located, sizeof(located), "%s:%d: %s", file, line, message);
     throw std::runtime_error(located);

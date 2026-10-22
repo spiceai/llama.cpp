@@ -6,12 +6,15 @@ dependency, which Spice.ai's `llama-cpp` crate builds with CMake.
 
 It also carries one source patch, which each Spice branch must keep:
 
-- **A failed check in libllama throws instead of aborting.** libllama defines
-  `GGML_ABORT_THROWS` (`src/CMakeLists.txt`), so its `GGML_ASSERT`s throw a
-  `std::runtime_error` (`ggml_abort_throw` in `src/llama-impl.cpp`, declared in
-  `ggml/include/ggml.h`). llama.cpp's C API catches it, so a GGUF whose metadata fails a check
-  fails its load rather than aborting the process. Spice's `llama-cpp` crate tests this with
-  a crafted GGUF.
+- **A failed check while loading a model throws instead of aborting.** libllama defines
+  `GGML_ABORT_THROWS` (`src/CMakeLists.txt`), so its `GGML_ASSERT`s go to `ggml_abort_throw`
+  (`src/llama-impl.cpp`, declared in `ggml/include/ggml.h`). That throws a
+  `std::runtime_error` only inside a `llama_abort_throws_scope` (`src/llama-impl.h`), which
+  `llama_model_load` (`src/llama.cpp`) opens in the try block that turns an exception into a
+  failed load, so a GGUF whose metadata fails a check fails its load rather than aborting the
+  process. Everywhere else, and on every other thread, a failed check aborts as upstream: the
+  C API functions that reach those checks do not catch exceptions. Spice's `llama-cpp` crate
+  tests the load path with crafted and corrupted GGUFs.
 
 Each Spice branch is `spiceai-<release>`, cut from the upstream release tag with the
 Spice commits on top. Its tip is tagged `<release>-spiceai.<n>`, a name apart from the
