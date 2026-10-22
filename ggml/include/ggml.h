@@ -284,7 +284,17 @@ __host__ __device__ constexpr inline void ggml_unused_vars_impl(Args&&...) noexc
 #   define GGML_NORETURN _Noreturn
 #endif
 
+#if defined(__cplusplus) && defined(GGML_ABORT_THROWS)
+// Spice.ai: a library that parses files it does not control defines GGML_ABORT_THROWS, so a
+// failed check throws a std::runtime_error that its C API boundary catches and reports,
+// rather than aborting the process. Only that library's C++ sources see this definition;
+// ggml itself, and every other target, still aborts.
+GGML_NORETURN void ggml_abort_throw(const char * file, int line, const char * fmt, ...)
+    GGML_ATTRIBUTE_FORMAT(3, 4);
+#define GGML_ABORT(...) ggml_abort_throw(__FILE__, __LINE__, __VA_ARGS__)
+#else
 #define GGML_ABORT(...) ggml_abort(__FILE__, __LINE__, __VA_ARGS__)
+#endif
 #define GGML_ASSERT(x) if (!(x)) GGML_ABORT("GGML_ASSERT(%s) failed", #x)
 
 // used to copy the number of elements and stride in bytes of tensors into local variables.

@@ -10,6 +10,7 @@
 #include <climits>
 #include <cstdarg>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 struct llama_logger_state {
@@ -210,4 +211,18 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, size_t m
         default:
             return gguf_data_to_str(type, gguf_get_val_data(ctx_gguf, i), 0);
     }
+}
+
+// Spice.ai: GGML_ABORT for libllama's sources, which define GGML_ABORT_THROWS (see ggml.h).
+// llama.cpp's C API functions catch std::exception, so a file whose contents fail a check
+// fails the call that read it instead of aborting the process.
+void ggml_abort_throw(const char * file, int line, const char * fmt, ...) {
+    char message[2048];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+    char located[2304];
+    snprintf(located, sizeof(located), "%s:%d: %s", file, line, message);
+    throw std::runtime_error(located);
 }
