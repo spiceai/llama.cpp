@@ -31,6 +31,17 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
 #define LLAMA_LOG_DEBUG(...) llama_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
 #define LLAMA_LOG_CONT(...)  llama_log_internal(GGML_LOG_LEVEL_CONT , __VA_ARGS__)
 
+// Spice.ai: while one is alive on a thread, a failed check in libllama's sources throws a
+// std::runtime_error instead of aborting (GGML_ABORT_THROWS in ggml.h). Model loading opens
+// one inside the try block that turns the exception into a failed load; everywhere else, and
+// on every other thread, a failed check aborts as it does upstream.
+struct llama_abort_throws_scope {
+    llama_abort_throws_scope();
+    ~llama_abort_throws_scope();
+    llama_abort_throws_scope(const llama_abort_throws_scope &) = delete;
+    llama_abort_throws_scope & operator=(const llama_abort_throws_scope &) = delete;
+};
+
 //
 // helpers
 //
