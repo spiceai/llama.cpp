@@ -3021,6 +3021,10 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         return nullptr;
     }
     const uint32_t comm_port = (uint32_t) port0 + 1000;
+    // rank 1 reaches rank 0 at this address instead, e.g. rank 0 on the link the two share
+    if (const char * comm_host = std::getenv("GGML_RPC_COMM_HOST")) {
+        host0 = comm_host;
+    }
     if (host0.size() >= 64) {
         return nullptr;
     }
