@@ -22,7 +22,9 @@ It also carries these source patches, which each Spice branch must keep until up
 - **Fixes on top of #30817**, not upstream. A GGUF whose `attention.output_group_count` is 0 fails its load
   instead of dividing by zero (`src/models/deepseek4.cpp`, which `deepseek41` shares), and one whose Engram head
   offset plus bucket count passes `INT32_MAX` fails its load instead of wrapping and aborting in the first decode
-  (`src/models/deepseek41.cpp`). `deepseek41v` image preprocessing (`tools/mtmd/mtmd-image.cpp`) counts the tokens
+  (`src/models/deepseek41.cpp`), whose output projection also applies a LoRA adapter on `output.weight`.
+  `ggml_validate_row_data` rejects MXFP8 blocks with an E4M3 NaN code (`ggml/src/ggml-quants.c`), so
+  `--check-tensors` catches them. `deepseek41v` image preprocessing (`tools/mtmd/mtmd-image.cpp`) counts the tokens
   of a placeholder bitmap, and pads an image too thin to keep a pixel at the planned size with the pad color alone,
   as Pillow's `ImageOps.pad` does, instead of failing. With `convert_hf_to_gguf.py --remote`,
   `conversion/deepseek41.py` reads the Engram tables by HTTP range instead of from shards it never downloaded.
