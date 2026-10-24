@@ -1441,6 +1441,9 @@ private:
         size_t                  scratch_size = 0;
         std::vector<uint8_t>    send_buf;
         std::vector<uint8_t>    recv_buf;
+        void *                  nccl = nullptr;                // NCCL communicator with the peer (GGML_RPC_COMM_NCCL=1)
+        bool                  (*nccl_allreduce)(ggml_backend_t, void *, ggml_tensor *) = nullptr;
+        void                  (*nccl_free)(void *) = nullptr;
     };
 
     std::vector<ggml_backend_t> backends;
@@ -2221,6 +2224,18 @@ void rpc_server::sync_all_backends() {
 
 // The comm link between two servers uses the same caps negotiation as the client HELLO,
 // so it gets the same transport upgrades (e.g. RDMA).
+// NCCL between the two servers of the pairwise comm, through the CUDA backend's exports
+typedef bool   (*rpc_nccl_unique_id_t)(void * out, size_t size);
+typedef void * (*rpc_nccl_comm_init_rank_t)(ggml_backend_t backend, const void * id, int nranks, int rank);
+typedef void   (*rpc_nccl_comm_free_t)(void * comm);
+typedef bool   (*rpc_nccl_allreduce_t)(ggml_backend_t backend, void * comm, ggml_tensor * t);
+
+static void * rpc_backend_proc(ggml_backend_t backend, const char * name) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg != nullptr ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+
 bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response) {
     response.ok = 0;
     if (request.device >= backends.size() || request.world != 2 || request.rank >= request.world) {
@@ -2276,6 +2291,37 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
     }
     state.rank  = request.rank;
     state.world = request.world;
+
+    // GGML_RPC_COMM_NCCL=1: reduce on the device with NCCL, queued on the backend's stream, instead of copying each
+    // partial to the host and exchanging it over the peer connection. Both ranks agree first, because
+    // ncclCommInitRank waits for every rank to join.
+    static const bool use_nccl = [] {
+        const char * v = std::getenv("GGML_RPC_COMM_NCCL");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (use_nccl) {
+        ggml_backend_t backend = backends[request.device];
+        auto unique_id = (rpc_nccl_unique_id_t)      rpc_backend_proc(backend, "ggml_backend_cuda_nccl_unique_id");
+        auto init_rank = (rpc_nccl_comm_init_rank_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_init_rank");
+        state.nccl_allreduce = (rpc_nccl_allreduce_t)  rpc_backend_proc(backend, "ggml_backend_cuda_nccl_allreduce");
+        state.nccl_free      = (rpc_nccl_comm_free_t)  rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_free");
+        uint8_t ok = unique_id != nullptr && init_rank != nullptr && state.nccl_allreduce != nullptr && state.nccl_free != nullptr;
+        uint8_t peer_ok = 0;
+        uint8_t id[128] = {};
+        bool sent;
+        if (request.rank == 0) {
+            ok = ok && unique_id(id, sizeof(id));
+            sent = state.peer->send_data(&ok, 1) && state.peer->send_data(id, sizeof(id)) && state.peer->flush() &&
+                   state.peer->recv_data(&peer_ok, 1);
+        } else {
+            sent = state.peer->recv_data(&peer_ok, 1) && state.peer->recv_data(id, sizeof(id)) &&
+                   state.peer->send_data(&ok, 1) && state.peer->flush();
+        }
+        if (sent && ok && peer_ok) {
+            state.nccl = init_rank(backend, id, (int) request.world, (int) request.rank);
+        }
+        LOG_INFO("[%s] device %u NCCL all-reduce %s\n", __func__, request.device, state.nccl != nullptr ? "on" : "unavailable, copying through the host");
+    }
     LOG_INFO("[%s] device %u joined pairwise comm as rank %u\n", __func__, request.device, request.rank);
     response.ok = 1;
     return true;
@@ -2310,6 +2356,9 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     const int64_t ne     = ggml_nelements(t_dst);
     if (nbytes == 0) {
         return true;
+    }
+    if (state.nccl != nullptr) {
+        return state.nccl_allreduce(backend, state.nccl, t_dst);
     }
     // reduce large partials in bf16 to halve the wire bytes; small (decode-sized) ones
     // stay f32 since the extra casts and sync cost more than the bytes saved
@@ -2409,6 +2458,10 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
 bool rpc_server::comm_free(const rpc_msg_comm_free_req & request) {
     if (request.device >= backends.size()) {
         return false;
+    }
+    comm_state & state = comm_states[request.device];
+    if (state.nccl != nullptr) {
+        state.nccl_free(state.nccl);
     }
     comm_states[request.device] = comm_state();
     return true;
