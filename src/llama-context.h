@@ -365,6 +365,9 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    // LLAMA_GRAPH_SLOTS=2: the scheduler of the graph slot not in use, swapped with sched when the slot changes
+    ggml_backend_sched_ptr sched_alt;
+    int                    sched_slot = 0;
 
     bool sched_need_reserve = true;
 
@@ -416,6 +419,7 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+    llm_graph_result * gf_res_prev_active_alt = nullptr; // the graph sched_alt last allocated
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
