@@ -14,9 +14,11 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -720,6 +722,31 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
+// LLAMA_GRAPH_SLOTS: "2" gives each context a second scheduler, so a context alternating between two graphs reuses
+// both; "flag:<path>" uses the second only while <path> exists (re-checked at most every 100 ms)
+static const std::string & llama_graph_slots_mode() {
+    static const std::string mode = [] {
+        const char * v = getenv("LLAMA_GRAPH_SLOTS");
+        return std::string(v != nullptr ? v : "");
+    }();
+    return mode;
+}
+
+static bool llama_graph_slots_on() {
+    const std::string & mode = llama_graph_slots_mode();
+    if (mode.rfind("flag:", 0) == 0) {
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(std::filesystem::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return atoi(mode.c_str()) >= 2;
+}
+
 void llama_context::sched_new(size_t max_nodes, bool parallel) {
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
@@ -728,10 +755,7 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
     // LLAMA_GRAPH_SLOTS=2: one scheduler per graph slot, so a context alternating between two graphs reuses both
-    static const bool graph_slots = [] {
-        const char * v = getenv("LLAMA_GRAPH_SLOTS");
-        return v != nullptr && atoi(v) >= 2;
-    }();
+    const bool graph_slots = llama_graph_slots_mode().rfind("flag:", 0) == 0 || atoi(llama_graph_slots_mode().c_str()) >= 2;
     sched_alt.reset();
     sched_slot = 0;
     gf_res_prev_active_alt = nullptr;
@@ -1547,7 +1571,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // with LLAMA_GRAPH_SLOTS=2 each graph slot has its own scheduler: switch to this ubatch's
     if (sched_alt) {
-        const int slot = n_outputs > 0;
+        const int slot = llama_graph_slots_on() && n_outputs > 0;
         if (slot != sched_slot) {
             std::swap(sched, sched_alt);
             std::swap(gf_res_prev_active, gf_res_prev_active_alt);
