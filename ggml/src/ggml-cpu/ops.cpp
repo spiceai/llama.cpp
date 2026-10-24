@@ -11556,8 +11556,13 @@ static void ggml_compute_forward_dsv4_hc_comb_f32(
                 const float bp = *(const float *) ((const char *) base->data  + h*nbb0);
                 const float mq = *(const float *) ((const char *) mixes->data + (hc + h)*nbm0 + it*nbm1);
                 const float bq = *(const float *) ((const char *) base->data  + (hc + h)*nbb0);
-                const float pre  = 1.0f / (1.0f + expf(-(mp*scale_pre + bp)));
-                const float post = 1.0f / (1.0f + expf(-(mq*scale_post + bq)));
+                // round each product to F32 before adding the base, as the separate MUL and ADD nodes do (the CUDA kernel
+                // uses __fmul_rn and __fadd_rn): a compiler that contracts the two into a fused multiply-add rounds once,
+                // which changes the weights
+                const volatile float sp = mp*scale_pre;
+                const volatile float sq = mq*scale_post;
+                const float pre  = 1.0f / (1.0f + expf(-(sp + bp)));
+                const float post = 1.0f / (1.0f + expf(-(sq + bq)));
                 *(float *) ((char *) dst->data + h*nbd0 + it*nbd1)        = pre + pre_eps;
                 *(float *) ((char *) dst->data + (hc + h)*nbd0 + it*nbd1) = post_scale*post;
             }
