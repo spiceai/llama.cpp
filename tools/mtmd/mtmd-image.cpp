@@ -1498,8 +1498,13 @@ mtmd_image_preproc_out mtmd_image_preprocessor_deepseek41v::preprocess(const cli
             new_w = round_half_even((double) orig.width / orig.height * best_height);
         }
     }
+    // a side that rounds to 0 (a very thin image) makes ImageOps.contain return an empty image, which pad leaves as
+    // the pad color alone
+    const bool contained_empty = new_w <= 0 || new_h <= 0;
     clip_image_u8 resized;
-    img_tool::resize(img, resized, {new_w, new_h}, hparams.image_resize_algo, PAD_NONE);
+    if (!contained_empty) {
+        img_tool::resize(img, resized, {new_w, new_h}, hparams.image_resize_algo, PAD_NONE);
+    }
 
     clip_image_u8 padded;
     if (new_w == best_width && new_h == best_height) {
@@ -1508,16 +1513,21 @@ mtmd_image_preproc_out mtmd_image_preprocessor_deepseek41v::preprocess(const cli
         padded.set_size({best_width, best_height}, img.is_placeholder());
         if (!img.is_placeholder()) {
             img_tool::fill(padded, hparams.image_pad_color);
-            const int off_x = round_half_even((best_width  - new_w) * 0.5);
-            const int off_y = round_half_even((best_height - new_h) * 0.5);
-            img_tool::composite(padded, resized, off_x, off_y);
+            if (!contained_empty) {
+                const int off_x = round_half_even((best_width  - new_w) * 0.5);
+                const int off_y = round_half_even((best_height - new_h) * 0.5);
+                img_tool::composite(padded, resized, off_x, off_y);
+            }
         }
     }
 
     out.append(hparams, padded);
 
-    // load_image rounds the normalized input to bf16 (round to nearest even)
+    // load_image rounds the normalized input to bf16 (round to nearest even); a placeholder (token counting) has no pixels
     for (auto & e : out.entries) {
+        if (e.is_placeholder()) {
+            continue;
+        }
         std::vector<float> buf = e.get_ro_buf();
         for (float & v : buf) {
             v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));
