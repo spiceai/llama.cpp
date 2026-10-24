@@ -49,9 +49,10 @@ It also carries these source patches, which each Spice branch must keep until up
   through NCCL when both rpc-servers can, and `GGML_RPC_COMM_WIRE_F32=1` keeps the host all-reduce's partials in
   F32, both sent to the two servers in `COMM_INIT` (`ggml/src/ggml-rpc/ggml-rpc.cpp`); `GGML_RPC_SET_ASYNC=1` on
   the client queues buffer writes without waiting; `LLAMA_DSV4_SHEXP_SHIFT=<rows>` moves shared-expert rows to the
-  rank with the lighter expert split (`src/llama-model.cpp`). With `GGML_RPC_COMM_NCCL` or `GGML_RPC_COMM_WIRE_F32`
-  set, both rpc-servers must come from this branch, since an older server refuses the longer `COMM_INIT`; with
-  neither set, `COMM_INIT` is upstream's. Drop each once upstream has an equivalent.
+  rank with the lighter expert split, only when `tensor_split` is unset or equal, and leaves an uneven split as given
+  (`src/llama-model.cpp`). With `GGML_RPC_COMM_NCCL` or `GGML_RPC_COMM_WIRE_F32` set, both rpc-servers must come
+  from this branch, since an older server refuses the longer `COMM_INIT`; with neither set, `COMM_INIT` is
+  upstream's. Drop each once upstream has an equivalent.
 
 Each Spice branch is `spiceai-<release>`, cut from the upstream release tag with the
 Spice commits on top. Its tip is tagged `<release>-spiceai.<n>`, a name apart from the

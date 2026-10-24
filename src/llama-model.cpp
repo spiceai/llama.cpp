@@ -897,18 +897,21 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         split_state.n_segments = segments.size();
 
-        // LLAMA_DSV4_SHEXP_SHIFT=<rows>: give the expert-light rank more of the shared expert (see patch notes)
+        // LLAMA_DSV4_SHEXP_SHIFT=<rows>: give the expert-light rank more of the shared expert (see patch notes). Only with an
+        // unset or equal tensor_split: with an uneven one, which rank is lighter depends on whether the split stands for
+        // device speed or memory, so an uneven split is left as given
         static const int64_t dsv4_shexp_shift = [] {
             const char * v = getenv("LLAMA_DSV4_SHEXP_SHIFT");
             return v != nullptr ? (int64_t) atoll(v) : (int64_t) 0;
         }();
-        if (is_dsv4 && dsv4_shexp_shift > 0 && ud->n_devices == 2 && segments.size() == 1 &&
+        const bool even_split = tensor_split_scan.back() == 0.0f || 2.0f*tensor_split_scan[0] == tensor_split_scan.back();
+        if (is_dsv4 && dsv4_shexp_shift > 0 && ud->n_devices == 2 && segments.size() == 1 && even_split &&
                 (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) || std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                  std::regex_match(tensor_name, pattern_ffn_down_shexp_weight))) {
             const ggml_tensor * exps = ud->model->get_tensor(("blk." + std::to_string(tc.il) + ".ffn_down_exps.weight").c_str());
             if (exps != nullptr) {
                 // the routed split of this layer as the loop above computes it (the same rotation and tensor_split): the
-                // first device's share is rounded down to the granularity, so when rounding removed rows it is the lighter one
+                // first device's half is rounded down to the granularity, so when rounding removed rows it has fewer rows
                 const int64_t ge     = std::lcm((int64_t) ggml_blck_size(exps->type), (int64_t) 128);
                 const int64_t ne_e   = exps->ne[0];
                 const int64_t high_e = tensor_split_scan.back() == 0.0f ?
