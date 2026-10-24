@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <cinttypes>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <thread>
@@ -258,8 +259,13 @@ struct rpc_msg_comm_init_req {
     uint32_t world;
     uint32_t port;      // rank 0: port to listen on; rank > 0: rank 0's comm port
     char     host[64];  // rank > 0: rank 0's host
-    uint32_t flags;     // RPC_COMM_FLAG_*, the same for every rank
+    uint32_t flags;     // RPC_COMM_FLAG_*, the same for every rank; sent only when one is set
 };
+
+// a COMM_INIT with no RPC_COMM_FLAG_* set is upstream's request, without the flags, so that a client that sets no
+// flag and a server without them (or the reverse) still agree on its size
+static constexpr size_t RPC_COMM_INIT_REQ_SIZE_NO_FLAGS = offsetof(rpc_msg_comm_init_req, flags);
+static_assert(RPC_COMM_INIT_REQ_SIZE_NO_FLAGS == 80, "COMM_INIT without flags must stay upstream's 80 bytes");
 
 struct rpc_msg_comm_init_rsp {
     uint8_t ok;
@@ -344,6 +350,19 @@ static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
         return false;
     }
     return sock->recv_data(msg, msg_size);
+}
+
+// COMM_INIT comes in either size: with the flags, or upstream's request without them (no flag set)
+static bool recv_comm_init_req(socket_ptr sock, rpc_msg_comm_init_req & request) {
+    uint64_t size;
+    if (!sock->recv_data(&size, sizeof(size))) {
+        return false;
+    }
+    if (size != sizeof(request) && size != RPC_COMM_INIT_REQ_SIZE_NO_FLAGS) {
+        return false;
+    }
+    request = {};
+    return sock->recv_data(&request, size);
 }
 
 static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
@@ -1467,7 +1486,8 @@ private:
         bool                    wire_f32 = false;              // send every host-path partial as F32 (RPC_COMM_FLAG_WIRE_F32)
         void *                  nccl = nullptr;                // NCCL communicator with the peer (RPC_COMM_FLAG_NCCL)
         bool                  (*nccl_allreduce)(ggml_backend_t, void *, ggml_tensor *) = nullptr;
-        void                  (*nccl_free)(void *) = nullptr;
+        void                  (*nccl_free)(void *) = nullptr;   // COMM_FREE: both ranks free the communicator together
+        void                  (*nccl_abort)(void *) = nullptr;  // disconnect without COMM_FREE: the peer may not take part
     };
 
     std::vector<ggml_backend_t> backends;
@@ -2252,6 +2272,7 @@ void rpc_server::sync_all_backends() {
 typedef bool   (*rpc_nccl_unique_id_t)(void * out, size_t size);
 typedef void * (*rpc_nccl_comm_init_rank_t)(ggml_backend_t backend, const void * id, int nranks, int rank);
 typedef void   (*rpc_nccl_comm_free_t)(void * comm);
+typedef void   (*rpc_nccl_comm_abort_t)(void * comm);
 typedef bool   (*rpc_nccl_allreduce_t)(ggml_backend_t backend, void * comm, ggml_tensor * t);
 
 static void * rpc_backend_proc(ggml_backend_t backend, const char * name) {
@@ -2327,7 +2348,9 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
         auto init_rank = (rpc_nccl_comm_init_rank_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_init_rank");
         state.nccl_allreduce = (rpc_nccl_allreduce_t)  rpc_backend_proc(backend, "ggml_backend_cuda_nccl_allreduce");
         state.nccl_free      = (rpc_nccl_comm_free_t)  rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_free");
-        uint8_t ok = unique_id != nullptr && init_rank != nullptr && state.nccl_allreduce != nullptr && state.nccl_free != nullptr;
+        state.nccl_abort     = (rpc_nccl_comm_abort_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_abort");
+        uint8_t ok = unique_id != nullptr && init_rank != nullptr && state.nccl_allreduce != nullptr && state.nccl_free != nullptr &&
+                     state.nccl_abort != nullptr;
         uint8_t peer_ok = 0;
         uint8_t id[128] = {};
         bool sent;
@@ -2380,10 +2403,11 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         return true;
     }
     if (state.nccl != nullptr) {
-        // NCCL reduces ggml_nelements floats in place, so it takes only a dense F32 tensor (deserialize_tensor already
-        // keeps the tensor's bytes inside its buffer)
-        if (t_dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(t_dst)) {
-            LOG_ERROR("[%s] NCCL all-reduce needs a contiguous F32 tensor, got %s\n", __func__, ggml_type_name(t_dst->type));
+        // NCCL reduces ggml_nelements floats in place, so it takes only a dense F32 tensor whose floats are exactly the
+        // ggml_nbytes that deserialize_tensor kept inside the buffer; for a huge ne, ggml_nbytes wraps and is smaller
+        if (t_dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(t_dst) || nbytes / sizeof(float) != (size_t) ne) {
+            LOG_ERROR("[%s] NCCL all-reduce needs a contiguous F32 tensor whose size matches its element count, got %s with %" PRId64 " elements in %zu bytes\n",
+                      __func__, ggml_type_name(t_dst->type), ne, nbytes);
             return false;
         }
         return state.nccl_allreduce(backend, state.nccl, t_dst);
@@ -2507,11 +2531,14 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
-    // a client that disconnects without COMM_FREE still leaves no NCCL communicator behind
-    for (comm_state & state : comm_states) {
-        if (state.nccl != nullptr && state.nccl_free != nullptr) {
-            state.nccl_free(state.nccl);
+    // a client that disconnects without COMM_FREE still leaves no NCCL communicator behind; abort it rather than
+    // destroy it, since the client may have sent a collective to this rank only, which the peer never joins
+    for (size_t device = 0; device < comm_states.size(); device++) {
+        comm_state & state = comm_states[device];
+        if (state.nccl != nullptr && state.nccl_abort != nullptr) {
+            state.nccl_abort(state.nccl);
             state.nccl = nullptr;
+            LOG_INFO("[%s] device %zu: aborted the NCCL communicator the client left open\n", __func__, device);
         }
     }
     for (auto buffer : buffers) {
@@ -2793,7 +2820,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_COMM_INIT: {
                 rpc_msg_comm_init_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_comm_init_req(sock, request)) {
                     return;
                 }
                 rpc_msg_comm_init_rsp response;
@@ -3141,7 +3168,9 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         if (i > 0) {
             memcpy(request->host, host0.c_str(), host0.size());
         }
-        ranks[i].dispatcher->send_async(RPC_CMD_COMM_INIT, request, sizeof(*request), &responses[i], sizeof(responses[i]));
+        // with no flag set this is upstream's COMM_INIT, which a server without the flags also reads
+        const size_t request_size = comm_flags != 0 ? sizeof(*request) : RPC_COMM_INIT_REQ_SIZE_NO_FLAGS;
+        ranks[i].dispatcher->send_async(RPC_CMD_COMM_INIT, request, request_size, &responses[i], sizeof(responses[i]));
     }
     for (size_t i = 0; i < n_backends; i++) {
         ranks[i].dispatcher->synchronize();

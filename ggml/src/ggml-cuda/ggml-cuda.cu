@@ -6200,6 +6200,13 @@ static void ggml_backend_cuda_nccl_comm_free(void * comm) {
     }
 }
 
+// for a peer that may no longer take part: ends any collective still waiting on it instead of waiting for it
+static void ggml_backend_cuda_nccl_comm_abort(void * comm) {
+    if (comm != nullptr) {
+        ncclCommAbort((ncclComm_t) comm);
+    }
+}
+
 // sums the tensor in place across the communicator's ranks, queued on the backend's stream
 static bool ggml_backend_cuda_nccl_allreduce(ggml_backend_t backend, void * comm, ggml_tensor * t) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -6219,6 +6226,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_nccl_comm_free") == 0) {
         return (void *)ggml_backend_cuda_nccl_comm_free;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_comm_abort") == 0) {
+        return (void *)ggml_backend_cuda_nccl_comm_abort;
     }
     if (strcmp(name, "ggml_backend_cuda_nccl_allreduce") == 0) {
         return (void *)ggml_backend_cuda_nccl_allreduce;
