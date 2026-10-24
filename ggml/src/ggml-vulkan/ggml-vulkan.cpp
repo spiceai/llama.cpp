@@ -7195,6 +7195,10 @@ static uint32_t ggml_vk_nb_elem(const ggml_tensor * t, int i) {
 void ggml_vk_dsv4_hc_comb(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * mixes, const ggml_tensor * scale, const ggml_tensor * base, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_dsv4_hc_comb(" << mixes << ", " << scale << ", " << base << ", " << dst << ")");
 
+    // supports_op declines the weights mode (ggml_dsv4_hc_weights), but an RPC client cannot ask it and may still send
+    // that mode; its [24, n_tokens] result does not fit the 4x4-per-token kernel, so stop instead of writing past it
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 2) == 0 && "the DSV4_HC_COMB weights mode has no Vulkan kernel");
+
     vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_comb_f32;
     GGML_ASSERT(pipeline != nullptr);
 

@@ -52,7 +52,9 @@ It also carries these source patches, which each Spice branch must keep until up
   rank with the lighter expert split, only when `tensor_split` is unset or equal, and leaves an uneven split as given
   (`src/llama-model.cpp`). With `GGML_RPC_COMM_NCCL` or `GGML_RPC_COMM_WIRE_F32` set, both rpc-servers must come
   from this branch, since an older server refuses the longer `COMM_INIT`; with neither set, `COMM_INIT` is
-  upstream's. Drop each once upstream has an equivalent.
+  upstream's. Over RPC, `LLAMA_DSV4_HC_WEIGHTS=1` likewise needs rpc-servers from this branch on the CPU or CUDA
+  backend: an RPC device reports every op as supported, so a server whose backend lacks the mode aborts the graph.
+  Drop each once upstream has an equivalent.
 
 Each Spice branch is `spiceai-<release>`, cut from the upstream release tag with the
 Spice commits on top. Its tip is tagged `<release>-spiceai.<n>`, a name apart from the
