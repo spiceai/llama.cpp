@@ -248,12 +248,17 @@ struct rpc_msg_get_tensor_2d_req {
     uint64_t stride;
 };
 
+// RPC_COMM_FLAG_*: how the client asks both ranks to reduce, so the two servers always agree
+static constexpr uint32_t RPC_COMM_FLAG_NCCL     = 1u; // through NCCL when both servers can (GGML_RPC_COMM_NCCL=1)
+static constexpr uint32_t RPC_COMM_FLAG_WIRE_F32 = 2u; // host path: every partial as F32 (GGML_RPC_COMM_WIRE_F32=1)
+
 struct rpc_msg_comm_init_req {
     uint32_t device;
     uint32_t rank;
     uint32_t world;
     uint32_t port;      // rank 0: port to listen on; rank > 0: rank 0's comm port
     char     host[64];  // rank > 0: rank 0's host
+    uint32_t flags;     // RPC_COMM_FLAG_*, the same for every rank
 };
 
 struct rpc_msg_comm_init_rsp {
@@ -1459,7 +1464,8 @@ private:
         size_t                  scratch_size = 0;
         std::vector<uint8_t>    send_buf;
         std::vector<uint8_t>    recv_buf;
-        void *                  nccl = nullptr;                // NCCL communicator with the peer (GGML_RPC_COMM_NCCL=1)
+        bool                    wire_f32 = false;              // send every host-path partial as F32 (RPC_COMM_FLAG_WIRE_F32)
+        void *                  nccl = nullptr;                // NCCL communicator with the peer (RPC_COMM_FLAG_NCCL)
         bool                  (*nccl_allreduce)(ggml_backend_t, void *, ggml_tensor *) = nullptr;
         void                  (*nccl_free)(void *) = nullptr;
     };
@@ -2307,17 +2313,15 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
         }
         state.peer->update_caps(remote_caps);
     }
-    state.rank  = request.rank;
-    state.world = request.world;
+    state.rank     = request.rank;
+    state.world    = request.world;
+    state.wire_f32 = (request.flags & RPC_COMM_FLAG_WIRE_F32) != 0;
 
-    // GGML_RPC_COMM_NCCL=1: reduce on the device with NCCL, queued on the backend's stream, instead of copying each
-    // partial to the host and exchanging it over the peer connection. Both ranks agree first, because
+    // RPC_COMM_FLAG_NCCL: reduce on the device with NCCL, queued on the backend's stream, instead of copying each
+    // partial to the host and exchanging it over the peer connection. The client sends the same flags to both ranks,
+    // so both take this branch, and they agree on whether NCCL is available before initializing it, because
     // ncclCommInitRank waits for every rank to join.
-    static const bool use_nccl = [] {
-        const char * v = std::getenv("GGML_RPC_COMM_NCCL");
-        return v != nullptr && std::atoi(v) != 0;
-    }();
-    if (use_nccl) {
+    if ((request.flags & RPC_COMM_FLAG_NCCL) != 0) {
         ggml_backend_t backend = backends[request.device];
         auto unique_id = (rpc_nccl_unique_id_t)      rpc_backend_proc(backend, "ggml_backend_cuda_nccl_unique_id");
         auto init_rank = (rpc_nccl_comm_init_rank_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_init_rank");
@@ -2376,15 +2380,17 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         return true;
     }
     if (state.nccl != nullptr) {
+        // NCCL reduces ggml_nelements floats in place, so it takes only a dense F32 tensor (deserialize_tensor already
+        // keeps the tensor's bytes inside its buffer)
+        if (t_dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(t_dst)) {
+            LOG_ERROR("[%s] NCCL all-reduce needs a contiguous F32 tensor, got %s\n", __func__, ggml_type_name(t_dst->type));
+            return false;
+        }
         return state.nccl_allreduce(backend, state.nccl, t_dst);
     }
     // reduce large partials in bf16 to halve the wire bytes; small (decode-sized) ones
     // stay f32 since the extra casts and sync cost more than the bytes saved
-    static const bool wire_f32 = [] {
-        const char * v = std::getenv("GGML_RPC_COMM_WIRE_F32");
-        return v != nullptr && std::atoi(v) != 0;
-    }();
-    const bool   wire_bf16  = !wire_f32 && t_dst->type == GGML_TYPE_F32 && ne >= 32768;
+    const bool   wire_bf16  = !state.wire_f32 && t_dst->type == GGML_TYPE_F32 && ne >= 32768;
     const size_t wire_bytes = wire_bf16 ? (size_t) ne*2 : nbytes;
     const size_t need       = wire_bf16 ? 2*nbytes : nbytes;
     if (state.scratch_size < need) {
@@ -2501,6 +2507,13 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    // a client that disconnects without COMM_FREE still leaves no NCCL communicator behind
+    for (comm_state & state : comm_states) {
+        if (state.nccl != nullptr && state.nccl_free != nullptr) {
+            state.nccl_free(state.nccl);
+            state.nccl = nullptr;
+        }
+    }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
@@ -3096,6 +3109,13 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         return nullptr;
     }
     const uint32_t comm_port = (uint32_t) port0 + 1000;
+    // GGML_RPC_COMM_NCCL=1 / GGML_RPC_COMM_WIRE_F32=1 here, on the client, decide for both ranks
+    auto env_on = [](const char * name) {
+        const char * v = std::getenv(name);
+        return v != nullptr && std::atoi(v) != 0;
+    };
+    const uint32_t comm_flags = (env_on("GGML_RPC_COMM_NCCL")     ? RPC_COMM_FLAG_NCCL     : 0u) |
+                                (env_on("GGML_RPC_COMM_WIRE_F32") ? RPC_COMM_FLAG_WIRE_F32 : 0u);
     // rank 1 reaches rank 0 at this address instead, e.g. rank 0 on the link the two share
     if (const char * comm_host = std::getenv("GGML_RPC_COMM_HOST")) {
         host0 = comm_host;
@@ -3117,6 +3137,7 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         request->rank   = (uint32_t) i;
         request->world  = (uint32_t) n_backends;
         request->port   = comm_port;
+        request->flags  = comm_flags;
         if (i > 0) {
             memcpy(request->host, host0.c_str(), host0.size());
         }
