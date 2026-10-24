@@ -896,6 +896,34 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             split_state.nr[is] = nr_s;
         }
         split_state.n_segments = segments.size();
+
+        // LLAMA_DSV4_SHEXP_SHIFT=<rows>: give the expert-light rank more of the shared expert (see patch notes)
+        static const int64_t dsv4_shexp_shift = [] {
+            const char * v = getenv("LLAMA_DSV4_SHEXP_SHIFT");
+            return v != nullptr ? (int64_t) atoll(v) : (int64_t) 0;
+        }();
+        if (is_dsv4 && dsv4_shexp_shift > 0 && ud->n_devices == 2 && segments.size() == 1 &&
+                (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) || std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
+                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight))) {
+            const ggml_tensor * exps = ud->model->get_tensor(("blk." + std::to_string(tc.il) + ".ffn_down_exps.weight").c_str());
+            if (exps != nullptr) {
+                // the routed split of this layer, computed as above: device (0 + rotation) gets the rounded-down half
+                const int64_t ge   = std::lcm((int64_t) ggml_blck_size(exps->type), (int64_t) 128);
+                const int64_t ne_e = exps->ne[0];
+                int64_t low_e = ne_e/2;
+                low_e -= low_e % ge;
+                if (2*low_e != ne_e) {
+                    const int64_t gs    = granularity[0];
+                    const size_t  light = (0 + tc.rotation) % 2;
+                    const size_t  heavy = (1 + tc.rotation) % 2;
+                    const int64_t shift = std::min(dsv4_shexp_shift - dsv4_shexp_shift % gs, split_state.ne[heavy] - gs);
+                    if (shift > 0) {
+                        split_state.ne[light] += shift;
+                        split_state.ne[heavy] -= shift;
+                    }
+                }
+            }
+        }
     } else {
         memset(split_state.ne, 0, sizeof(split_state.ne));
         split_state.nr[0] = 1;
