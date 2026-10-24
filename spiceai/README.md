@@ -19,6 +19,14 @@ It also carries these source patches, which each Spice branch must keep until up
   merged upstream. It adds the model, the DSpark drafter, and the pairwise all-reduce between two RPC
   servers that `-sm tensor` uses when the model is split across two machines. Drop it once a release
   contains the PR.
+- **Fixes on top of #30817**, not upstream. A GGUF whose `attention.output_group_count` is 0 fails its load
+  instead of dividing by zero (`src/models/deepseek4.cpp`, which `deepseek41` shares), and one whose Engram head
+  offset plus bucket count passes `INT32_MAX` fails its load instead of wrapping and aborting in the first decode
+  (`src/models/deepseek41.cpp`). `deepseek41v` image preprocessing (`tools/mtmd/mtmd-image.cpp`) counts the tokens
+  of a placeholder bitmap, and pads an image too thin to keep a pixel at the planned size with the pad color alone,
+  as Pillow's `ImageOps.pad` does, instead of failing. With `convert_hf_to_gguf.py --remote`,
+  `conversion/deepseek41.py` reads the Engram tables by HTTP range instead of from shards it never downloaded.
+  When dropping #30817, keep whichever of these the release still lacks.
 - **DFlash drafters over Qwen3.8-Flash-Next (`qwen4exp`)**, upstream #30927 (`d9ee007a0`), merged after
   b11803. The target records the mean over its hyper-connection copies as each layer input, the
   `[n_embd, n_tokens]` rows a DFlash drafter reads; without it the first drafted request aborts in
