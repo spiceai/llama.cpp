@@ -907,12 +907,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                  std::regex_match(tensor_name, pattern_ffn_down_shexp_weight))) {
             const ggml_tensor * exps = ud->model->get_tensor(("blk." + std::to_string(tc.il) + ".ffn_down_exps.weight").c_str());
             if (exps != nullptr) {
-                // the routed split of this layer, computed as above: device (0 + rotation) gets the rounded-down half
-                const int64_t ge   = std::lcm((int64_t) ggml_blck_size(exps->type), (int64_t) 128);
-                const int64_t ne_e = exps->ne[0];
-                int64_t low_e = ne_e/2;
-                low_e -= low_e % ge;
-                if (2*low_e != ne_e) {
+                // the routed split of this layer as the loop above computes it (the same rotation and tensor_split): the
+                // first device's share is rounded down to the granularity, so when rounding removed rows it is the lighter one
+                const int64_t ge     = std::lcm((int64_t) ggml_blck_size(exps->type), (int64_t) 128);
+                const int64_t ne_e   = exps->ne[0];
+                const int64_t high_e = tensor_split_scan.back() == 0.0f ?
+                    ne_e/2 : (int64_t) (ne_e * tensor_split_scan[0] / tensor_split_scan.back());
+                if (high_e % ge != 0) {
                     const int64_t gs    = granularity[0];
                     const size_t  light = (0 + tc.rotation) % 2;
                     const size_t  heavy = (1 + tc.rotation) % 2;
