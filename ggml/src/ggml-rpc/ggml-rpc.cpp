@@ -533,6 +533,7 @@ public:
     void busy_spin_acquire();
     void busy_spin_release();
     void graph_compute(uint32_t device, const ggml_cgraph * cgraph);
+    void forget_graphs();
 
     void start(const std::string & endpoint);
     void work();
@@ -753,6 +754,8 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     request->remote_ptr = ctx->remote_ptr;
     LOG_DBG2("[%s] remote_ptr: 0x%" PRIx64 "\n", __func__, request->remote_ptr);
     ctx->dispatcher->send(RPC_CMD_FREE_BUFFER, request, sizeof(*request));
+    // the server no longer holds any graph, so each one is sent in full the next time it is computed
+    ctx->dispatcher->forget_graphs();
     delete ctx;
 }
 
@@ -1310,6 +1313,12 @@ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) 
     }
 }
 
+// the server discards every graph it stored when a buffer is freed (rpc_server::free_buffer)
+void rpc_dispatcher::forget_graphs() {
+    std::lock_guard<std::mutex> lock(graph_mutex);
+    graph_uids.clear();
+}
+
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     rpc_ctx->dispatcher->graph_compute(rpc_ctx->device, cgraph);
@@ -1615,11 +1624,10 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     }
     // Discard all cached graphs to avoid use-after-free in graph_recompute,
     // since their nodes may hold pointers to the buffer being freed. The client
-    // will have to re-serialize its graphs from now on.
+    // forgets them too and re-serializes its graphs from now on, so both sides
+    // count the same entries towards GRAPH_CACHE_MAX.
     for (auto & sgs : stored_graphs) {
-        for (auto & sg : sgs) {
-            sg.second.graph = nullptr;
-        }
+        sgs.clear();
     }
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
