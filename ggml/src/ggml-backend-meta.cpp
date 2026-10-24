@@ -2323,7 +2323,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
                     cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
                 }
-                cgraph_ij->uid = ggml_graph_next_uid();
+                // GGML_META_STABLE_UIDS=1: derive the uid from the graph's, the device and the index, so a graph computed
+                // again after another (two schedulers alternating) maps to the same subgraph uids; bit 63 keeps the derived
+                // values apart from ggml_graph_next_uid() counter values, and the fields cannot overlap within these bounds
+                static const bool stable_uids = [] {
+                    const char * v = getenv("GGML_META_STABLE_UIDS");
+                    return v != nullptr && atoi(v) != 0;
+                }();
+                if (stable_uids && cgraph->uid != 0 && cgraph->uid < (1ull << 46) && j < 128 && i_graph < 1024) {
+                    cgraph_ij->uid = (1ull << 63) | (cgraph->uid << 17) | ((uint64_t) j << 10) | (uint64_t) i_graph;
+                } else {
+                    cgraph_ij->uid = ggml_graph_next_uid();
+                }
             }
         }
     }
