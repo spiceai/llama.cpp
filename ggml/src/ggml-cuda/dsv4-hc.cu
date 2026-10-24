@@ -33,11 +33,18 @@ static __device__ void dsv4_hc_comb_norm_rows(float * comb, float eps) {
     }
 }
 
+// weights: also write pre/post (rows [0, 2*hc) of wdst, token stride swt) as the MUL -> ADD -> SIGMOID -> SCALE chains
+// would, each step rounded on its own, while dst points at the comb rows
+template <bool weights>
 static __global__ void dsv4_hc_comb_f32(
         const float * mixes,
         const float * scale,
         const float * base,
         float * dst,
+        float * wdst,
+        int64_t swt,
+        float pre_eps,
+        float post_scale,
         int64_t n_tokens,
         int64_t sm0,
         int64_t sm1,
@@ -58,6 +65,19 @@ static __global__ void dsv4_hc_comb_f32(
     }
 
     ggml_cuda_pdl_sync();
+
+    if constexpr (weights) {
+        const float scale_pre  = scale[0*ss0];
+        const float scale_post = scale[1*ss0];
+        for (int h = 0; h < DSV4_HC; ++h) {
+            const float ap = __fadd_rn(__fmul_rn(mixes[h*sm0 + it*sm1], scale_pre), base[h*sb0]);
+            const float aq = __fadd_rn(__fmul_rn(mixes[(DSV4_HC + h)*sm0 + it*sm1], scale_post), base[(DSV4_HC + h)*sb0]);
+            const float sp = 1.0f / (1.0f + expf(-ap));
+            const float sq = 1.0f / (1.0f + expf(-aq));
+            wdst[h + it*swt]           = __fadd_rn(sp, pre_eps);
+            wdst[DSV4_HC + h + it*swt] = __fmul_rn(post_scale, sq);
+        }
+    }
 
     const float scale_comb = scale[2*ss0];
     float comb[DSV4_HC*DSV4_HC];
@@ -214,10 +234,21 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     constexpr int64_t hc_mix_dim = (2 + DSV4_HC)*DSV4_HC;
 
+    // mode 1 (ggml_dsv4_hc_weights): dst is [hc_mix_dim, n_tokens], pre and post weights ahead of the comb
+    const bool  weights    = ggml_get_op_params_i32(dst, 2) == 1;
+    const float pre_eps    = ggml_get_op_params_f32(dst, 3);
+    const float post_scale = ggml_get_op_params_f32(dst, 4);
+
     GGML_ASSERT(mixes->ne[0] == hc_mix_dim);
-    GGML_ASSERT(dst->ne[0] == DSV4_HC);
-    GGML_ASSERT(dst->ne[1] == DSV4_HC);
-    GGML_ASSERT(dst->ne[2] == mixes->ne[1]);
+    if (weights) {
+        GGML_ASSERT(dst->ne[0] == hc_mix_dim);
+        GGML_ASSERT(dst->ne[1] == mixes->ne[1]);
+        GGML_ASSERT(dst->nb[0] == sizeof(float));
+    } else {
+        GGML_ASSERT(dst->ne[0] == DSV4_HC);
+        GGML_ASSERT(dst->ne[1] == DSV4_HC);
+        GGML_ASSERT(dst->ne[2] == mixes->ne[1]);
+    }
     GGML_ASSERT(scale->ne[0] >= 3);
     GGML_ASSERT(base->ne[0] == hc_mix_dim);
 
@@ -235,8 +266,24 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const dim3 grid_dims((n_tokens + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    ggml_cuda_kernel_launch(dsv4_hc_comb_f32, launch_params,
+    if (weights) {
+        // the comb rows as a [dst, src, token] view: element (dst, src) at row 2*hc + dst + hc*src
+        float * wdst = (float *) dst->data;
+        const int64_t swt = nbd1 / sizeof(float);
+        ggml_cuda_kernel_launch(dsv4_hc_comb_f32<true>, launch_params,
+                (const float *) mixes->data, (const float *) scale->data, (const float *) base->data, wdst + 2*DSV4_HC,
+                wdst, swt, pre_eps, post_scale,
+                n_tokens,
+                nbm0 / sizeof(float), nbm1 / sizeof(float),
+                nbs0 / sizeof(float),
+                nbb0 / sizeof(float),
+                (int64_t) 1, (int64_t) DSV4_HC, swt,
+                eps, n_iter);
+        return;
+    }
+    ggml_cuda_kernel_launch(dsv4_hc_comb_f32<false>, launch_params,
             (const float *) mixes->data, (const float *) scale->data, (const float *) base->data, (float *) dst->data,
+            nullptr, (int64_t) 0, 0.0f, 0.0f,
             n_tokens,
             nbm0 / sizeof(float), nbm1 / sizeof(float),
             nbs0 / sizeof(float),
