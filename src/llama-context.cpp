@@ -726,6 +726,21 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+
+    // LLAMA_GRAPH_SLOTS=2: one scheduler per graph slot, so a context alternating between two graphs reuses both
+    static const bool graph_slots = [] {
+        const char * v = getenv("LLAMA_GRAPH_SLOTS");
+        return v != nullptr && atoi(v) >= 2;
+    }();
+    sched_alt.reset();
+    sched_slot = 0;
+    gf_res_prev_active_alt = nullptr;
+    if (graph_slots) {
+        sched_alt.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+        ggml_backend_sched_set_copy_callback(sched_alt.get(), sched_copy_experts, this);
+        ggml_backend_sched_set_realloc_callback(sched_alt.get(), sched_graph_realloc, this);
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -753,6 +768,7 @@ void llama_context::sched_reserve() {
     }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
+    gf_res_prev_active_alt = nullptr;
 
     sched_new(max_nodes, cparams.pipeline_parallel);
 
@@ -995,6 +1011,7 @@ bool llama_context::memory_update(bool optimize) {
             }
         }
         gf_res_prev_active = nullptr;
+        gf_res_prev_active_alt = nullptr;
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1526,6 +1543,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    // with LLAMA_GRAPH_SLOTS=2 each graph slot has its own scheduler: switch to this ubatch's
+    if (sched_alt) {
+        const int slot = n_outputs > 0;
+        if (slot != sched_slot) {
+            std::swap(sched, sched_alt);
+            std::swap(gf_res_prev_active, gf_res_prev_active_alt);
+            sched_slot = slot;
+        }
     }
 
     auto * res = get_gf_res_prev();
@@ -2655,6 +2682,7 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     }
     gf_res_prev_active = nullptr;
+    gf_res_prev_active_alt = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -3897,6 +3925,7 @@ void llama_context::opt_epoch_iter(
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
             gf_res_prev_active = nullptr;
+            gf_res_prev_active_alt = nullptr;
             res->reset();
 
             auto * gf = model.build_graph(gparams);
