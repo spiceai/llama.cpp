@@ -108,8 +108,10 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
             }
         }
         for (size_t c = 0; c < n_e*n_cols; ++c) {
-            // a bucket count of 0 traps in the hash; row ids are int32
-            if (engram_primes[c] < 2 || engram_offsets[c] + engram_primes[c] > (uint64_t) INT32_MAX) {
+            // a bucket count of 0 traps in the hash; row ids are int32. bound the offset before comparing against the
+            // remaining range, so offset + bucket count cannot wrap
+            if (engram_primes[c] < 2 || engram_offsets[c] > (uint64_t) INT32_MAX ||
+                    engram_primes[c] > (uint64_t) INT32_MAX - engram_offsets[c]) {
                 throw std::runtime_error(format("DeepSeek-V4.1 engram head %zu: bucket range out of range", c));
             }
         }
