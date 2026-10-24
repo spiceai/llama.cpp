@@ -41,6 +41,16 @@ It also carries these source patches, which each Spice branch must keep until up
   servers that also share a direct link exchange over that link, and over RDMA when the address is a
   RoCE GID.
 
+- **Two-rank DeepSeek-V4 decode switches**, not upstream, each off by default and measured on two DGX Sparks:
+  `GGML_CUDA_MMVQ_IQ3_SMALL_K=1` lets IQ3 expert down projections with few K blocks take the small-K
+  `mul_mat_vec_q` path (`ggml/src/ggml-cuda/mmvq.cu`); `LLAMA_DSV4_HC_WEIGHTS=1` computes the
+  hyper-connection weights in one op, `ggml_dsv4_hc_weights` (`src/models/deepseek4.cpp`,
+  `ggml/src/ggml-cuda/dsv4-hc.cu`); `GGML_RPC_COMM_NCCL=1` on both rpc-servers runs the pairwise all-reduce
+  through NCCL, and `GGML_RPC_COMM_WIRE_F32=1` keeps the host all-reduce's partials in F32
+  (`ggml/src/ggml-rpc/ggml-rpc.cpp`); `GGML_RPC_SET_ASYNC=1` on the client queues buffer writes without
+  waiting; `LLAMA_DSV4_SHEXP_SHIFT=<rows>` moves shared-expert rows to the rank with the lighter expert split
+  (`src/llama-model.cpp`). Drop each once upstream has an equivalent.
+
 Each Spice branch is `spiceai-<release>`, cut from the upstream release tag with the
 Spice commits on top. Its tip is tagged `<release>-spiceai.<n>`, a name apart from the
 branch's so neither is ambiguous, with `<n>` counting re-packagings of one release. To move
