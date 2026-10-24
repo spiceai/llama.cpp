@@ -2313,7 +2313,11 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     }
     // reduce large partials in bf16 to halve the wire bytes; small (decode-sized) ones
     // stay f32 since the extra casts and sync cost more than the bytes saved
-    const bool   wire_bf16  = t_dst->type == GGML_TYPE_F32 && ne >= 32768;
+    static const bool wire_f32 = [] {
+        const char * v = std::getenv("GGML_RPC_COMM_WIRE_F32");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    const bool   wire_bf16  = !wire_f32 && t_dst->type == GGML_TYPE_F32 && ne >= 32768;
     const size_t wire_bytes = wire_bf16 ? (size_t) ne*2 : nbytes;
     const size_t need       = wire_bf16 ? 2*nbytes : nbytes;
     if (state.scratch_size < need) {
