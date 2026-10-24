@@ -14,6 +14,8 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <atomic>
+#include <filesystem>
 #include <set>
 #include <string>
 #include <tuple>
@@ -1899,8 +1901,10 @@ struct ggml_backend_meta_context {
         size_t                                  max_subgraphs = 0;
         size_t                                  n_subgraphs   = 0;
         uint64_t                                uid           = 0;
+        bool                                    cloned        = false;
     } alt;
     ggml_context_ptr ctx_clones;
+    bool             cloned = false; // the active split points only at slot-owned clones, weights and graph tensors
 
     void swap_slot() {
         alt.cgraphs.resize(backend_configs.size());
@@ -1917,6 +1921,7 @@ struct ggml_backend_meta_context {
         std::swap(max_subgraphs, alt.max_subgraphs);
         std::swap(n_subgraphs,   alt.n_subgraphs);
         std::swap(uid,           alt.uid);
+        std::swap(cloned,        alt.cloned);
     }
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
@@ -2075,6 +2080,26 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
+// GGML_META_GRAPH_SLOTS: "2" keeps the splits of the two most recent graphs; "flag:<path>" does so while <path>
+// exists (re-checked at most every 100 ms), so one loaded model can alternate both arms of an A/B
+static bool ggml_backend_meta_graph_slots_on() {
+    static const std::string mode = [] {
+        const char * v = getenv("GGML_META_GRAPH_SLOTS");
+        return std::string(v != nullptr ? v : "");
+    }();
+    if (mode.rfind("flag:", 0) == 0) {
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(std::filesystem::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return atoi(mode.c_str()) >= 2;
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -2082,16 +2107,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     // GGML_META_GRAPH_SLOTS=2: keep the splits of the two most recent graphs. A graph that is not the active one
     // swaps in the other slot: either it is that slot's graph, or that slot is the older one and gets rebuilt.
-    static const bool graph_slots = [] {
-        const char * v = getenv("GGML_META_GRAPH_SLOTS");
-        return v != nullptr && atoi(v) >= 2;
-    }();
+    const bool graph_slots = ggml_backend_meta_graph_slots_on();
     if (graph_slots && cgraph->uid != 0 && cgraph->uid != backend_ctx->uid) {
         backend_ctx->swap_slot();
     }
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
-    const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+    // A split built while slots were off points into the rotating compute containers, so with slots on it is rebuilt.
+    const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid) ||
+                               (graph_slots && !backend_ctx->cloned);
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -2391,7 +2415,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        if (graph_slots && cgraph->uid != 0) {
+        backend_ctx->cloned = graph_slots && cgraph->uid != 0;
+        if (backend_ctx->cloned) {
             // the slot keeps this split, so its subgraphs must not point into a buffer's rotating compute containers,
             // which the next rebuild of another graph resets: clone what they reach into the slot's own context
             const size_t n_clones = (size_t) (cgraph->n_nodes + cgraph->n_leafs + 16) * 2 * n_backends;
