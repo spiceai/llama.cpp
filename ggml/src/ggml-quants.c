@@ -5587,7 +5587,19 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             } break;
         case GGML_TYPE_MXFP8:
             {
-                VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp8, data, nb);
+                const block_mxfp8 * q = (const block_mxfp8 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_e_e8m0(q[i].e, i)) {
+                        return false;
+                    }
+                    // E4M3 (fn) has no inf; S.1111.111 is its only NaN
+                    for (int j = 0; j < QK_MXFP8; ++j) {
+                        if ((q[i].qs[j] & 0x7F) == 0x7F) {
+                            fprintf(stderr, "ggml_validate_row_data: found nan value at block %zu\n", i);
+                            return false;
+                        }
+                    }
+                }
             } break;
         case GGML_TYPE_NVFP4:
             {
