@@ -17,6 +17,8 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1884,6 +1886,39 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
+    // GGML_META_GRAPH_SLOTS=2: the split of the other recent graph, swapped with the fields above, and the
+    // simple tensor clones each split's subgraphs point at
+    struct graph_slot {
+        std::vector<std::vector<cgraph_config>> cgraphs; // per backend
+        std::vector<std::vector<ggml_tensor *>> nodes;   // per backend
+        ggml_context_ptr                        ctx;
+        ggml_context_ptr                        ctx_clones;
+        std::vector<ggml_cgraph *>              cgraphs_aux;
+        std::vector<ggml_tensor *>              nodes_aux;
+        int                                     max_nnodes    = 0;
+        size_t                                  max_subgraphs = 0;
+        size_t                                  n_subgraphs   = 0;
+        uint64_t                                uid           = 0;
+    } alt;
+    ggml_context_ptr ctx_clones;
+
+    void swap_slot() {
+        alt.cgraphs.resize(backend_configs.size());
+        alt.nodes.resize(backend_configs.size());
+        for (size_t j = 0; j < backend_configs.size(); j++) {
+            std::swap(backend_configs[j].cgraphs, alt.cgraphs[j]);
+            std::swap(backend_configs[j].nodes,   alt.nodes[j]);
+        }
+        std::swap(ctx,           alt.ctx);
+        std::swap(ctx_clones,    alt.ctx_clones);
+        std::swap(cgraphs_aux,   alt.cgraphs_aux);
+        std::swap(nodes_aux,     alt.nodes_aux);
+        std::swap(max_nnodes,    alt.max_nnodes);
+        std::swap(max_subgraphs, alt.max_subgraphs);
+        std::swap(n_subgraphs,   alt.n_subgraphs);
+        std::swap(uid,           alt.uid);
+    }
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -2044,6 +2079,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+
+    // GGML_META_GRAPH_SLOTS=2: keep the splits of the two most recent graphs. A graph that is not the active one
+    // swaps in the other slot: either it is that slot's graph, or that slot is the older one and gets rebuilt.
+    static const bool graph_slots = [] {
+        const char * v = getenv("GGML_META_GRAPH_SLOTS");
+        return v != nullptr && atoi(v) >= 2;
+    }();
+    if (graph_slots && cgraph->uid != 0 && cgraph->uid != backend_ctx->uid) {
+        backend_ctx->swap_slot();
+    }
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
@@ -2346,6 +2391,60 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        if (graph_slots && cgraph->uid != 0) {
+            // the slot keeps this split, so its subgraphs must not point into a buffer's rotating compute containers,
+            // which the next rebuild of another graph resets: clone what they reach into the slot's own context
+            const size_t n_clones = (size_t) (cgraph->n_nodes + cgraph->n_leafs + 16) * 2 * n_backends;
+            const ggml_init_params params_clones = {
+                /*.mem_size   =*/ n_clones * ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            backend_ctx->ctx_clones.reset(ggml_init(params_clones));
+            ggml_context * ctx_clones = backend_ctx->ctx_clones.get();
+
+            // the graph's own tensors (kept as nodes for host views) belong to the caller, who keeps them alive
+            std::unordered_set<const ggml_tensor *> originals;
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                originals.insert(cgraph->nodes[i]);
+            }
+            for (int i = 0; i < cgraph->n_leafs; i++) {
+                originals.insert(cgraph->leafs[i]);
+            }
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                std::unordered_map<const ggml_tensor *, ggml_tensor *> clones;
+                auto own = [&](auto & self, ggml_tensor * t) -> ggml_tensor * {
+                    if (t == nullptr || originals.count(t) != 0) {
+                        return t;
+                    }
+                    // weights are stored statically and never reset
+                    if (t->view_src == nullptr && t->buffer != nullptr &&
+                            ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                        return t;
+                    }
+                    auto it = clones.find(t);
+                    if (it != clones.end()) {
+                        return it->second;
+                    }
+                    // a one-element placeholder, then the whole struct of t: type, shape, strides, data, buffer, op
+                    ggml_tensor * c = ggml_new_tensor_1d(ctx_clones, GGML_TYPE_I8, 1);
+                    GGML_ASSERT(c != nullptr);
+                    *c = *t;
+                    clones[t] = c;
+                    for (int k = 0; k < GGML_MAX_SRC; k++) {
+                        c->src[k] = self(self, t->src[k]);
+                    }
+                    c->view_src = self(self, t->view_src);
+                    return c;
+                };
+                // nodes are in topological order, so a node's srcs are cloned before it and the recursion stays shallow
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    bcj.nodes[i] = own(own, bcj.nodes[i]);
+                }
+            }
+        }
+
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             for (size_t i_graph = 0; i_graph < n_subgraphs; i_graph++) {
@@ -2361,18 +2460,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
                     cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
                 }
-                // GGML_META_STABLE_UIDS=1: derive the uid from the graph's, the device and the index, so a graph computed
-                // again after another (two schedulers alternating) maps to the same subgraph uids; bit 63 keeps the derived
-                // values apart from ggml_graph_next_uid() counter values, and the fields cannot overlap within these bounds
-                static const bool stable_uids = [] {
-                    const char * v = getenv("GGML_META_STABLE_UIDS");
-                    return v != nullptr && atoi(v) != 0;
-                }();
-                if (stable_uids && cgraph->uid != 0 && cgraph->uid < (1ull << 46) && j < 128 && i_graph < 1024) {
-                    cgraph_ij->uid = (1ull << 63) | (cgraph->uid << 17) | ((uint64_t) j << 10) | (uint64_t) i_graph;
-                } else {
-                    cgraph_ij->uid = ggml_graph_next_uid();
-                }
+                cgraph_ij->uid = ggml_graph_next_uid();
             }
         }
     }
