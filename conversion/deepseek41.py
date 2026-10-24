@@ -229,6 +229,48 @@ class DeepseekV41Model(DeepseekV4Model):
         data = cast(np.ndarray, _StreamedBytes((len(pairs), rows, packed_cols * 2 // 32 * 17), chunks))
         self.gguf_writer.add_tensor(self.format_tensor_name(key, bid), data, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
 
+    _ENGRAM_CHUNK_ROWS = 1 << 18
+
+    def _engram_rows(self, parts: list[tuple[str, str, int, Path, Path]]) -> Iterable[tuple[str, str, Tensor, Tensor]]:
+        """(weight name, scale name, e4m3 rows, e8m0 rows) of each Engram table as uint8 tensors, a chunk of rows at a
+        time. Local shards are sliced in place; --remote downloads only the config and tokenizer files, so the rows
+        are read from the remote shard by HTTP range, as the other remote tensors are."""
+        step = self._ENGRAM_CHUNK_ROWS
+        if self.remote_hf_model_id is None:
+            from safetensors import safe_open
+            for wn, sn, rows, wpart, spart in parts:
+                with safe_open(wpart, framework="pt") as fw, safe_open(spart, framework="pt") as fs:
+                    ws, ss = fw.get_slice(wn), fs.get_slice(sn)
+                    for r0 in range(0, rows, step):
+                        yield wn, sn, ws[r0:r0 + step].view(torch.uint8), ss[r0:r0 + step].view(torch.uint8)
+            return
+
+        remote = gguf.utility.SafetensorRemote
+        shard_tensors: dict[str, dict[str, gguf.utility.RemoteTensor]] = {}
+
+        def remote_tensor(tensor_name: str, part: Path) -> gguf.utility.RemoteTensor:
+            file = part.relative_to(self.dir_model).as_posix()
+            url = f"{remote.BASE_DOMAIN}/{self.remote_hf_model_id}/resolve/main/{file}"
+            if url not in shard_tensors:
+                shard_tensors[url] = remote.get_list_tensors(url)
+            t = shard_tensors[url][tensor_name]
+            if len(t.shape) != 2 or t.size != t.shape[0] * t.shape[1]:
+                raise ValueError(f"{tensor_name}: expected a 2D tensor of one-byte elements, got {t.dtype} {t.shape}")
+            return t
+
+        def read_rows(t: gguf.utility.RemoteTensor, r0: int, r1: int) -> Tensor:
+            row_bytes = t.shape[1]
+            raw = remote.get_data_by_range(t.url, t.offset_start + r0 * row_bytes, (r1 - r0) * row_bytes)
+            if len(raw) != (r1 - r0) * row_bytes:
+                raise ValueError(f"{t.url}: read {len(raw)} bytes of rows {r0}..{r1}, expected {(r1 - r0) * row_bytes}")
+            return torch.frombuffer(bytearray(raw), dtype=torch.uint8).reshape(r1 - r0, row_bytes)
+
+        for wn, sn, rows, wpart, spart in parts:
+            wt, st = remote_tensor(wn, wpart), remote_tensor(sn, spart)
+            for r0 in range(0, rows, step):
+                r1 = min(rows, r0 + step)
+                yield wn, sn, read_rows(wt, r0, r1), read_rows(st, r0, r1)
+
     def _write_engram_tables(self, layer_ids: list[int]) -> None:
         # official lookup e4m3 * 2^(e8m0 - 127): stored as the source MXFP8 blocks (bit-exact) or as exact BF16
         parts, dim = [], None
@@ -247,31 +289,23 @@ class DeepseekV41Model(DeepseekV4Model):
 
         if self._engram_mxfp8:
             def blocks() -> Iterable[np.ndarray]:
-                from safetensors import safe_open
-                for wn, sn, rows, wpart, spart in parts:
-                    with safe_open(wpart, framework="pt") as fw, safe_open(spart, framework="pt") as fs:
-                        ws, ss = fw.get_slice(wn), fs.get_slice(sn)
-                        for r0 in range(0, rows, 1 << 18):
-                            q = ws[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 32).numpy()
-                            e = ss[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 1).numpy()
-                            if (e == 0xFF).any() or ((q & 0x7F) == 0x7F).any():
-                                raise ValueError(f"{wn}: NaN E8M0 scale or E4M3 code")
-                            yield np.concatenate([e, q], axis=1)
+                for wn, _, w_rows, s_rows in self._engram_rows(parts):
+                    q = w_rows.reshape(-1, 32).numpy()
+                    e = s_rows.reshape(-1, 1).numpy()
+                    if (e == 0xFF).any() or ((q & 0x7F) == 0x7F).any():
+                        raise ValueError(f"{wn}: NaN E8M0 scale or E4M3 code")
+                    yield np.concatenate([e, q], axis=1)
             data = cast(np.ndarray, _StreamedBytes((n_rows, dim // 32 * 33), blocks))
             self.gguf_writer.add_tensor(name, data, raw_dtype=gguf.GGMLQuantizationType.MXFP8)
             return
 
         def chunks() -> Iterable[np.ndarray]:
-            from safetensors import safe_open
-            for wn, sn, rows, wpart, spart in parts:
-                with safe_open(wpart, framework="pt") as fw, safe_open(spart, framework="pt") as fs:
-                    ws, ss = fw.get_slice(wn), fs.get_slice(sn)
-                    for r0 in range(0, rows, 1 << 18):
-                        q = ws[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 32)
-                        e = ss[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 1)
-                        _e8m0_check(e.numpy(), sn)
-                        v = (q.view(torch.float8_e4m3fn).float() * torch.exp2(e.float() - 127)).reshape(-1, dim)
-                        yield (v if self._f32 else v.bfloat16()).view(torch.uint8).numpy()
+            for _, sn, w_rows, s_rows in self._engram_rows(parts):
+                q = w_rows.reshape(-1, 32)
+                e = s_rows.reshape(-1, 1)
+                _e8m0_check(e.numpy(), sn)
+                v = (q.view(torch.float8_e4m3fn).float() * torch.exp2(e.float() - 127)).reshape(-1, dim)
+                yield (v if self._f32 else v.bfloat16()).view(torch.uint8).numpy()
         qt = gguf.GGMLQuantizationType.F32 if self._f32 else gguf.GGMLQuantizationType.BF16
         data = cast(np.ndarray, _StreamedBytes((n_rows, dim * (4 if self._f32 else 2)), chunks))
         self.gguf_writer.add_tensor(name, data, raw_dtype=qt)
