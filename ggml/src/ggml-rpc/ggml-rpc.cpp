@@ -845,6 +845,16 @@ static bool rpc_use_hash_cache(const ggml_tensor * tensor, size_t size) {
     return size > HASH_THRESHOLD && tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
 }
 
+// GGML_RPC_SET_ASYNC=1: a buffer write returns once it is queued; the request owns a copy of the data and the
+// server handles commands in order, so a later graph compute or read on that server sees it
+static bool rpc_set_async() {
+    static const bool v = [] {
+        const char * e = std::getenv("GGML_RPC_SET_ASYNC");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v;
+}
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
@@ -869,7 +879,11 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     }
     size_t input_size;
     auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
-    ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
+    if (rpc_set_async()) {
+        ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input, input_size);
+    } else {
+        ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
+    }
 }
 
 static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
@@ -891,7 +905,11 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, 
         memcpy(dest + i*size, (const char *)data + i*stride_data, size);
     }
     std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-    ctx->dispatcher->send(RPC_CMD_SET_TENSOR_2D, input_ptr, input_size);
+    if (rpc_set_async()) {
+        ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR_2D, input_ptr, input_size);
+    } else {
+        ctx->dispatcher->send(RPC_CMD_SET_TENSOR_2D, input_ptr, input_size);
+    }
 }
 
 static void ggml_backend_rpc_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data,
