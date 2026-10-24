@@ -8,14 +8,6 @@
 #include <stdexcept>
 #include <string>
 
-static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
-    if (ext_factor == 0.0f) {
-        return 1.0f;
-    }
-
-    return 1.0f / (1.0f + 0.1f*logf(1.0f/freq_scale));
-}
-
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     if (hparams.n_layer_nextn > 0) {
         const uint32_t n_layer_main = hparams.n_layer_all - hparams.n_layer_nextn;
@@ -49,6 +41,10 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
     ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
     ml.get_key(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
+    // the tensor shapes and the grouped output projection divide by it
+    if (hparams.dsv4_o_group_count == 0) {
+        throw std::runtime_error("DeepSeek-V4 attention.output_group_count must be > 0");
+    }
 
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
@@ -358,6 +354,18 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         ggml_tensor ** post,
         ggml_tensor ** comb,
         int il) const {
+    return build_hc_pre(x, build_hc_mixes(x, hc_fn, hc_scale, hc_base, post, comb, il), il);
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_hc_mixes(
+        ggml_tensor * x,
+        ggml_tensor * hc_fn,
+        ggml_tensor * hc_scale,
+        ggml_tensor * hc_base,
+        ggml_tensor ** post,
+        ggml_tensor ** comb,
+        int il,
+        bool f32_src) const {
     const int64_t hc         = hparams.dsv4_hc_mult;
     const int64_t hc_dim     = hc*n_embd;
     const int64_t hc_mix_dim = (2 + hc)*hc;
@@ -369,6 +377,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
+    if (f32_src && !ggml_is_quantized(hc_fn->type)) {
+        // F32 weights (model.py hc_pre runs in fp32): request F32 inputs, the mixes are near-tie sensitive
+        ggml_prec_set_src(mixes, GGML_PREC_F32, 1);
+    }
     cb(mixes, "hc_mixes", il);
 
     ggml_tensor * scale_pre  = dsv4_view_1d(ctx0, hc_scale, 1, 0);
@@ -404,8 +416,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     }
     cb(*comb, "hc_comb", il);
 
-    ggml_tensor * result = build_hc_pre(x, pre, il);
-    return result;
+    return pre;
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
