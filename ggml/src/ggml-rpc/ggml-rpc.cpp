@@ -2399,7 +2399,13 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
                 return true;
             }
         }
-        LOG_INFO("[%s] device %u NCCL all-reduce %s\n", __func__, request.device, state.nccl != nullptr ? "on" : "unavailable, copying through the host");
+        bool nccl_on;
+        {
+            // the client watchdog may abort the communicator at any time from here on
+            std::lock_guard<std::mutex> lock(comm_mutex);
+            nccl_on = state.nccl != nullptr;
+        }
+        LOG_INFO("[%s] device %u NCCL all-reduce %s\n", __func__, request.device, nccl_on ? "on" : "unavailable, copying through the host");
     }
     LOG_INFO("[%s] device %u joined pairwise comm as rank %u\n", __func__, request.device, request.rank);
     response.ok = 1;
