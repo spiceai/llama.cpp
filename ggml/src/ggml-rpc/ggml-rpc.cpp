@@ -2362,8 +2362,28 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
             sent = state.peer->recv_data(&peer_ok, 1) && state.peer->recv_data(id, sizeof(id)) &&
                    state.peer->send_data(&ok, 1) && state.peer->flush();
         }
-        if (sent && ok && peer_ok) {
+        if (!sent) {
+            // the peer connection failed mid-handshake, so the ranks may now disagree: this COMM_INIT fails
+            state.peer = nullptr;
+            return true;
+        }
+        if (ok && peer_ok) {
             state.nccl = init_rank(backend, id, (int) request.world, (int) request.rank);
+            // ncclCommInitRank can succeed on one rank and fail on the other, so the ranks agree on its result as
+            // well: unless both have a communicator, neither keeps one, and both copy through the host
+            uint8_t inited = state.nccl != nullptr;
+            uint8_t peer_inited = 0;
+            const bool agreed = request.rank == 0 ?
+                state.peer->send_data(&inited, 1) && state.peer->flush() && state.peer->recv_data(&peer_inited, 1) :
+                state.peer->recv_data(&peer_inited, 1) && state.peer->send_data(&inited, 1) && state.peer->flush();
+            if ((!agreed || !peer_inited) && state.nccl != nullptr) {
+                state.nccl_abort(state.nccl);
+                state.nccl = nullptr;
+            }
+            if (!agreed) {
+                state.peer = nullptr;
+                return true;
+            }
         }
         LOG_INFO("[%s] device %u NCCL all-reduce %s\n", __func__, request.device, state.nccl != nullptr ? "on" : "unavailable, copying through the host");
     }
