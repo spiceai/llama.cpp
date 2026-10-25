@@ -301,6 +301,9 @@ struct rpc_msg_comm_init_rsp {
 struct rpc_msg_comm_allreduce_req {
     uint32_t   device;
     rpc_tensor tensor;
+    // this rank's share of the work was empty (the meta backend disabled its node), so its partial is garbage: the rank
+    // contributes zeros. Only the mesh comm takes it.
+    uint32_t   zero;
 };
 
 struct rpc_msg_comm_free_req {
@@ -1642,8 +1645,8 @@ private:
     };
 
     bool comm_init_mesh(const rpc_msg_comm_init_req & request, comm_state & state);
-    bool comm_allreduce_mesh(comm_state & state, ggml_backend_t backend, ggml_tensor * t_dst);
-    bool comm_allreduce_mesh_async(comm_state & state, ggml_backend_t backend, ggml_tensor * t_dst);
+    bool comm_allreduce_mesh(comm_state & state, ggml_backend_t backend, ggml_tensor * t_dst, bool zero);
+    bool comm_allreduce_mesh_async(comm_state & state, ggml_backend_t backend, ggml_tensor * t_dst, bool zero);
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
@@ -2633,7 +2636,11 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         return true;
     }
     if (!state.peers.empty()) {
-        return comm_allreduce_mesh(state, backend, t_dst);
+        return comm_allreduce_mesh(state, backend, t_dst, request.zero != 0);
+    }
+    if (request.zero != 0) {
+        LOG_ERROR("[%s] device %u: only the mesh comm takes a zero partial\n", __func__, request.device);
+        return false;
     }
     if (state.nccl != nullptr) {
         // NCCL reduces ggml_nelements floats in place, so it takes only a dense F32 tensor whose floats are exactly the
@@ -2905,7 +2912,7 @@ struct rpc_comm_async {
     void *   (*host_alloc)(size_t) = nullptr;
 
     // jobs: the server thread queues, the exchange thread takes them in order
-    struct job { uint32_t flag; uint64_t seq; size_t nbytes; };
+    struct job { uint32_t flag; uint64_t seq; size_t nbytes; bool zero; };
     job                   jobs[RING] = {};
     std::atomic<uint32_t> queued{0};              // the flag of the last queued all-reduce
     std::atomic<uint32_t> processed{0};           // the flag of the last one whose `done` was signalled
@@ -2996,6 +3003,10 @@ struct rpc_comm_async {
                 if (stop.load(std::memory_order_acquire)) {
                     return;
                 }
+            }
+            if (j.zero) {
+                // the stream copied a disabled node's garbage out; this rank's share is zero
+                memset(out, 0, j.nbytes);
             }
             if (broken.load(std::memory_order_relaxed) ||
                 !rpc_comm_mesh_exchange(*peers, rank, world, j.seq, j.nbytes, out, *parts, in)) {
@@ -3169,7 +3180,7 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
 // Every rank sends its partial to every peer and sums all of them in rank order, ((p0 + p1) + p2) + ..., so that the
 // ranks hold the same bits afterwards: the mirrored activations each rank computes from the sum must not drift apart.
 // The wire is always F32, since a partial rounded for the wire would have to be rounded on its own rank as well.
-bool rpc_server::comm_allreduce_mesh(comm_state & state, ggml_backend_t backend, ggml_tensor * t_dst) {
+bool rpc_server::comm_allreduce_mesh(comm_state & state, ggml_backend_t backend, ggml_tensor * t_dst, bool zero) {
     const size_t  nbytes = ggml_nbytes(t_dst);
     const int64_t ne     = ggml_nelements(t_dst);
     if (t_dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(t_dst) || nbytes / sizeof(float) != (size_t) ne) {
@@ -3180,7 +3191,7 @@ bool rpc_server::comm_allreduce_mesh(comm_state & state, ggml_backend_t backend,
     if (state.async != nullptr && state.async->broken.load(std::memory_order_acquire)) {
         return false;
     }
-    if (rpc_comm_async_enabled() && comm_allreduce_mesh_async(state, backend, t_dst)) {
+    if (rpc_comm_async_enabled() && comm_allreduce_mesh_async(state, backend, t_dst, zero)) {
         return true;
     }
     if (state.async != nullptr && state.async->broken.load(std::memory_order_acquire)) {
@@ -3198,7 +3209,11 @@ bool rpc_server::comm_allreduce_mesh(comm_state & state, ggml_backend_t backend,
         own.resize(nbytes);
     }
     state.sum.resize((size_t) ne);
-    ggml_backend_tensor_get(t_dst, own.data(), 0, nbytes);
+    if (zero) {
+        std::fill(own.begin(), own.begin() + nbytes, 0);
+    } else {
+        ggml_backend_tensor_get(t_dst, own.data(), 0, nbytes);
+    }
     if (!rpc_comm_mesh_exchange(state.peers, state.rank, state.world, state.seq, nbytes, own.data(), state.parts,
                                 state.sum.data())) {
         return false;
@@ -3209,7 +3224,7 @@ bool rpc_server::comm_allreduce_mesh(comm_state & state, ggml_backend_t backend,
 
 // Queues the all-reduce on the backend's stream and returns at once; false when the backend cannot, leaving the
 // all-reduce to the synchronous path
-bool rpc_server::comm_allreduce_mesh_async(comm_state & state, ggml_backend_t backend, ggml_tensor * t_dst) {
+bool rpc_server::comm_allreduce_mesh_async(comm_state & state, ggml_backend_t backend, ggml_tensor * t_dst, bool zero) {
     if (state.async == nullptr) {
         auto host_alloc = (rpc_comm_host_alloc_t) rpc_backend_proc(backend, "ggml_backend_cuda_comm_host_alloc");
         auto host_free  = (rpc_comm_host_free_t)  rpc_backend_proc(backend, "ggml_backend_cuda_comm_host_free");
@@ -3277,7 +3292,7 @@ bool rpc_server::comm_allreduce_mesh_async(comm_state & state, ggml_backend_t ba
     }
     const uint32_t flag = ++a.next_flag;
     state.seq++;
-    a.jobs[flag % rpc_comm_async::RING] = { flag, state.seq, nbytes };
+    a.jobs[flag % rpc_comm_async::RING] = { flag, state.seq, nbytes, zero };
     if (!a.stage(backend, t_dst, a.out, a.in, &a.flags[0], &a.flags[1], flag)) {
         LOG_ERROR("[%s] could not queue all-reduce %" PRIu64 " on the device's stream\n", __func__, state.seq);
         a.broken.store(true, std::memory_order_release);
@@ -3894,6 +3909,7 @@ struct ggml_backend_rpc_comm_context {
         std::shared_ptr<rpc_dispatcher> dispatcher;
     };
     std::vector<rank_info> ranks;
+    bool                   mesh = false; // a rank whose node is disabled can contribute zeros
 };
 
 static void ggml_backend_rpc_comm_free(void * comm_ctx_v) {
@@ -4064,7 +4080,7 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
     } else {
         LOG_INFO("%s: %zu-rank mesh communicator initialized\n", __func__, n_backends);
     }
-    return new ggml_backend_rpc_comm_context{std::move(ranks)};
+    return new ggml_backend_rpc_comm_context{std::move(ranks), mesh};
 }
 
 static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tensor ** tensors) {
@@ -4083,9 +4099,10 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tenso
                 tensors[i]->buffer == nullptr || !ggml_backend_buffer_is_rpc(tensors[i]->buffer)) {
             return false;
         }
-        // a rank with a disabled node has garbage in its partial and must contribute zeros,
-        // which only the fallback path handles
-        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        // a rank with a disabled node (an empty share of the work, as when a layer has fewer KV heads than there are
+        // ranks) has garbage in its partial and must contribute zeros: the mesh does that, the pairwise comm cannot,
+        // so it leaves the reduction to the fallback, which copies every partial through this process
+        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 && !comm_ctx->mesh) {
             return false;
         }
     }
@@ -4093,6 +4110,7 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tenso
         auto request = std::make_shared<rpc_msg_comm_allreduce_req>();
         request->device = comm_ctx->ranks[i].device;
         request->tensor = serialize_tensor(tensors[i]);
+        request->zero   = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ? 1 : 0;
         comm_ctx->ranks[i].dispatcher->send_async(RPC_CMD_COMM_ALLREDUCE, request, sizeof(*request));
     }
     return true;
