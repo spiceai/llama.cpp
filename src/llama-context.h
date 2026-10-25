@@ -451,5 +451,7 @@ private:
 
     // LLAMA_DEBUG_CALL_SUMS: whether the last ubatch reused its graph, and a per-context count of decoded ubatches
     bool    dbg_reused = false;
+    bool    dbg_forced = false;      // the last ubatch's graph was rebuilt because LLAMA_DEBUG_REBUILD_ON_NAN asked for it
+    bool    dbg_rebuild_next = false; // rebuild the next ubatch with outputs instead of reusing its graph
     int64_t dbg_calls  = 0;
 };

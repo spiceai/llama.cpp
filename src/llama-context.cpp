@@ -1602,7 +1602,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // DIAG LLAMA_GRAPH_SLOTS_INJECT_REUSE=0: with graph slots, a draft context rebuilds its graphs without outputs
     static const bool inject_reuse = getenv("LLAMA_GRAPH_SLOTS_INJECT_REUSE") == nullptr || atoi(getenv("LLAMA_GRAPH_SLOTS_INJECT_REUSE")) != 0;
-    const bool reuse_allowed = inject_reuse || !sched_alt || cparams.ctx_other == nullptr || n_outputs > 0;
+    // DIAG LLAMA_GRAPH_SLOTS_DRAFT_REUSE=0: with graph slots, a draft context rebuilds its graphs with outputs
+    static const bool draft_reuse = getenv("LLAMA_GRAPH_SLOTS_DRAFT_REUSE") == nullptr || atoi(getenv("LLAMA_GRAPH_SLOTS_DRAFT_REUSE")) != 0;
+    const bool forced = dbg_rebuild_next && n_outputs > 0;
+    if (forced) {
+        dbg_rebuild_next = false;
+    }
+    dbg_forced = forced;
+    const bool reuse_allowed = !forced &&
+        (inject_reuse || !sched_alt || cparams.ctx_other == nullptr || n_outputs > 0) &&
+        (draft_reuse  || !sched_alt || cparams.ctx_other == nullptr || n_outputs == 0);
     if (!graph_reuse_disable && reuse_allowed && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -2303,11 +2312,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     sum_nextn = llama_debug_checksum(embd_nextn.data + offset*n_e, n_rows*n_e, &nonfinite);
                 }
             }
+            // DIAG LLAMA_DEBUG_REBUILD_ON_NAN=1: after a reused graph gives non-finite outputs, rebuild the next one with outputs
+            static const bool rebuild_on_nan = getenv("LLAMA_DEBUG_REBUILD_ON_NAN") != nullptr;
+            if (rebuild_on_nan && dbg_reused && nonfinite > 0) {
+                dbg_rebuild_next = true;
+            }
             fprintf(stderr, "DBGSUM %s call %" PRId64 " %s n_tokens %u n_outputs %d seq %d pos %d..%d slot %d %s"
                     " logits %.9e argmax %d nextn %.9e nonfinite %" PRId64 "\n",
                     cparams.ctx_other != nullptr ? "dft" : "tgt", dbg_calls, ubatch.embd ? "embd" : "tok", ubatch.n_tokens,
                     n_outputs, ubatch.seq_id[0][0], ubatch.pos[0], ubatch.pos[ubatch.n_tokens - 1], sched_slot,
-                    dbg_reused ? "reused" : "built", sum_logits, argmax_last, sum_nextn, nonfinite);
+                    dbg_reused ? "reused" : (dbg_forced ? "forced" : "built"), sum_logits, argmax_last, sum_nextn, nonfinite);
             dbg_calls++;
         }
 
