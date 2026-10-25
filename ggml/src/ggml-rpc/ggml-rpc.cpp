@@ -723,6 +723,31 @@ static bool rpc_set_batch() {
     return std::atoi(mode.c_str()) != 0;
 }
 
+// GGML_RPC_READ_PIPELINE=1 (or flag:<path>, re-checked at most every 100 ms): a command with a reply that has more such
+// commands queued behind it goes to the server without waiting for its reply, and the replies are read in order once
+// the run ends, so reads queued back to back (a graph's outputs) cost one round trip instead of one each. The server
+// answers in the order it receives commands, and only commands with a reply produce one. Only a run of commands with
+// replies is pipelined, up to RPC_READ_PIPELINE_MAX_BYTES of replies, so neither side waits on a full socket buffer.
+static bool rpc_read_pipeline() {
+    static const std::string mode = [] {
+        const char * e = std::getenv("GGML_RPC_READ_PIPELINE");
+        return std::string(e != nullptr ? e : "");
+    }();
+    if (mode.rfind("flag:", 0) == 0) {
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(fs::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return std::atoi(mode.c_str()) != 0;
+}
+
+static constexpr size_t RPC_READ_PIPELINE_MAX_BYTES = 1u << 20;
+
 static constexpr size_t RPC_SET_BATCH_MAX_WRITES = 256;
 static constexpr size_t RPC_SET_BATCH_MAX_BYTES  = 64u << 20;
 // how long a batch waits for the next write while the queue is empty (GGML_RPC_SET_BATCH_LINGER_US, default 100): a
@@ -781,18 +806,54 @@ void rpc_dispatcher::send_set_tensor_batch(const rpc_msg_ptr & first) {
 
 void rpc_dispatcher::work() {
     auto last_cmd = std::chrono::steady_clock::now();
+    // commands sent with GGML_RPC_READ_PIPELINE whose replies are not read yet, and the bytes those replies hold
+    std::vector<rpc_msg_ptr> pending;
+    size_t pending_bytes = 0;
+    auto read_replies = [&]() {
+        for (const rpc_msg_ptr & m : pending) {
+            uint64_t out_size = 0;
+            const bool status = sock->recv_data(&out_size, sizeof(out_size)) && out_size == m->output_size &&
+                                sock->recv_data(m->output, m->output_size);
+            RPC_STATUS_ASSERT(status);
+            m->completion.set_value();
+        }
+        pending.clear();
+        pending_bytes = 0;
+    };
     while (running) {
         rpc_msg_ptr msg_ptr;
         // spin only while commands keep coming, so an idle dispatcher does not keep a core busy
         const bool spin = busy_spin_users.load(std::memory_order_relaxed) != 0 &&
                           std::chrono::steady_clock::now() - last_cmd < RPC_BUSY_SPIN_IDLE_TIME;
-        if (spin) {
+        if (!pending.empty()) {
+            // the replies of a pipelined run are read as soon as nothing more is queued behind them
+            if (!queue.try_pop(&msg_ptr)) {
+                read_replies();
+                continue;
+            }
+        } else if (spin) {
             if (!queue.try_pop(&msg_ptr)) {
                 rpc_cpu_relax();
                 continue;
             }
         } else if (!queue.pop(&msg_ptr)) {
             break;
+        }
+        const bool pipelined = msg_ptr->cmd != RPC_CMD_NONE && msg_ptr->output != nullptr && rpc_read_pipeline() &&
+                               pending_bytes + msg_ptr->output_size <= RPC_READ_PIPELINE_MAX_BYTES;
+        if (!pipelined && !pending.empty()) {
+            // anything else, a barrier included, goes after the replies of the run before it
+            read_replies();
+        }
+        if (pipelined) {
+            LOG_DBG2("[%s] %s pipelined (in: %s, out: %s)\n", __func__, rpc_cmd_name(msg_ptr->cmd),
+                     rpc_log_format_size(msg_ptr->input_size).c_str(), rpc_log_format_size(msg_ptr->output_size).c_str());
+            const bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
+            RPC_STATUS_ASSERT(status);
+            pending.push_back(msg_ptr);
+            pending_bytes += msg_ptr->output_size;
+            last_cmd = std::chrono::steady_clock::now();
+            continue;
         }
         if (msg_ptr->cmd != RPC_CMD_NONE) {
             LOG_DBG2("[%s] %s (in: %s, out: %s)\n", __func__, rpc_cmd_name(msg_ptr->cmd),
