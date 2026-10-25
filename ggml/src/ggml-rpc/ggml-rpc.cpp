@@ -25,6 +25,12 @@
 #include <filesystem>
 #include <algorithm>
 #include <atomic>
+#if !defined(_WIN32)
+#  include <arpa/inet.h>
+#  include <ifaddrs.h>
+#  include <net/if.h>
+#  include <netinet/in.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -254,6 +260,7 @@ struct rpc_msg_get_tensor_2d_req {
 // RPC_COMM_FLAG_*: how the client asks both ranks to reduce, so the two servers always agree
 static constexpr uint32_t RPC_COMM_FLAG_NCCL     = 1u; // through NCCL when both servers can (GGML_RPC_COMM_NCCL=1)
 static constexpr uint32_t RPC_COMM_FLAG_WIRE_F32 = 2u; // host path: every partial as F32 (GGML_RPC_COMM_WIRE_F32=1)
+static constexpr uint32_t RPC_COMM_FLAG_MESH     = 4u; // two ranks through the mesh, as more always go (GGML_RPC_COMM_MESH=1)
 
 // the most ranks one comm joins; more than two connect every pair of ranks directly (a full mesh)
 static constexpr uint32_t RPC_COMM_MAX_WORLD = 8;
@@ -2530,7 +2537,7 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
         response.ok = 1;
         return true;
     }
-    if (request.world > 2) {
+    if (request.world > 2 || (request.flags & RPC_COMM_FLAG_MESH) != 0) {
         response.ok = comm_init_mesh(request, state) ? 1 : 0;
         return true;
     }
@@ -2792,6 +2799,78 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
 // link the two share (three Sparks cabled as a triangle have a link per pair). Rank r listens on port + r and connects
 // to each lower rank j at hosts[j], port + j, naming itself first so that the listener knows which rank arrived. Each
 // link negotiates its transport like the pairwise one, so a host on an RDMA link's subnet gets RDMA.
+// world > 2: a rank's IPv4 links, which a lower rank sends to a rank that connects to it, so that the two can move to the
+// fastest link they share: the address the client gave may route over a slower one, or over loopback identities that
+// RDMA cannot use (RDMA needs the address of the cable's own port)
+struct rpc_comm_link {
+    uint32_t addr;  // network order
+    uint32_t mask;  // network order
+    uint32_t speed; // Mbit/s, 0 when not known
+};
+
+// the first word a connecting rank sends: its rank, with this bit when it connects over a link already chosen
+static constexpr uint32_t RPC_COMM_CHOSEN_LINK = 0x80000000u;
+
+static std::vector<rpc_comm_link> rpc_comm_local_links() {
+    std::vector<rpc_comm_link> links;
+#if !defined(_WIN32)
+    struct ifaddrs * ifs = nullptr;
+    if (getifaddrs(&ifs) != 0) {
+        return links;
+    }
+    for (struct ifaddrs * it = ifs; it != nullptr; it = it->ifa_next) {
+        if (it->ifa_addr == nullptr || it->ifa_netmask == nullptr || it->ifa_addr->sa_family != AF_INET ||
+                (it->ifa_flags & IFF_LOOPBACK) != 0 || (it->ifa_flags & IFF_UP) == 0 || (it->ifa_flags & IFF_RUNNING) == 0) {
+            continue;
+        }
+        rpc_comm_link link = {};
+        link.addr = ((const struct sockaddr_in *) it->ifa_addr)->sin_addr.s_addr;
+        link.mask = ((const struct sockaddr_in *) it->ifa_netmask)->sin_addr.s_addr;
+        if (link.mask == 0xffffffffu) {
+            continue; // a /32 is an identity, not a link to a peer
+        }
+        std::ifstream speed_file(std::string("/sys/class/net/") + it->ifa_name + "/speed");
+        long speed = 0;
+        if (speed_file >> speed && speed > 0) {
+            link.speed = (uint32_t) speed;
+        }
+        links.push_back(link);
+    }
+    freeifaddrs(ifs);
+#endif
+    return links;
+}
+
+// the peer's address on the fastest subnet both ranks are on; an address both have (an identical bridge on every
+// node, such as Docker's) is no link between them
+static std::string rpc_comm_best_link(const std::vector<rpc_comm_link> & ours, const std::vector<rpc_comm_link> & theirs) {
+    std::string best;
+#if !defined(_WIN32)
+    bool found = false;
+    uint32_t best_speed = 0;
+    for (const auto & t : theirs) {
+        for (const auto & o : ours) {
+            const bool same_subnet = (t.addr & o.mask) == (o.addr & o.mask) && (t.addr & t.mask) == (o.addr & t.mask);
+            if (t.addr == o.addr || !same_subnet) {
+                continue;
+            }
+            const uint32_t speed = std::min(t.speed, o.speed);
+            if (!found || speed > best_speed) {
+                char text[INET_ADDRSTRLEN] = {};
+                struct in_addr in = {};
+                in.s_addr = t.addr;
+                if (inet_ntop(AF_INET, &in, text, sizeof(text)) != nullptr) {
+                    found = true;
+                    best_speed = speed;
+                    best = text;
+                }
+            }
+        }
+    }
+#endif
+    return best;
+}
+
 bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_state & state) {
     const uint32_t rank  = request.rank;
     const uint32_t world = request.world;
@@ -2807,9 +2886,13 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
     }
     uint8_t local_caps[RPC_CONN_CAPS_SIZE] = {};
     uint8_t remote_caps[RPC_CONN_CAPS_SIZE] = {};
+    const std::vector<rpc_comm_link> our_links = rpc_comm_local_links();
     for (uint32_t j = 0; j < rank; j++) {
-        const std::string host(request.hosts[j], strnlen(request.hosts[j], sizeof(request.hosts[j])));
+        std::string host(request.hosts[j], strnlen(request.hosts[j], sizeof(request.hosts[j])));
         socket_ptr peer;
+        // the first connection, at the host the client gave, learns the lower rank's links; when another link the two
+        // share is faster, the rank connects again over it, telling the first connection it moves
+        bool chosen = false;
         // the lower rank may not be listening yet, or may drop a connection before the handshake ends: the whole
         // handshake is retried for a few seconds, and a rank that reconnects replaces its first connection there
         for (int i = 0; i < 100 && peer == nullptr; i++) {
@@ -2820,9 +2903,35 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
             if (attempt == nullptr) {
                 continue;
             }
+            const uint32_t word = rank | (chosen ? RPC_COMM_CHOSEN_LINK : 0u);
+            if (!attempt->send_data(&word, sizeof(word))) {
+                continue;
+            }
+            if (!chosen) {
+                uint32_t n_links = 0;
+                if (!attempt->recv_data(&n_links, sizeof(n_links)) || n_links > 64) {
+                    continue;
+                }
+                std::vector<rpc_comm_link> their_links(n_links);
+                if (n_links > 0 && !attempt->recv_data(their_links.data(), n_links * sizeof(rpc_comm_link))) {
+                    continue;
+                }
+                const std::string best = rpc_comm_best_link(our_links, their_links);
+                const uint8_t move = !best.empty() && best != host;
+                if (!attempt->send_data(&move, sizeof(move))) {
+                    continue;
+                }
+                chosen = true;
+                if (move) {
+                    LOG_INFO("[%s] device %u: rank %u moves to rank %u's link at %s (given %s)\n", __func__, request.device,
+                             rank, j, best.c_str(), host.c_str());
+                    host = best;
+                    i = 0;
+                    continue;
+                }
+            }
             attempt->get_caps(local_caps);
-            if (!attempt->send_data(&rank, sizeof(rank)) || !attempt->send_data(local_caps, sizeof(local_caps)) ||
-                !attempt->recv_data(remote_caps, sizeof(remote_caps))) {
+            if (!attempt->send_data(local_caps, sizeof(local_caps)) || !attempt->recv_data(remote_caps, sizeof(remote_caps))) {
                 LOG_DBG("[%s] rank %u: the handshake with rank %u failed, retrying\n", __func__, rank, j);
                 continue;
             }
@@ -2844,14 +2953,29 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
             LOG_ERROR("[%s] rank %u failed to accept a higher rank\n", __func__, rank);
             return false;
         }
-        uint32_t peer_rank = 0;
-        if (!peer->recv_data(&peer_rank, sizeof(peer_rank))) {
+        uint32_t word = 0;
+        if (!peer->recv_data(&word, sizeof(word))) {
             LOG_DBG("[%s] rank %u: a connection closed before naming its rank\n", __func__, rank);
             continue;
         }
+        const uint32_t peer_rank = word & ~RPC_COMM_CHOSEN_LINK;
         if (peer_rank <= rank || peer_rank >= world) {
             LOG_ERROR("[%s] rank %u refused a connection naming rank %u of %u\n", __func__, rank, peer_rank, world);
             return false;
+        }
+        if ((word & RPC_COMM_CHOSEN_LINK) == 0) {
+            // a first connection learns our links; when the rank moves to another one, this connection is done
+            const uint32_t n_links = (uint32_t) our_links.size();
+            uint8_t move = 0;
+            if (!peer->send_data(&n_links, sizeof(n_links)) ||
+                (n_links > 0 && !peer->send_data(our_links.data(), n_links * sizeof(rpc_comm_link))) ||
+                !peer->recv_data(&move, sizeof(move))) {
+                LOG_DBG("[%s] rank %u: rank %u closed while learning the links\n", __func__, rank, peer_rank);
+                continue;
+            }
+            if (move) {
+                continue;
+            }
         }
         if (!peer->recv_data(remote_caps, sizeof(remote_caps))) {
             LOG_DBG("[%s] rank %u: rank %u closed during the handshake\n", __func__, rank, peer_rank);
@@ -3730,8 +3854,10 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         const char * v = std::getenv(name);
         return v != nullptr && std::atoi(v) != 0;
     };
+    const bool     mesh       = n_backends > 2 || env_on("GGML_RPC_COMM_MESH");
     const uint32_t comm_flags = (env_on("GGML_RPC_COMM_NCCL")     ? RPC_COMM_FLAG_NCCL     : 0u) |
-                                (env_on("GGML_RPC_COMM_WIRE_F32") ? RPC_COMM_FLAG_WIRE_F32 : 0u);
+                                (env_on("GGML_RPC_COMM_WIRE_F32") ? RPC_COMM_FLAG_WIRE_F32 : 0u) |
+                                (mesh                             ? RPC_COMM_FLAG_MESH     : 0u);
     // rank 1 reaches rank 0 at this address instead, e.g. rank 0 on the link the two share
     if (const char * comm_host = std::getenv("GGML_RPC_COMM_HOST")) {
         host0 = comm_host;
@@ -3740,7 +3866,7 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         return nullptr;
     }
     std::vector<std::vector<std::string>> mesh_hosts;
-    if (n_backends > 2) {
+    if (mesh) {
         std::vector<std::string> endpoints;
         for (const auto & rank : ranks) {
             endpoints.push_back(rank.endpoint);
@@ -3767,12 +3893,12 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         if (i > 0) {
             memcpy(request->host, host0.c_str(), host0.size());
         }
-        for (size_t j = 0; n_backends > 2 && j < i; j++) {
+        for (size_t j = 0; mesh && j < i; j++) {
             memcpy(request->hosts[j], mesh_hosts[i][j].c_str(), mesh_hosts[i][j].size());
         }
         // with no flag set this is upstream's COMM_INIT, which a server without the flags also reads; two ranks never
         // send the mesh hosts, so a server without the mesh still reads a pairwise request with flags
-        const size_t request_size = n_backends > 2 ? sizeof(*request) :
+        const size_t request_size = mesh ? sizeof(*request) :
                                     comm_flags != 0 ? RPC_COMM_INIT_REQ_SIZE_PAIR : RPC_COMM_INIT_REQ_SIZE_NO_FLAGS;
         ranks[i].dispatcher->send_async(RPC_CMD_COMM_INIT, request, request_size, &responses[i], sizeof(responses[i]));
     }
@@ -3792,7 +3918,7 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         }
         return nullptr;
     }
-    if (n_backends == 2) {
+    if (!mesh) {
         LOG_INFO("%s: pairwise communicator initialized (%s <-> %s)\n", __func__,
                  ranks[0].endpoint.c_str(), ranks[1].endpoint.c_str());
     } else {
