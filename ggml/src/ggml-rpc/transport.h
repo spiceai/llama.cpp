@@ -19,6 +19,9 @@ struct socket_t {
     // writes into fixed-size frames and posts the trailing partial frame only
     // here. No-op on TCP.
     bool flush();
+    // Ends the connection in both directions, so that a send or receive another thread is blocked in returns false.
+    // The socket stays open until it is destroyed.
+    void shutdown();
 
     socket_ptr accept();
 
