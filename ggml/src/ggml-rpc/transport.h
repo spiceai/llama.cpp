@@ -30,7 +30,8 @@ struct socket_t {
     bool wait_peer_closed(int timeout_ms);
     static bool detects_peer_close();
 
-    static socket_ptr create_server(const char * host, int port);
+    // backlog: how many connections may wait for accept()
+    static socket_ptr create_server(const char * host, int port, int backlog = 1);
     static socket_ptr connect(const char * host, int port);
 
 private:

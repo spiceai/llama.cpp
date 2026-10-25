@@ -747,11 +747,13 @@ socket_ptr socket_t::accept() {
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
 }
 
-socket_ptr socket_t::create_server(const char * host, int port) {
+socket_ptr socket_t::create_server(const char * host, int port, int backlog) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (!is_valid_fd(sockfd)) {
         return nullptr;
     }
+    // owns the descriptor from here on, so every failure below closes it
+    auto owner = std::make_unique<impl>(sockfd);
     if (!set_reuse_addr(sockfd)) {
         LOG_ERROR("Failed to set SO_REUSEADDR\n");
         return nullptr;
@@ -768,11 +770,11 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
         return nullptr;
     }
-    if (listen(sockfd, 1) < 0) {
+    if (listen(sockfd, backlog) < 0) {
         return nullptr;
     }
     LOG_DBG("[%s] listening on %s:%d\n", __func__, host, port);
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+    return socket_ptr(new socket_t(std::move(owner)));
 }
 
 socket_ptr socket_t::connect(const char * host, int port) {
@@ -780,6 +782,8 @@ socket_ptr socket_t::connect(const char * host, int port) {
     if (!is_valid_fd(sockfd)) {
         return nullptr;
     }
+    // owns the descriptor from here on, so a failed attempt (callers retry) does not leak it
+    auto owner = std::make_unique<impl>(sockfd);
     if (!set_no_delay(sockfd)) {
         LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
@@ -797,7 +801,7 @@ socket_ptr socket_t::connect(const char * host, int port) {
         return nullptr;
     }
     LOG_DBG("[%s] connected to %s:%d\n", __func__, host, port);
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+    return socket_ptr(new socket_t(std::move(owner)));
 }
 
 #ifdef _WIN32

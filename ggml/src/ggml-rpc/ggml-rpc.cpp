@@ -2798,7 +2798,8 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
     std::vector<socket_ptr> peers(world);
     socket_ptr srv;
     if (rank + 1 < world) {
-        srv = socket_t::create_server("0.0.0.0", (int) (request.port + rank));
+        // every higher rank may connect at once
+        srv = socket_t::create_server("0.0.0.0", (int) (request.port + rank), (int) world);
         if (srv == nullptr) {
             LOG_ERROR("[%s] rank %u failed to listen on comm port %u\n", __func__, rank, request.port + rank);
             return false;
@@ -2809,52 +2810,64 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
     for (uint32_t j = 0; j < rank; j++) {
         const std::string host(request.hosts[j], strnlen(request.hosts[j], sizeof(request.hosts[j])));
         socket_ptr peer;
-        // the lower rank may not be listening yet, retry for a few seconds
+        // the lower rank may not be listening yet, or may drop a connection before the handshake ends: the whole
+        // handshake is retried for a few seconds, and a rank that reconnects replaces its first connection there
         for (int i = 0; i < 100 && peer == nullptr; i++) {
-            peer = socket_t::connect(host.c_str(), (int) (request.port + j));
-            if (peer == nullptr) {
+            if (i > 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
+            socket_ptr attempt = socket_t::connect(host.c_str(), (int) (request.port + j));
+            if (attempt == nullptr) {
+                continue;
+            }
+            attempt->get_caps(local_caps);
+            if (!attempt->send_data(&rank, sizeof(rank)) || !attempt->send_data(local_caps, sizeof(local_caps)) ||
+                !attempt->recv_data(remote_caps, sizeof(remote_caps))) {
+                LOG_DBG("[%s] rank %u: the handshake with rank %u failed, retrying\n", __func__, rank, j);
+                continue;
+            }
+            attempt->update_caps(remote_caps);
+            peer = attempt;
         }
         if (peer == nullptr) {
             LOG_ERROR("[%s] rank %u failed to connect to rank %u at %s:%u\n", __func__, rank, j, host.c_str(),
                       request.port + j);
             return false;
         }
-        peer->get_caps(local_caps);
-        if (!peer->send_data(&rank, sizeof(rank)) || !peer->send_data(local_caps, sizeof(local_caps)) ||
-            !peer->recv_data(remote_caps, sizeof(remote_caps))) {
-            LOG_ERROR("[%s] rank %u lost rank %u during the handshake\n", __func__, rank, j);
-            return false;
-        }
-        peer->update_caps(remote_caps);
         LOG_INFO("[%s] device %u: rank %u reaches rank %u at %s over %s\n", __func__, request.device, rank, j,
                  host.c_str(), peer->transport_name());
         peers[j] = peer;
     }
-    for (uint32_t n = rank + 1; n < world; n++) {
+    for (uint32_t joined = 0; joined < world - 1 - rank; ) {
         socket_ptr peer = srv->accept();
-        uint32_t peer_rank = 0;
-        if (peer == nullptr || !peer->recv_data(&peer_rank, sizeof(peer_rank))) {
+        if (peer == nullptr) {
             LOG_ERROR("[%s] rank %u failed to accept a higher rank\n", __func__, rank);
             return false;
         }
-        if (peer_rank <= rank || peer_rank >= world || peers[peer_rank] != nullptr) {
+        uint32_t peer_rank = 0;
+        if (!peer->recv_data(&peer_rank, sizeof(peer_rank))) {
+            LOG_DBG("[%s] rank %u: a connection closed before naming its rank\n", __func__, rank);
+            continue;
+        }
+        if (peer_rank <= rank || peer_rank >= world) {
             LOG_ERROR("[%s] rank %u refused a connection naming rank %u of %u\n", __func__, rank, peer_rank, world);
             return false;
         }
         if (!peer->recv_data(remote_caps, sizeof(remote_caps))) {
-            LOG_ERROR("[%s] rank %u lost rank %u during the handshake\n", __func__, rank, peer_rank);
-            return false;
+            LOG_DBG("[%s] rank %u: rank %u closed during the handshake\n", __func__, rank, peer_rank);
+            continue;
         }
         peer->get_caps(local_caps);
         if (!peer->send_data(local_caps, sizeof(local_caps))) {
-            LOG_ERROR("[%s] rank %u lost rank %u during the handshake\n", __func__, rank, peer_rank);
-            return false;
+            LOG_DBG("[%s] rank %u: rank %u closed during the handshake\n", __func__, rank, peer_rank);
+            continue;
         }
         peer->update_caps(remote_caps);
         LOG_INFO("[%s] device %u: rank %u accepted rank %u over %s\n", __func__, request.device, rank, peer_rank,
                  peer->transport_name());
+        if (peers[peer_rank] == nullptr) {
+            joined++;
+        }
         peers[peer_rank] = peer;
     }
     if ((request.flags & RPC_COMM_FLAG_NCCL) != 0) {
@@ -2959,6 +2972,10 @@ bool rpc_server::comm_free(const rpc_msg_comm_free_req & request) {
         return false;
     }
     comm_state & state = comm_states[request.device];
+    if (!state.peers.empty()) {
+        LOG_INFO("[%s] device %u: rank %u of the %u-rank mesh ran %" PRIu64 " all-reduces\n", __func__, request.device,
+                 state.rank, state.world, state.seq);
+    }
     void * nccl = nullptr;
     {
         std::lock_guard<std::mutex> lock(comm_mutex);
