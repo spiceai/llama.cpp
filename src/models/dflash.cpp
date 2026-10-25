@@ -364,6 +364,9 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
     ggml_tensor * cur = build_inp_embd_enc();
 
     cur = build_lora_mm(model.fc, cur, model.fc_s);
+    if (cparams.logits_gather && llama_dspark_split()) {
+        cur = ggml_backend_meta_gather(ctx0, cur);
+    }
     cb(cur, "fc_out", -1);
 
     cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
@@ -432,6 +435,10 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     for (int64_t i = i_draft_beg; i < block_drafts; ++i) {
         ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);                          // [R, n_blocks]
         ggml_tensor * bias    = g.build_lora_mm(w2, w1_prev, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
+        if (g.cparams.logits_gather && llama_dspark_split()) {
+            // the add and argmax below read whole rows
+            bias = ggml_backend_meta_gather(ctx0, bias);
+        }
         if (model.d2t) {
             // reduced draft vocab: scatter the bias to the target rows (base is -inf on the others)
             const int64_t n_draft_vocab = bias->ne[0];
@@ -863,6 +870,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
         // fuse the target features through the encoder
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+        if (cparams.logits_gather && llama_dspark_split()) {
+            // the norm below reads whole rows
+            inp_g = ggml_backend_meta_gather(ctx0, inp_g);
+        }
         inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
         cb(inp_g, "inp_g_embeddings", -1);
 
@@ -1147,6 +1158,10 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
         // fuse the target features through the encoder
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+        if (cparams.logits_gather && llama_dspark_split()) {
+            // the norm below reads whole rows
+            inp_g = ggml_backend_meta_gather(ctx0, inp_g);
+        }
         inp_g = build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
         cb(inp_g, "inp_g_embeddings", -1);
 
@@ -1332,6 +1347,10 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
         res->add_input(std::move(inp));
 
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+        if (cparams.logits_gather && llama_dspark_split()) {
+            // the norm below reads whole rows
+            inp_g = ggml_backend_meta_gather(ctx0, inp_g);
+        }
         inp_g = build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
         cb(inp_g, "main_x", -1);
 

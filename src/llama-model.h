@@ -662,6 +662,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 // (DeepSeek-V4 mirrors it otherwise) and gather the logits whole onto every device, for samplers and draft heads
 bool llama_tensor_logits_gather();
 
+// LLAMA_DSPARK_SPLIT=1 (with LLAMA_TENSOR_LOGITS_GATHER=1): split the DFlash/DSpark drafter's feature projection (fc) and
+// Markov transition (markov_w2) by output rows as well, and gather their results whole onto every device
+bool llama_dspark_split();
+
 struct llama_prec_policy {
     // the key is the weight tensor `res->src[0]`, stores the recommended accumulation type of the op (unused for now)
     // TODO: migrate ad-hoc ggml_prec_set_acc() calls to this container + update apply() to use it
