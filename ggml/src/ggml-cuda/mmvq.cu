@@ -1162,8 +1162,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
         const bool is_nvidia_pascal_older = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
 
+        // GGML_CUDA_MMVQ_IQ3_SMALL_K=1 keeps the small-K path for the IQ3 types as well, which pays off when K is a
+        // few blocks (an expert down projection split across ranks); off by default, measured on GB10 only
+        static const bool iq3_small_k = [] {
+            const char * v = getenv("GGML_CUDA_MMVQ_IQ3_SMALL_K");
+            return v != nullptr && atoi(v) != 0;
+        }();
         if (is_nvidia_turing_plus) {
-            if (ncols_dst == 1 &&
+            if (ncols_dst == 1 && !iq3_small_k &&
                     std::find(iq_slow_turing.begin(), iq_slow_turing.end(), type) != iq_slow_turing.end()) {
                 use = false;
             }

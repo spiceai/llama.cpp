@@ -6171,8 +6171,69 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+#ifdef GGML_USE_NCCL
+// NCCL between processes, for callers outside this backend such as the RPC server's pairwise all-reduce
+static bool ggml_backend_cuda_nccl_unique_id(void * out, size_t size) {
+    ncclUniqueId id;
+    if (size < sizeof(id) || ncclGetUniqueId(&id) != ncclSuccess) {
+        return false;
+    }
+    memcpy(out, &id, sizeof(id));
+    return true;
+}
+
+static void * ggml_backend_cuda_nccl_comm_init_rank(ggml_backend_t backend, const void * id, int nranks, int rank) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    ncclUniqueId uid;
+    memcpy(&uid, id, sizeof(uid));
+    ncclComm_t comm = nullptr;
+    if (ncclCommInitRank(&comm, nranks, uid, rank) != ncclSuccess) {
+        return nullptr;
+    }
+    return comm;
+}
+
+static void ggml_backend_cuda_nccl_comm_free(void * comm) {
+    if (comm != nullptr) {
+        ncclCommDestroy((ncclComm_t) comm);
+    }
+}
+
+// for a peer that may no longer take part: ends any collective still waiting on it instead of waiting for it
+static void ggml_backend_cuda_nccl_comm_abort(void * comm) {
+    if (comm != nullptr) {
+        ncclCommAbort((ncclComm_t) comm);
+    }
+}
+
+// sums the tensor in place across the communicator's ranks, queued on the backend's stream
+static bool ggml_backend_cuda_nccl_allreduce(ggml_backend_t backend, void * comm, ggml_tensor * t) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    return ncclAllReduce(t->data, t->data, ggml_nelements(t), ncclFloat, ncclSum, (ncclComm_t) comm, cuda_ctx->stream()) == ncclSuccess;
+}
+#endif // GGML_USE_NCCL
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#ifdef GGML_USE_NCCL
+    if (strcmp(name, "ggml_backend_cuda_nccl_unique_id") == 0) {
+        return (void *)ggml_backend_cuda_nccl_unique_id;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_comm_init_rank") == 0) {
+        return (void *)ggml_backend_cuda_nccl_comm_init_rank;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_comm_free") == 0) {
+        return (void *)ggml_backend_cuda_nccl_comm_free;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_comm_abort") == 0) {
+        return (void *)ggml_backend_cuda_nccl_comm_abort;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_allreduce") == 0) {
+        return (void *)ggml_backend_cuda_nccl_allreduce;
+    }
+#endif // GGML_USE_NCCL
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <cinttypes>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <thread>
@@ -248,13 +249,23 @@ struct rpc_msg_get_tensor_2d_req {
     uint64_t stride;
 };
 
+// RPC_COMM_FLAG_*: how the client asks both ranks to reduce, so the two servers always agree
+static constexpr uint32_t RPC_COMM_FLAG_NCCL     = 1u; // through NCCL when both servers can (GGML_RPC_COMM_NCCL=1)
+static constexpr uint32_t RPC_COMM_FLAG_WIRE_F32 = 2u; // host path: every partial as F32 (GGML_RPC_COMM_WIRE_F32=1)
+
 struct rpc_msg_comm_init_req {
     uint32_t device;
     uint32_t rank;
     uint32_t world;
     uint32_t port;      // rank 0: port to listen on; rank > 0: rank 0's comm port
     char     host[64];  // rank > 0: rank 0's host
+    uint32_t flags;     // RPC_COMM_FLAG_*, the same for every rank; sent only when one is set
 };
+
+// a COMM_INIT with no RPC_COMM_FLAG_* set is upstream's request, without the flags, so that a client that sets no
+// flag and a server without them (or the reverse) still agree on its size
+static constexpr size_t RPC_COMM_INIT_REQ_SIZE_NO_FLAGS = offsetof(rpc_msg_comm_init_req, flags);
+static_assert(RPC_COMM_INIT_REQ_SIZE_NO_FLAGS == 80, "COMM_INIT without flags must stay upstream's 80 bytes");
 
 struct rpc_msg_comm_init_rsp {
     uint8_t ok;
@@ -339,6 +350,19 @@ static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
         return false;
     }
     return sock->recv_data(msg, msg_size);
+}
+
+// COMM_INIT comes in either size: with the flags, or upstream's request without them (no flag set)
+static bool recv_comm_init_req(socket_ptr sock, rpc_msg_comm_init_req & request) {
+    uint64_t size;
+    if (!sock->recv_data(&size, sizeof(size))) {
+        return false;
+    }
+    if (size != sizeof(request) && size != RPC_COMM_INIT_REQ_SIZE_NO_FLAGS) {
+        return false;
+    }
+    request = {};
+    return sock->recv_data(&request, size);
 }
 
 static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
@@ -845,6 +869,17 @@ static bool rpc_use_hash_cache(const ggml_tensor * tensor, size_t size) {
     return size > HASH_THRESHOLD && tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
 }
 
+// GGML_RPC_SET_ASYNC=1: a buffer write returns once it is queued; the request owns a copy of the data and the
+// server handles commands in order, so a later graph compute or read on that server sees it. A write into a weight
+// buffer still waits: model loading writes the whole model that way, and nothing else would bound the queued copies
+static bool rpc_set_async(ggml_backend_buffer_t buffer) {
+    static const bool v = [] {
+        const char * e = std::getenv("GGML_RPC_SET_ASYNC");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
@@ -869,7 +904,11 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     }
     size_t input_size;
     auto input = serialize_set_tensor(rpc_tensor, cache_flag, offset, data, size, input_size);
-    ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
+    if (rpc_set_async(buffer)) {
+        ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR, input, input_size);
+    } else {
+        ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
+    }
 }
 
 static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
@@ -891,7 +930,11 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, 
         memcpy(dest + i*size, (const char *)data + i*stride_data, size);
     }
     std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-    ctx->dispatcher->send(RPC_CMD_SET_TENSOR_2D, input_ptr, input_size);
+    if (rpc_set_async(buffer)) {
+        ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR_2D, input_ptr, input_size);
+    } else {
+        ctx->dispatcher->send(RPC_CMD_SET_TENSOR_2D, input_ptr, input_size);
+    }
 }
 
 static void ggml_backend_rpc_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data,
@@ -1441,6 +1484,11 @@ private:
         size_t                  scratch_size = 0;
         std::vector<uint8_t>    send_buf;
         std::vector<uint8_t>    recv_buf;
+        bool                    wire_f32 = false;              // send every host-path partial as F32 (RPC_COMM_FLAG_WIRE_F32)
+        void *                  nccl = nullptr;                // NCCL communicator with the peer (RPC_COMM_FLAG_NCCL)
+        bool                  (*nccl_allreduce)(ggml_backend_t, void *, ggml_tensor *) = nullptr;
+        void                  (*nccl_free)(void *) = nullptr;   // COMM_FREE: both ranks free the communicator together
+        void                  (*nccl_abort)(void *) = nullptr;  // disconnect without COMM_FREE: the peer may not take part
     };
 
     std::vector<ggml_backend_t> backends;
@@ -2221,6 +2269,19 @@ void rpc_server::sync_all_backends() {
 
 // The comm link between two servers uses the same caps negotiation as the client HELLO,
 // so it gets the same transport upgrades (e.g. RDMA).
+// NCCL between the two servers of the pairwise comm, through the CUDA backend's exports
+typedef bool   (*rpc_nccl_unique_id_t)(void * out, size_t size);
+typedef void * (*rpc_nccl_comm_init_rank_t)(ggml_backend_t backend, const void * id, int nranks, int rank);
+typedef void   (*rpc_nccl_comm_free_t)(void * comm);
+typedef void   (*rpc_nccl_comm_abort_t)(void * comm);
+typedef bool   (*rpc_nccl_allreduce_t)(ggml_backend_t backend, void * comm, ggml_tensor * t);
+
+static void * rpc_backend_proc(ggml_backend_t backend, const char * name) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg != nullptr ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+
 bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response) {
     response.ok = 0;
     if (request.device >= backends.size() || request.world != 2 || request.rank >= request.world) {
@@ -2274,8 +2335,59 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
         }
         state.peer->update_caps(remote_caps);
     }
-    state.rank  = request.rank;
-    state.world = request.world;
+    state.rank     = request.rank;
+    state.world    = request.world;
+    state.wire_f32 = (request.flags & RPC_COMM_FLAG_WIRE_F32) != 0;
+
+    // RPC_COMM_FLAG_NCCL: reduce on the device with NCCL, queued on the backend's stream, instead of copying each
+    // partial to the host and exchanging it over the peer connection. The client sends the same flags to both ranks,
+    // so both take this branch, and they agree on whether NCCL is available before initializing it, because
+    // ncclCommInitRank waits for every rank to join.
+    if ((request.flags & RPC_COMM_FLAG_NCCL) != 0) {
+        ggml_backend_t backend = backends[request.device];
+        auto unique_id = (rpc_nccl_unique_id_t)      rpc_backend_proc(backend, "ggml_backend_cuda_nccl_unique_id");
+        auto init_rank = (rpc_nccl_comm_init_rank_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_init_rank");
+        state.nccl_allreduce = (rpc_nccl_allreduce_t)  rpc_backend_proc(backend, "ggml_backend_cuda_nccl_allreduce");
+        state.nccl_free      = (rpc_nccl_comm_free_t)  rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_free");
+        state.nccl_abort     = (rpc_nccl_comm_abort_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_abort");
+        uint8_t ok = unique_id != nullptr && init_rank != nullptr && state.nccl_allreduce != nullptr && state.nccl_free != nullptr &&
+                     state.nccl_abort != nullptr;
+        uint8_t peer_ok = 0;
+        uint8_t id[128] = {};
+        bool sent;
+        if (request.rank == 0) {
+            ok = ok && unique_id(id, sizeof(id));
+            sent = state.peer->send_data(&ok, 1) && state.peer->send_data(id, sizeof(id)) && state.peer->flush() &&
+                   state.peer->recv_data(&peer_ok, 1);
+        } else {
+            sent = state.peer->recv_data(&peer_ok, 1) && state.peer->recv_data(id, sizeof(id)) &&
+                   state.peer->send_data(&ok, 1) && state.peer->flush();
+        }
+        if (!sent) {
+            // the peer connection failed mid-handshake, so the ranks may now disagree: this COMM_INIT fails
+            state.peer = nullptr;
+            return true;
+        }
+        if (ok && peer_ok) {
+            state.nccl = init_rank(backend, id, (int) request.world, (int) request.rank);
+            // ncclCommInitRank can succeed on one rank and fail on the other, so the ranks agree on its result as
+            // well: unless both have a communicator, neither keeps one, and both copy through the host
+            uint8_t inited = state.nccl != nullptr;
+            uint8_t peer_inited = 0;
+            const bool agreed = request.rank == 0 ?
+                state.peer->send_data(&inited, 1) && state.peer->flush() && state.peer->recv_data(&peer_inited, 1) :
+                state.peer->recv_data(&peer_inited, 1) && state.peer->send_data(&inited, 1) && state.peer->flush();
+            if ((!agreed || !peer_inited) && state.nccl != nullptr) {
+                state.nccl_abort(state.nccl);
+                state.nccl = nullptr;
+            }
+            if (!agreed) {
+                state.peer = nullptr;
+                return true;
+            }
+        }
+        LOG_INFO("[%s] device %u NCCL all-reduce %s\n", __func__, request.device, state.nccl != nullptr ? "on" : "unavailable, copying through the host");
+    }
     LOG_INFO("[%s] device %u joined pairwise comm as rank %u\n", __func__, request.device, request.rank);
     response.ok = 1;
     return true;
@@ -2311,9 +2423,19 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     if (nbytes == 0) {
         return true;
     }
+    if (state.nccl != nullptr) {
+        // NCCL reduces ggml_nelements floats in place, so it takes only a dense F32 tensor whose floats are exactly the
+        // ggml_nbytes that deserialize_tensor kept inside the buffer; for a huge ne, ggml_nbytes wraps and is smaller
+        if (t_dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(t_dst) || nbytes / sizeof(float) != (size_t) ne) {
+            LOG_ERROR("[%s] NCCL all-reduce needs a contiguous F32 tensor whose size matches its element count, got %s with %" PRId64 " elements in %zu bytes\n",
+                      __func__, ggml_type_name(t_dst->type), ne, nbytes);
+            return false;
+        }
+        return state.nccl_allreduce(backend, state.nccl, t_dst);
+    }
     // reduce large partials in bf16 to halve the wire bytes; small (decode-sized) ones
     // stay f32 since the extra casts and sync cost more than the bytes saved
-    const bool   wire_bf16  = t_dst->type == GGML_TYPE_F32 && ne >= 32768;
+    const bool   wire_bf16  = !state.wire_f32 && t_dst->type == GGML_TYPE_F32 && ne >= 32768;
     const size_t wire_bytes = wire_bf16 ? (size_t) ne*2 : nbytes;
     const size_t need       = wire_bf16 ? 2*nbytes : nbytes;
     if (state.scratch_size < need) {
@@ -2406,6 +2528,10 @@ bool rpc_server::comm_free(const rpc_msg_comm_free_req & request) {
     if (request.device >= backends.size()) {
         return false;
     }
+    comm_state & state = comm_states[request.device];
+    if (state.nccl != nullptr) {
+        state.nccl_free(state.nccl);
+    }
     comm_states[request.device] = comm_state();
     return true;
 }
@@ -2426,6 +2552,16 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    // a client that disconnects without COMM_FREE still leaves no NCCL communicator behind; abort it rather than
+    // destroy it, since the client may have sent a collective to this rank only, which the peer never joins
+    for (size_t device = 0; device < comm_states.size(); device++) {
+        comm_state & state = comm_states[device];
+        if (state.nccl != nullptr && state.nccl_abort != nullptr) {
+            state.nccl_abort(state.nccl);
+            state.nccl = nullptr;
+            LOG_INFO("[%s] device %zu: aborted the NCCL communicator the client left open\n", __func__, device);
+        }
+    }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
@@ -2705,7 +2841,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_COMM_INIT: {
                 rpc_msg_comm_init_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_comm_init_req(sock, request)) {
                     return;
                 }
                 rpc_msg_comm_init_rsp response;
@@ -3021,6 +3157,13 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         return nullptr;
     }
     const uint32_t comm_port = (uint32_t) port0 + 1000;
+    // GGML_RPC_COMM_NCCL=1 / GGML_RPC_COMM_WIRE_F32=1 here, on the client, decide for both ranks
+    auto env_on = [](const char * name) {
+        const char * v = std::getenv(name);
+        return v != nullptr && std::atoi(v) != 0;
+    };
+    const uint32_t comm_flags = (env_on("GGML_RPC_COMM_NCCL")     ? RPC_COMM_FLAG_NCCL     : 0u) |
+                                (env_on("GGML_RPC_COMM_WIRE_F32") ? RPC_COMM_FLAG_WIRE_F32 : 0u);
     // rank 1 reaches rank 0 at this address instead, e.g. rank 0 on the link the two share
     if (const char * comm_host = std::getenv("GGML_RPC_COMM_HOST")) {
         host0 = comm_host;
@@ -3042,10 +3185,13 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         request->rank   = (uint32_t) i;
         request->world  = (uint32_t) n_backends;
         request->port   = comm_port;
+        request->flags  = comm_flags;
         if (i > 0) {
             memcpy(request->host, host0.c_str(), host0.size());
         }
-        ranks[i].dispatcher->send_async(RPC_CMD_COMM_INIT, request, sizeof(*request), &responses[i], sizeof(responses[i]));
+        // with no flag set this is upstream's COMM_INIT, which a server without the flags also reads
+        const size_t request_size = comm_flags != 0 ? sizeof(*request) : RPC_COMM_INIT_REQ_SIZE_NO_FLAGS;
+        ranks[i].dispatcher->send_async(RPC_CMD_COMM_INIT, request, request_size, &responses[i], sizeof(responses[i]));
     }
     for (size_t i = 0; i < n_backends; i++) {
         ranks[i].dispatcher->synchronize();

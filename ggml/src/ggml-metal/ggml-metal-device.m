@@ -1802,7 +1802,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
             }
         case GGML_OP_DSV4_HC_COMB:
-            return has_simdgroup_reduction &&
+            return has_simdgroup_reduction && ((const int32_t *) op->op_params)[2] == 0 &&
                 op->src[0]->type == GGML_TYPE_F32 &&
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 &&

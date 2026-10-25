@@ -2713,6 +2713,20 @@ extern "C" {
             float                 eps,
             int32_t               n_iter);
 
+    // hc_weights: hc_comb plus the pre and post weights, from one pass over mixes
+    //   -> [(2 + hc)*hc, n_tokens]: row h < hc is pre[h]  = sigmoid(mixes[h, t]*scale[0] + base[h]) + pre_eps,
+    //      row hc + h is post[h] = post_scale*sigmoid(mixes[hc + h, t]*scale[1] + base[hc + h]),
+    //      row 2*hc + dst + hc*src is the hc_comb element [dst, src]
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_weights(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter,
+            float                 pre_eps,
+            float                 post_scale);
+
     // hc_pre: x [n_embd, hc, n_tokens], weights [hc, n_tokens] -> [n_embd, n_tokens]
     //   result[i, t] = sum_h x[i, h, t]*weights[h, t]
     //

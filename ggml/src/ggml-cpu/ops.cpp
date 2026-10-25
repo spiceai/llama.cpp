@@ -11478,10 +11478,20 @@ static void ggml_compute_forward_dsv4_hc_comb_f32(
 
     const int64_t n_tokens = mixes->ne[1];
 
+    // mode 1 (ggml_dsv4_hc_weights): dst is [hc_mix_dim, n_tokens] with the pre and post weights ahead of the comb
+    const bool  weights    = ggml_get_op_params_i32(dst, 2) == 1;
+    const float pre_eps    = ggml_get_op_params_f32(dst, 3);
+    const float post_scale = ggml_get_op_params_f32(dst, 4);
+
     GGML_ASSERT(mixes->ne[0] == hc_mix_dim);
-    GGML_ASSERT(dst->ne[0] == hc);
-    GGML_ASSERT(dst->ne[1] == hc);
-    GGML_ASSERT(dst->ne[2] == n_tokens);
+    if (weights) {
+        GGML_ASSERT(dst->ne[0] == hc_mix_dim);
+        GGML_ASSERT(dst->ne[1] == n_tokens);
+    } else {
+        GGML_ASSERT(dst->ne[0] == hc);
+        GGML_ASSERT(dst->ne[1] == hc);
+        GGML_ASSERT(dst->ne[2] == n_tokens);
+    }
     GGML_ASSERT(scale->ne[0] >= 3);
     GGML_ASSERT(base->ne[0] == hc_mix_dim);
 
@@ -11538,6 +11548,29 @@ static void ggml_compute_forward_dsv4_hc_comb_f32(
             ggml_dsv4_hc_comb_norm_cols(comb, eps);
         }
 
+        if (weights) {
+            const float scale_pre  = *(const float *) ((const char *) scale->data + 0*nbs0);
+            const float scale_post = *(const float *) ((const char *) scale->data + 1*nbs0);
+            for (int64_t h = 0; h < hc; ++h) {
+                const float mp = *(const float *) ((const char *) mixes->data + h*nbm0 + it*nbm1);
+                const float bp = *(const float *) ((const char *) base->data  + h*nbb0);
+                const float mq = *(const float *) ((const char *) mixes->data + (hc + h)*nbm0 + it*nbm1);
+                const float bq = *(const float *) ((const char *) base->data  + (hc + h)*nbb0);
+                // round each product to F32 before adding the base, as the separate MUL and ADD nodes do (the CUDA kernel
+                // uses __fmul_rn and __fadd_rn): a compiler that contracts the two into a fused multiply-add rounds once,
+                // which changes the weights
+                const volatile float sp = mp*scale_pre;
+                const volatile float sq = mq*scale_post;
+                const float pre  = 1.0f / (1.0f + expf(-(sp + bp)));
+                const float post = 1.0f / (1.0f + expf(-(sq + bq)));
+                *(float *) ((char *) dst->data + h*nbd0 + it*nbd1)        = pre + pre_eps;
+                *(float *) ((char *) dst->data + (hc + h)*nbd0 + it*nbd1) = post_scale*post;
+            }
+            for (int64_t idx = 0; idx < hc*hc; ++idx) {
+                *(float *) ((char *) dst->data + (comb_offset + idx)*nbd0 + it*nbd1) = comb[idx];
+            }
+            continue;
+        }
         for (int64_t isrc = 0; isrc < hc; ++isrc) {
             for (int64_t idst = 0; idst < hc; ++idst) {
                 const int64_t idx = idst + hc*isrc;

@@ -383,6 +383,25 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_mixes(
     }
     cb(mixes, "hc_mixes", il);
 
+    // LLAMA_DSV4_HC_WEIGHTS=1: pre, post and comb from one kernel; the chains below cost 8 more launches per block
+    static const bool hc_weights = [] {
+        const char * v = getenv("LLAMA_DSV4_HC_WEIGHTS");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    if (hc_weights && cparams.fused_dsv4_hc_comb) {
+        ggml_tensor * w = ggml_dsv4_hc_weights(ctx0, mixes, hc_scale, hc_base, hparams.dsv4_hc_eps,
+                (int32_t) hparams.dsv4_hc_sinkhorn_iters, hparams.dsv4_hc_eps, 2.0f);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COMB, w, il});
+        const size_t es = ggml_element_size(w);
+        ggml_tensor * pre = ggml_view_2d(ctx0, w, hc, nt, w->nb[1], 0);
+        cb(pre, "hc_pre", il);
+        *post = ggml_view_2d(ctx0, w, hc, nt, w->nb[1], hc*es);
+        cb(*post, "hc_post", il);
+        *comb = ggml_view_3d(ctx0, w, hc, hc, nt, hc*es, w->nb[1], 2*hc*es);
+        cb(*comb, "hc_comb", il);
+        return pre;
+    }
+
     ggml_tensor * scale_pre  = dsv4_view_1d(ctx0, hc_scale, 1, 0);
     ggml_tensor * scale_post = dsv4_view_1d(ctx0, hc_scale, 1, 1);
 
