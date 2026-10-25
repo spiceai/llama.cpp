@@ -6215,8 +6215,84 @@ static bool ggml_backend_cuda_nccl_allreduce(ggml_backend_t backend, void * comm
 }
 #endif // GGML_USE_NCCL
 
+// The RPC mesh all-reduce, queued on the backend's stream instead of waiting on it: the partial in `t` goes to host
+// memory at `out`, the stream sets `*ready` to `seq` and waits for `*done` to reach `seq`, and then reads the sum back
+// from `in`. A thread of the RPC server exchanges the partials between the two signals, so the stream never drains and
+// the next subgraph is already queued behind the wait. `out`, `in`, `ready` and `done` are host memory from
+// ggml_backend_cuda_comm_host_alloc; ggml_backend_cuda_comm_can_stage says once whether the device can do this.
+static void * ggml_backend_cuda_comm_host_alloc(size_t size) {
+    void * ptr = nullptr;
+    if (cudaHostAlloc(&ptr, size, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    memset(ptr, 0, size);
+    return ptr;
+}
+
+static void ggml_backend_cuda_comm_host_free(void * ptr) {
+    if (ptr != nullptr) {
+        CUDA_CHECK(cudaFreeHost(ptr));
+    }
+}
+
+// whether the stream can signal and wait on host memory: waits on a flag already set, signals another, and checks it
+static bool ggml_backend_cuda_comm_can_stage(ggml_backend_t backend, uint32_t * ready, uint32_t * done) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    void * ready_dev = nullptr;
+    void * done_dev  = nullptr;
+    if (cudaHostGetDevicePointer(&ready_dev, ready, 0) != cudaSuccess || cudaHostGetDevicePointer(&done_dev, done, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    __atomic_store_n(done, 1u, __ATOMIC_RELEASE);
+    __atomic_store_n(ready, 0u, __ATOMIC_RELEASE);
+    CUstream stream = (CUstream) cuda_ctx->stream();
+    const bool queued =
+        cuStreamWaitValue32(stream, (CUdeviceptr) done_dev, 1, CU_STREAM_WAIT_VALUE_GEQ) == CUDA_SUCCESS &&
+        cuStreamWriteValue32(stream, (CUdeviceptr) ready_dev, 7, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS;
+    const bool ran = queued && cudaStreamSynchronize(cuda_ctx->stream()) == cudaSuccess;
+    (void) cudaGetLastError();
+    const bool ok = ran && __atomic_load_n(ready, __ATOMIC_ACQUIRE) == 7u;
+    __atomic_store_n(done, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(ready, 0u, __ATOMIC_RELEASE);
+    return ok;
+}
+
+static bool ggml_backend_cuda_comm_stage(ggml_backend_t backend, ggml_tensor * t, void * out, const void * in,
+                                         uint32_t * ready, uint32_t * done, uint32_t seq) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    void * ready_dev = nullptr;
+    void * done_dev  = nullptr;
+    if (cudaHostGetDevicePointer(&ready_dev, ready, 0) != cudaSuccess || cudaHostGetDevicePointer(&done_dev, done, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    cudaStream_t stream = cuda_ctx->stream();
+    const size_t nbytes = ggml_nbytes(t);
+    CUDA_CHECK(cudaMemcpyAsync(out, t->data, nbytes, cudaMemcpyDeviceToHost, stream));
+    CU_CHECK(cuStreamWriteValue32((CUstream) stream, (CUdeviceptr) ready_dev, seq, CU_STREAM_WRITE_VALUE_DEFAULT));
+    CU_CHECK(cuStreamWaitValue32((CUstream) stream, (CUdeviceptr) done_dev, seq, CU_STREAM_WAIT_VALUE_GEQ));
+    CUDA_CHECK(cudaMemcpyAsync(t->data, in, nbytes, cudaMemcpyHostToDevice, stream));
+    return true;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_comm_host_alloc") == 0) {
+        return (void *)ggml_backend_cuda_comm_host_alloc;
+    }
+    if (strcmp(name, "ggml_backend_cuda_comm_host_free") == 0) {
+        return (void *)ggml_backend_cuda_comm_host_free;
+    }
+    if (strcmp(name, "ggml_backend_cuda_comm_can_stage") == 0) {
+        return (void *)ggml_backend_cuda_comm_can_stage;
+    }
+    if (strcmp(name, "ggml_backend_cuda_comm_stage") == 0) {
+        return (void *)ggml_backend_cuda_comm_stage;
+    }
 #ifdef GGML_USE_NCCL
     if (strcmp(name, "ggml_backend_cuda_nccl_unique_id") == 0) {
         return (void *)ggml_backend_cuda_nccl_unique_id;

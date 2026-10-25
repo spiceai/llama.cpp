@@ -1452,6 +1452,11 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 
 // RPC server-side implementation
 
+struct rpc_comm_async;
+struct rpc_comm_async_deleter {
+    void operator()(rpc_comm_async * async) const;
+};
+
 class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
@@ -1519,10 +1524,13 @@ private:
         std::vector<std::vector<uint8_t>> parts;
         std::vector<float>                sum;
         uint64_t                          seq = 0;
+        // GGML_RPC_COMM_ASYNC: the all-reduces queued on the backend's stream, exchanged by a thread of their own
+        std::unique_ptr<struct rpc_comm_async, rpc_comm_async_deleter> async;
     };
 
     bool comm_init_mesh(const rpc_msg_comm_init_req & request, comm_state & state);
     bool comm_allreduce_mesh(comm_state & state, ggml_backend_t backend, ggml_tensor * t_dst);
+    bool comm_allreduce_mesh_async(comm_state & state, ggml_backend_t backend, ggml_tensor * t_dst);
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
@@ -2641,6 +2649,181 @@ static std::string rpc_comm_best_link(const std::vector<rpc_comm_link> & ours, c
     return best;
 }
 
+// Sends this rank's partial (`nbytes` at `own`) to every peer and receives theirs into `parts`, then sums all of them
+// in rank order into `sum`, so every rank holds the same bits. Each partial goes behind its rpc_comm_part_hdr, as a
+// separate message: the RDMA transport delivers messages whole, so a read must take exactly what one send wrote.
+static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32_t rank, uint32_t world, uint64_t seq,
+                                   size_t nbytes, const uint8_t * own, std::vector<std::vector<uint8_t>> & parts, float * sum) {
+    const rpc_comm_part_hdr hdr = { seq, (uint64_t) nbytes };
+    for (auto & part : parts) {
+        if (part.size() < nbytes) {
+            part.resize(nbytes);
+        }
+    }
+    // the header first: a peer on another all-reduce, or with a partial of another size, fails here instead of being
+    // read as this partial
+    auto recv_part = [&](uint32_t j) {
+        rpc_comm_part_hdr got;
+        if (!peers[j]->recv_data(&got, sizeof(got))) {
+            return false;
+        }
+        if (got.seq != hdr.seq || got.nbytes != hdr.nbytes) {
+            LOG_ERROR("[%s] rank %u expected all-reduce %" PRIu64 " of %" PRIu64 " bytes from rank %u, got %" PRIu64
+                      " of %" PRIu64 " bytes\n", __func__, rank, hdr.seq, hdr.nbytes, j, got.seq, got.nbytes);
+            return false;
+        }
+        return peers[j]->recv_data(parts[j].data(), nbytes);
+    };
+    auto send_part = [&](uint32_t j) {
+        return peers[j]->send_data(&hdr, sizeof(hdr)) && peers[j]->send_data(own, nbytes) && peers[j]->flush();
+    };
+    auto lost = [&](uint32_t j) {
+        LOG_ERROR("[%s] rank %u lost rank %u during all-reduce %" PRIu64 "\n", __func__, rank, j, hdr.seq);
+        return false;
+    };
+    if (nbytes <= RPC_COMM_MESH_EAGER_BYTES) {
+        for (uint32_t j = 0; j < world; j++) {
+            if (j != rank && !send_part(j)) {
+                return lost(j);
+            }
+        }
+        for (uint32_t j = 0; j < world; j++) {
+            if (j != rank && !recv_part(j)) {
+                return lost(j);
+            }
+        }
+    } else {
+        // pair by pair in rank order, the lower rank of each pair sending first: the unfinished pair with the lowest
+        // ranks always has both of its ranks waiting on it, so the exchange cannot deadlock
+        for (uint32_t j = 0; j < world; j++) {
+            if (j == rank) {
+                continue;
+            }
+            const bool ok = rank < j ? send_part(j) && recv_part(j) : recv_part(j) && send_part(j);
+            if (!ok) {
+                return lost(j);
+            }
+        }
+    }
+    const int64_t ne = (int64_t) (nbytes / sizeof(float));
+    for (uint32_t j = 0; j < world; j++) {
+        const float * part = (const float *) (j == rank ? own : parts[j].data());
+        if (j == 0) {
+            memcpy(sum, part, nbytes);
+            continue;
+        }
+        for (int64_t k = 0; k < ne; k++) {
+            sum[k] += part[k];
+        }
+    }
+    return true;
+}
+
+// GGML_RPC_COMM_ASYNC=1 (or flag:<path>, on while the file exists): the backend's stream copies each partial to host
+// memory, signals `ready` and waits on `done`; this thread exchanges and sums the partials and signals `done`, so the
+// server thread never waits for the stream and the next subgraph is already queued behind the wait. Only for a backend
+// that exports ggml_backend_cuda_comm_stage (CUDA) and whose device can wait on host memory.
+typedef void * (*rpc_comm_host_alloc_t)(size_t size);
+typedef void   (*rpc_comm_host_free_t)(void * ptr);
+typedef bool   (*rpc_comm_can_stage_t)(ggml_backend_t backend, uint32_t * ready, uint32_t * done);
+typedef bool   (*rpc_comm_stage_t)(ggml_backend_t backend, ggml_tensor * t, void * out, const void * in,
+                                   uint32_t * ready, uint32_t * done, uint32_t seq);
+
+struct rpc_comm_async {
+    static constexpr uint32_t RING = 256;         // all-reduces that may be queued ahead of the exchange
+
+    rpc_comm_host_free_t host_free = nullptr;
+    rpc_comm_stage_t     stage     = nullptr;
+    ggml_backend_t       backend   = nullptr;
+    uint32_t * flags    = nullptr;                // [0] ready, [1] done: host memory the stream writes and waits on
+    uint8_t  * out      = nullptr;                // this rank's partial, copied out by the stream
+    float    * in       = nullptr;                // the sum, copied back by the stream
+    size_t     capacity = 0;
+    void *   (*host_alloc)(size_t) = nullptr;
+
+    // jobs: the server thread queues, the exchange thread takes them in order
+    struct job { uint32_t flag; uint64_t seq; size_t nbytes; };
+    job                   jobs[RING] = {};
+    std::atomic<uint32_t> queued{0};              // the flag of the last queued all-reduce
+    std::atomic<uint32_t> processed{0};           // the flag of the last one whose `done` was signalled
+    std::atomic<bool>     stop{false};
+    std::atomic<bool>     broken{false};          // an exchange failed: the client must be dropped
+    uint32_t              next_flag = 0;
+    std::thread           thread;
+
+    // peers and their buffers, used by the exchange thread only while jobs are pending
+    const std::vector<socket_ptr> * peers = nullptr;
+    std::vector<std::vector<uint8_t>> * parts = nullptr;
+    uint32_t rank = 0, world = 0;
+
+    ~rpc_comm_async() {
+        // all-reduces still queued on the stream wait on `done`: the thread releases them, without exchanging, before
+        // it stops, so the stream drains instead of waiting forever
+        broken.store(true, std::memory_order_release);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (thread.joinable() && !idle() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        stop.store(true, std::memory_order_release);
+        if (thread.joinable()) {
+            thread.join();
+        }
+        if (host_free != nullptr) {
+            host_free(flags);
+            host_free(out);
+            host_free(in);
+        }
+    }
+
+    bool idle() const {
+        return processed.load(std::memory_order_acquire) == queued.load(std::memory_order_acquire);
+    }
+
+    void run() {
+        uint32_t spins = 0;
+        while (!stop.load(std::memory_order_acquire)) {
+            const uint32_t last = processed.load(std::memory_order_relaxed);
+            if (last == queued.load(std::memory_order_acquire)) {
+                // spin while all-reduces keep coming, then back off, so an idle model does not hold a core
+                if (++spins > 20000) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(spins > 200000 ? 1000 : 20));
+                }
+                continue;
+            }
+            spins = 0;
+            const job & j = jobs[(last + 1) % RING];
+            // wait for the stream to copy the partial out
+            while (__atomic_load_n(&flags[0], __ATOMIC_ACQUIRE) < j.flag) {
+                if (stop.load(std::memory_order_acquire)) {
+                    return;
+                }
+            }
+            if (!broken.load(std::memory_order_relaxed) &&
+                !rpc_comm_mesh_exchange(*peers, rank, world, j.seq, j.nbytes, out, *parts, in)) {
+                // the stream is released either way, so it drains; the server drops the client before using any result
+                broken.store(true, std::memory_order_release);
+            }
+            __atomic_store_n(&flags[1], j.flag, __ATOMIC_RELEASE);
+            processed.store(j.flag, std::memory_order_release);
+        }
+    }
+};
+
+void rpc_comm_async_deleter::operator()(rpc_comm_async * async) const {
+    delete async;
+}
+
+static bool rpc_comm_async_enabled() {
+    static const char * env = std::getenv("GGML_RPC_COMM_ASYNC");
+    if (env == nullptr) {
+        return false;
+    }
+    if (strncmp(env, "flag:", 5) == 0) {
+        return std::filesystem::exists(env + 5);
+    }
+    return std::atoi(env) != 0;
+}
+
 bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_state & state) {
     const uint32_t rank  = request.rank;
     const uint32_t world = request.world;
@@ -2789,82 +2972,116 @@ bool rpc_server::comm_allreduce_mesh(comm_state & state, ggml_backend_t backend,
                   "with %" PRId64 " elements in %zu bytes\n", __func__, ggml_type_name(t_dst->type), ne, nbytes);
         return false;
     }
-    const uint32_t rank  = state.rank;
-    const uint32_t world = state.world;
-    const size_t   frame = sizeof(rpc_comm_part_hdr) + nbytes;
-    for (auto & part : state.parts) {
-        if (part.size() < frame) {
-            part.resize(frame);
-        }
+    if (state.async != nullptr && state.async->broken.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (rpc_comm_async_enabled() && comm_allreduce_mesh_async(state, backend, t_dst)) {
+        return true;
+    }
+    if (state.async != nullptr && state.async->broken.load(std::memory_order_acquire)) {
+        return false;
+    }
+    // wait for the pending subgraph that produced this partial, and for any all-reduce still being exchanged off the
+    // stream, which uses the same connections
+    ggml_backend_synchronize(backend);
+    while (state.async != nullptr && !state.async->idle()) {
+        std::this_thread::yield();
+    }
+    state.seq++;
+    std::vector<uint8_t> & own = state.parts[state.rank];
+    if (own.size() < nbytes) {
+        own.resize(nbytes);
     }
     state.sum.resize((size_t) ne);
-    state.seq++;
-
-    // wait for the pending subgraph that produced this partial
-    ggml_backend_synchronize(backend);
-    uint8_t * own = state.parts[rank].data();
-    const rpc_comm_part_hdr hdr = { state.seq, (uint64_t) nbytes };
-    memcpy(own, &hdr, sizeof(hdr));
-    ggml_backend_tensor_get(t_dst, own + sizeof(hdr), 0, nbytes);
-
-    // the header first: a peer on another all-reduce, or with a partial of another size, fails here instead of being
-    // read as this partial
-    auto recv_part = [&](uint32_t j) {
-        rpc_comm_part_hdr got;
-        if (!state.peers[j]->recv_data(&got, sizeof(got))) {
-            return false;
-        }
-        if (got.seq != hdr.seq || got.nbytes != hdr.nbytes) {
-            LOG_ERROR("[%s] rank %u expected all-reduce %" PRIu64 " of %" PRIu64 " bytes from rank %u, got %" PRIu64
-                      " of %" PRIu64 " bytes\n", __func__, rank, hdr.seq, hdr.nbytes, j, got.seq, got.nbytes);
-            return false;
-        }
-        return state.peers[j]->recv_data(state.parts[j].data() + sizeof(hdr), nbytes);
-    };
-    // the header and the partial go as two messages, as recv_part reads them: the RDMA transport delivers each message
-    // whole, so a read must take exactly what one send wrote
-    auto send_part = [&](uint32_t j) {
-        return state.peers[j]->send_data(own, sizeof(hdr)) && state.peers[j]->send_data(own + sizeof(hdr), nbytes) &&
-               state.peers[j]->flush();
-    };
-    auto lost = [&](uint32_t j) {
-        LOG_ERROR("[%s] rank %u lost rank %u during all-reduce %" PRIu64 "\n", __func__, rank, j, hdr.seq);
+    ggml_backend_tensor_get(t_dst, own.data(), 0, nbytes);
+    if (!rpc_comm_mesh_exchange(state.peers, state.rank, state.world, state.seq, nbytes, own.data(), state.parts,
+                                state.sum.data())) {
         return false;
-    };
-    if (nbytes <= RPC_COMM_MESH_EAGER_BYTES) {
-        for (uint32_t j = 0; j < world; j++) {
-            if (j != rank && !send_part(j)) {
-                return lost(j);
-            }
-        }
-        for (uint32_t j = 0; j < world; j++) {
-            if (j != rank && !recv_part(j)) {
-                return lost(j);
-            }
-        }
-    } else {
-        // pair by pair in rank order, the lower rank of each pair sending first: the unfinished pair with the lowest
-        // ranks always has both of its ranks waiting on it, so the exchange cannot deadlock
-        for (uint32_t j = 0; j < world; j++) {
-            if (j == rank) {
-                continue;
-            }
-            const bool ok = rank < j ? send_part(j) && recv_part(j) : recv_part(j) && send_part(j);
-            if (!ok) {
-                return lost(j);
-            }
-        }
     }
+    ggml_backend_tensor_set(t_dst, state.sum.data(), 0, nbytes);
+    return true;
+}
 
-    float * sum = state.sum.data();
-    memcpy(sum, state.parts[0].data() + sizeof(hdr), nbytes);
-    for (uint32_t j = 1; j < world; j++) {
-        const float * part = (const float *) (state.parts[j].data() + sizeof(hdr));
-        for (int64_t k = 0; k < ne; k++) {
-            sum[k] += part[k];
+// Queues the all-reduce on the backend's stream and returns at once; false when the backend cannot, leaving the
+// all-reduce to the synchronous path
+bool rpc_server::comm_allreduce_mesh_async(comm_state & state, ggml_backend_t backend, ggml_tensor * t_dst) {
+    if (state.async == nullptr) {
+        auto host_alloc = (rpc_comm_host_alloc_t) rpc_backend_proc(backend, "ggml_backend_cuda_comm_host_alloc");
+        auto host_free  = (rpc_comm_host_free_t)  rpc_backend_proc(backend, "ggml_backend_cuda_comm_host_free");
+        auto can_stage  = (rpc_comm_can_stage_t)  rpc_backend_proc(backend, "ggml_backend_cuda_comm_can_stage");
+        auto stage      = (rpc_comm_stage_t)      rpc_backend_proc(backend, "ggml_backend_cuda_comm_stage");
+        if (host_alloc == nullptr || host_free == nullptr || can_stage == nullptr || stage == nullptr) {
+            return false;
+        }
+        // no queued work may still run on the stream while it is probed
+        ggml_backend_synchronize(backend);
+        std::unique_ptr<rpc_comm_async, rpc_comm_async_deleter> async(new rpc_comm_async());
+        async->host_alloc = host_alloc;
+        async->host_free  = host_free;
+        async->stage      = stage;
+        async->backend    = backend;
+        async->flags      = (uint32_t *) host_alloc(2 * sizeof(uint32_t));
+        if (async->flags == nullptr || !can_stage(backend, &async->flags[0], &async->flags[1])) {
+            LOG_WARN("[%s] the device cannot queue all-reduces on its stream; they wait for it instead\n", __func__);
+            host_free(async->flags);
+            async->flags = nullptr;
+            async->host_free = nullptr;
+            return false;
+        }
+        async->peers = &state.peers;
+        async->parts = &state.parts;
+        async->rank  = state.rank;
+        async->world = state.world;
+        rpc_comm_async * a = async.get();
+        async->thread = std::thread([a] { a->run(); });
+        state.async = std::move(async);
+        LOG_INFO("[%s] rank %u queues its all-reduces on the device's stream\n", __func__, state.rank);
+    }
+    rpc_comm_async & a = *state.async;
+    if (a.flags == nullptr) {
+        return false;
+    }
+    const size_t nbytes = ggml_nbytes(t_dst);
+    // a larger partial, or a flag about to wrap: drain the stream and the exchange first
+    if (nbytes > a.capacity || a.next_flag >= 0xfffffff0u) {
+        ggml_backend_synchronize(backend);
+        while (!a.idle()) {
+            std::this_thread::yield();
+        }
+        if (nbytes > a.capacity) {
+            a.host_free(a.out);
+            a.host_free(a.in);
+            const size_t capacity = std::max(nbytes, 2 * a.capacity);
+            a.out = (uint8_t *) a.host_alloc(capacity);
+            a.in  = (float *)   a.host_alloc(capacity);
+            if (a.out == nullptr || a.in == nullptr) {
+                LOG_ERROR("[%s] could not allocate %zu bytes of host memory for the all-reduce\n", __func__, capacity);
+                a.broken.store(true, std::memory_order_release);
+                return false;
+            }
+            a.capacity = capacity;
+        }
+        if (a.next_flag >= 0xfffffff0u) {
+            __atomic_store_n(&a.flags[0], 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&a.flags[1], 0u, __ATOMIC_RELEASE);
+            a.next_flag = 0;
+            a.queued.store(0, std::memory_order_release);
+            a.processed.store(0, std::memory_order_release);
         }
     }
-    ggml_backend_tensor_set(t_dst, sum, 0, nbytes);
+    // no more than RING all-reduces ahead of the exchange
+    while (a.next_flag - a.processed.load(std::memory_order_acquire) >= rpc_comm_async::RING - 1) {
+        std::this_thread::yield();
+    }
+    const uint32_t flag = ++a.next_flag;
+    state.seq++;
+    a.jobs[flag % rpc_comm_async::RING] = { flag, state.seq, nbytes };
+    if (!a.stage(backend, t_dst, a.out, a.in, &a.flags[0], &a.flags[1], flag)) {
+        LOG_ERROR("[%s] could not queue all-reduce %" PRIu64 " on the device's stream\n", __func__, state.seq);
+        a.broken.store(true, std::memory_order_release);
+        return false;
+    }
+    a.queued.store(flag, std::memory_order_release);
     return true;
 }
 
@@ -2873,6 +3090,11 @@ bool rpc_server::comm_free(const rpc_msg_comm_free_req & request) {
         return false;
     }
     comm_state & state = comm_states[request.device];
+    if (state.async != nullptr) {
+        // the stream and the exchange drain before the connections they use close
+        ggml_backend_synchronize(backends[request.device]);
+        state.async.reset();
+    }
     if (!state.peers.empty()) {
         LOG_INFO("[%s] device %u: rank %u of the %u-rank mesh ran %" PRIu64 " all-reduces\n", __func__, request.device,
                  state.rank, state.world, state.seq);
