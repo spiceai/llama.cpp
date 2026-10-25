@@ -405,14 +405,45 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 struct ggml_backend_meta_simple_tensor_container {
     std::vector<ggml_context_ptr> ctxs;
     std::map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
+    // A compute container holds the views made of its buffer's tensors between two evals, and its contexts are sized
+    // for a fixed number per tensor. A buffer with few tensors (an MTP head's KV cache) can need more, for instance when
+    // several graphs are reserved before the first eval: those tensors go to spill contexts, freed with the rest on reset.
+    // The static container is sized exactly and never spills: its contexts are iterated to allocate its tensors.
+    bool                                       can_spill = false;
+    ggml_init_params                           params    = {};
+    std::vector<std::vector<ggml_context_ptr>> spill;
 
-    ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
+    ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple, bool can_spill = false)
+        : can_spill(can_spill), params(params), spill(n_simple) {
         ctxs.reserve(n_simple);
         for (int i = 0; i < n_simple; i++) {
             ctxs.emplace_back(ggml_init(params));
         }
     }
     ggml_backend_meta_simple_tensor_container() {}
+
+    // the context for one more tensor of simple buffer j
+    ggml_context * ctx_for_new_tensor(size_t j) {
+        ggml_context * ctx = spill[j].empty() ? ctxs[j].get() : spill[j].back().get();
+        if (!can_spill || ggml_get_mem_size(ctx) - ggml_used_mem(ctx) >= ggml_tensor_overhead()) {
+            return ctx;
+        }
+        ggml_init_params p = params;
+        p.mem_size = std::max(p.mem_size, (size_t) 1024 * ggml_tensor_overhead());
+        spill[j].emplace_back(ggml_init(p));
+        GGML_ASSERT(spill[j].back() != nullptr);
+        return spill[j].back().get();
+    }
+
+    void reset() {
+        for (ggml_context_ptr & ctx : ctxs) {
+            ggml_reset(ctx.get());
+        }
+        for (auto & s : spill) {
+            s.clear();
+        }
+        simple_tensors.clear();
+    }
 };
 
 struct ggml_backend_meta_buffer_context {
@@ -1270,7 +1301,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
     for (size_t j = 0; j < n_simple_bufs; j++) {
-        ggml_context          * simple_ctx = stc.ctxs[j].get();
+        ggml_context          * simple_ctx = stc.ctx_for_new_tensor(j);
         ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
 
         if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
@@ -1772,8 +1803,8 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
         /*.no_alloc   =*/ true,
     };
     ggml_backend_meta_simple_tensor_container stc_static;
-    ggml_backend_meta_simple_tensor_container stc_compute_0(params, n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_1(params, n_simple_bufts);
+    ggml_backend_meta_simple_tensor_container stc_compute_0(params, n_simple_bufts, /*can_spill =*/ true);
+    ggml_backend_meta_simple_tensor_container stc_compute_1(params, n_simple_bufts, /*can_spill =*/ true);
 
     size_t max_size = 0;
     std::vector<ggml_backend_buffer_t> bufs;
@@ -1803,8 +1834,8 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
         /*.no_alloc   =*/ true,
     };
     ggml_backend_meta_simple_tensor_container stc_static   (params_static,  n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_0(params_compute, n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_1(params_compute, n_simple_bufts);
+    ggml_backend_meta_simple_tensor_container stc_compute_0(params_compute, n_simple_bufts, /*can_spill =*/ true);
+    ggml_backend_meta_simple_tensor_container stc_compute_1(params_compute, n_simple_bufts, /*can_spill =*/ true);
 
     std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
     ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
@@ -2077,10 +2108,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
             buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
             ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
-            for (ggml_context_ptr & ctx : stc.ctxs) {
-                ggml_reset(ctx.get());
-            }
-            stc.simple_tensors.clear();
+            stc.reset();
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
