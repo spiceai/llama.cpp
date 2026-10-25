@@ -1446,9 +1446,8 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
-// LLAMA_TENSOR_BACKEND_SAMPLING=1: offload sampler chains with SPLIT_MODE_TENSOR too. This holds only while the sampled
-// logits are mirrored on every device, i.e. the output head is not split: the meta backend refuses a top-k over a split
-// vocabulary (its per-row ops assert that the row axis is not split).
+// LLAMA_TENSOR_BACKEND_SAMPLING=1: offload sampler chains with SPLIT_MODE_TENSOR too. The sampled logits must not be split
+// along the vocabulary: the meta backend's per-row ops (top-k) assert when the row axis is split.
 static bool llama_tensor_backend_sampling() {
     static const bool on = [] {
         const char * v = getenv("LLAMA_TENSOR_BACKEND_SAMPLING");
