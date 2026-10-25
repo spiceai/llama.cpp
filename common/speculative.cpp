@@ -1299,9 +1299,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (backend_chains[seq_id] == nullptr || backend_chains_attached[seq_id] == want) {
                 continue;
             }
-            if (llama_set_sampler(params.ctx_dft, seq_id, want ? backend_chains[seq_id] : nullptr)) {
-                backend_chains_attached[seq_id] = want;
+            if (want) {
+                backend_chains_attached[seq_id] = llama_set_sampler(params.ctx_dft, seq_id, backend_chains[seq_id]);
+                continue;
             }
+            llama_set_sampler(params.ctx_dft, seq_id, nullptr);
+            // a chain is set up for the backend only once, so the next attach takes a new one
+            llama_sampler_free(backend_chains[seq_id]);
+            backend_chains[seq_id] = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(backend_chains[seq_id], llama_sampler_init_top_k(10));
+            backend_chains_attached[seq_id] = false;
         }
     }
 
