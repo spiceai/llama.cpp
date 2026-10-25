@@ -2554,8 +2554,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                ((node->flags & GGML_TENSOR_FLAG_COMPUTE) ? "" : ",disabled") + "," +
                                (node->buffer ? ggml_backend_buffer_name(node->buffer) : "no buffer") + ")";
                     }
-                    GGML_LOG_INFO("meta: all-reduce %" PRIu64 " (subgraph %zu of %zu) falls back:%s\n", n, i,
-                                  backend_ctx->n_subgraphs, why.c_str());
+                    // stderr, since a host's log callback may drop ggml's messages (llama-server and llama-bench do)
+                    fprintf(stderr, "meta: all-reduce %" PRIu64 " (subgraph %zu of %zu) falls back:%s\n", n, i,
+                            backend_ctx->n_subgraphs, why.c_str());
                 }
                 const ggml_status status = allreduce_fallback(i);
                 if (status != GGML_STATUS_SUCCESS) {
