@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 static uint64_t splitmix64(uint64_t & state) {
@@ -32,8 +33,8 @@ static ggml_tensor * view_2d(ggml_context * ctx, ggml_tensor * t, int64_t ne0, i
     return ggml_view_2d(ctx, t, ne0, ne1, t->nb[1], i0*ggml_element_size(t));
 }
 
-// returns how many of the fused op's values differ from the separate nodes' bit for bit
-static int64_t compare(ggml_backend_t backend, int64_t n_tokens, uint64_t seed) {
+// returns how many of the fused op's values differ from the separate nodes' bit for bit, and describes the first
+static int64_t compare(ggml_backend_t backend, int64_t n_tokens, uint64_t seed, std::string & first_diff) {
     const int64_t hc     = 4;
     const float   eps    = 1e-6f;
     const int32_t n_iter = 20;
@@ -98,8 +99,10 @@ static int64_t compare(ggml_backend_t backend, int64_t n_tokens, uint64_t seed) 
     auto check = [&](const char * name, int64_t t, int64_t i, float fused, float separate) {
         if (memcmp(&fused, &separate, sizeof(float)) != 0) {
             if (n_diff == 0) {
-                printf("  first difference: %s[%" PRId64 "] of token %" PRId64 ": fused %.9g, separate nodes %.9g\n",
-                       name, i, t, fused, separate);
+                char buf[256];
+                snprintf(buf, sizeof(buf), "  first difference: %s[%" PRId64 "] of token %" PRId64 ": fused %.9g, separate nodes %.9g\n",
+                         name, i, t, fused, separate);
+                first_diff = buf;
             }
             n_diff++;
         }
@@ -127,9 +130,10 @@ int main(void) {
     int n_failed = 0;
     for (int64_t n_tokens : { 1, 17, 257, 4096 }) {
         for (uint64_t seed : { 1, 2, 3 }) {
-            const int64_t n_diff = compare(backend, n_tokens, seed);
-            printf("n_tokens = %4" PRId64 ", seed = %" PRIu64 ": %" PRId64 " of %" PRId64 " values differ\n",
-                   n_tokens, seed, n_diff, n_tokens*24);
+            std::string first_diff;
+            const int64_t n_diff = compare(backend, n_tokens, seed, first_diff);
+            printf("n_tokens = %4" PRId64 ", seed = %" PRIu64 ": %" PRId64 " of %" PRId64 " values differ\n%s",
+                   n_tokens, seed, n_diff, n_tokens*24, first_diff.c_str());
             n_failed += n_diff != 0;
         }
     }
