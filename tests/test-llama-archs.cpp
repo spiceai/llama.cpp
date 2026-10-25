@@ -136,6 +136,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --rpc <host:port,...>    Split the tensor split (Meta) config across these RPC servers' devices only\n");
+    LOG("  --n-rs-seq <n>           Keep n recurrent-state snapshots per sequence, as speculative decoding does\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -639,6 +640,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     return ret;
 }
 
+// --n-rs-seq: recurrent-state snapshots per sequence, as speculative decoding keeps them, for every context
+static uint32_t n_rs_seq = 0;
+
 static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/) {
     return true;
 }
@@ -661,6 +665,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.n_rs_seq = n_rs_seq;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -1385,6 +1390,13 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) {
             if (i + 1 < argc) {
                 out = argv[++i];
+            } else {
+                usage(argv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--n-rs-seq") == 0) {
+            if (i + 1 < argc) {
+                n_rs_seq = (uint32_t) std::stoul(argv[++i]);
             } else {
                 usage(argv);
                 return 1;

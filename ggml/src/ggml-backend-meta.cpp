@@ -685,11 +685,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_view = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        // A gated delta net's result holds its output and then the new state, [S_v, S_v, H_v, n_seqs]: each device's part
-        // is the state of its own heads, so the view of the state is split by heads, which reshaping the result's split
-        // along its rows does not find (it lands on S_v, which only divides evenly between some device counts)
+        // A gated delta net's result holds its output and then its states, each [S_v, S_v, H_v] with the heads outermost:
+        // each device's part holds the states of its own heads, so a view of the states is split by heads, along the axis
+        // whose extent completes one state ([S_v, S_v, H_v, n_seqs] or [S_v*S_v*H_v, n_seqs, n_snapshots]). Reshaping the
+        // result's split along its rows does not find it: it lands on S_v, which only divides between some device counts.
         if (tensor->src[0]->op == GGML_OP_GATED_DELTA_NET && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && tensor->view_offs > 0) {
-            return {GGML_BACKEND_SPLIT_AXIS_2, {0}, {1}, 1};
+            const ggml_tensor * v = tensor->src[0]->src[2];
+            const int64_t state = v->ne[0] * v->ne[0] * v->ne[1];
+            int64_t extent = 1;
+            for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                extent *= tensor->ne[dim];
+                if (extent == state) {
+                    return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
+                }
+            }
+            GGML_ABORT("a view of a gated delta net's states that splits a state: %s", tensor->name);
         }
         if (ggml_is_contiguous(tensor) && ggml_is_contiguous(tensor->src[0])) {
             return handle_reshape(src_ss);
