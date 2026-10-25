@@ -1961,10 +1961,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int64_t t_exit = ggml_time_us();
             const auto & dt = g_decode_timing;
             const int64_t inside = t_exit - t_entry;
-            fprintf(stderr, "DT %s tok %d out %d reused %d | before: gap %.3f sync %.3f cpu %.3f | inside %.3f: build %.3f inputs %.3f submit %.3f sync %.3f rest %.3f\n",
+            fprintf(stderr, "DT %s tok %d out %d reused %d | before: gap %.3f sync %.3f cpu %.3f | inside %.3f: build %.3f inputs %.3f submit %.3f sync %.3f rest %.3f | at %lld end %lld\n",
                     llm_arch_name(lctx.model.arch), n_tokens, (int) lctx.n_outputs, (int) (lctx.n_reused - reused0),
                     gap/1e3, sync_before/1e3, (gap - sync_before)/1e3, inside/1e3, dt.build_us/1e3, dt.inputs_us/1e3,
-                    dt.submit_us/1e3, dt.sync_us/1e3, (inside - dt.build_us - dt.inputs_us - dt.submit_us - dt.sync_us)/1e3);
+                    dt.submit_us/1e3, dt.sync_us/1e3, (inside - dt.build_us - dt.inputs_us - dt.submit_us - dt.sync_us)/1e3,
+                    (long long) t_entry, (long long) t_exit);
             g_decode_timing.last_exit = t_exit;
             g_decode_timing.sync_us   = 0;
         }

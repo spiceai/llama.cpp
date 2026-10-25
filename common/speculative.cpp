@@ -980,6 +980,15 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+
+// DIAG (not for merge): with LLAMA_DECODE_TIMING=1, a "DTM <mark> <us>" line at each speculative-loop phase boundary
+static void dtm(const char * mark) {
+    static const bool on = [] { const char * v = getenv("LLAMA_DECODE_TIMING"); return v != nullptr && atoi(v) != 0; }();
+    if (on) {
+        fprintf(stderr, "DTM %s %lld\n", mark, (long long) ggml_time_us());
+    }
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1249,7 +1258,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const llama_pos pos_arr[4] = { p, p, p, 0 };
                     batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
                 }
+                dtm("dfp.inject");
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                dtm("dfp.inject_ret");
                 if (rc != 0) {
                     LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -1354,7 +1365,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        dtm("dfd.decode");
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        dtm("dfd.decode_ret");
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;

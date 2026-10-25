@@ -43,6 +43,15 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+
+// DIAG (not for merge): with LLAMA_DECODE_TIMING=1, a "DTM <mark> <us>" line at each speculative-loop phase boundary
+static void dtm(const char * mark) {
+    static const bool on = [] { const char * v = getenv("LLAMA_DECODE_TIMING"); return v != nullptr && atoi(v) != 0; }();
+    if (on) {
+        fprintf(stderr, "DTM %s %lld\n", mark, (long long) ggml_time_us());
+    }
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
         const auto mcaps = mtmd_get_cap_from_file(params.mmproj.path.c_str());
@@ -3778,9 +3787,13 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            dtm("us.draft_yield");
             queue_tasks.yield_to_queue([&]() {
+                dtm("us.draft_start");
                 common_speculative_draft(spec.get());
+                dtm("us.draft_done");
             });
+            dtm("us.draft_yield_ret");
         }
 
         // make checkpoints if needed
@@ -4556,12 +4569,15 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        dtm("dec.yield");
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            dtm("dec.done");
         });
+        dtm("dec.yield_ret");
 
         if (ret != 0) {
             {
@@ -4622,8 +4638,11 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                dtm("sp.start");
                 ok = common_speculative_process(spec.get(), batch.view);
+                dtm("sp.done");
             });
+            dtm("sp.yield_ret");
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -4662,6 +4681,8 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off) {
+        dtm("pd.start");
+        struct dtm_end { ~dtm_end() { dtm("pd.end"); } } dtm_end_guard;
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -4819,6 +4840,7 @@ private:
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
+                    dtm("pd.accepted");
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4922,6 +4944,7 @@ private:
                 }
             }
 
+            dtm("pd.tokens");
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
