@@ -1446,6 +1446,17 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+// LLAMA_TENSOR_BACKEND_SAMPLING=1: offload sampler chains with SPLIT_MODE_TENSOR too. This holds only while the sampled
+// logits are mirrored on every device, i.e. the output head is not split: the meta backend refuses a top-k over a split
+// vocabulary (its per-row ops assert that the row axis is not split).
+static bool llama_tensor_backend_sampling() {
+    static const bool on = [] {
+        const char * v = getenv("LLAMA_TENSOR_BACKEND_SAMPLING");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return on;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1453,7 +1464,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !llama_tensor_backend_sampling()) {
         static bool warned = false;
         if (!warned) {
             LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
