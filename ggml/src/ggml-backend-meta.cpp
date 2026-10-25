@@ -14,8 +14,6 @@
 #include <cstring>
 #include <map>
 #include <memory>
-#include <atomic>
-#include <filesystem>
 #include <set>
 #include <string>
 #include <tuple>
@@ -1888,8 +1886,7 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
-    // GGML_META_GRAPH_SLOTS=2: the split of a graph that is not the active one, and the simple tensor clones its
-    // subgraphs point at
+    // the split of a graph that is not the active one, and the simple tensor clones its subgraphs point at
     struct graph_slot {
         std::vector<std::vector<cgraph_config>> cgraphs; // per backend
         std::vector<std::vector<ggml_tensor *>> nodes;   // per backend
@@ -1906,12 +1903,15 @@ struct ggml_backend_meta_context {
     ggml_context_ptr ctx_clones;
     bool             cloned = false; // the active split points only at slot-owned clones, weights and graph tensors
 
-    // A scheduler reuses only the graph it allocated last, so one split is kept per compute buffer: the active one in
-    // the fields above (graph allocated in active_buf), the others parked here. An LRU of recent graphs would instead
-    // evict the split of a graph its scheduler still reuses, and rebuilding that graph would look up views that the
-    // compute containers have since rotated away.
+    // A context that alternates between two schedulers (llama.cpp's LLAMA_GRAPH_SLOTS=2) computes graphs allocated in
+    // two compute buffers here. A scheduler reuses only the graph it allocated last, so one split is kept per compute
+    // buffer: the active one in the fields above (graph allocated in active_buf), the others parked here. An LRU of
+    // recent graphs would instead evict the split of a graph its scheduler still reuses. Splits are parked only while
+    // graphs keep coming from more than one buffer: GRAPH_SLOTS_IDLE computes from the active buffer drop them.
+    static constexpr int GRAPH_SLOTS_IDLE = 4;
     ggml_backend_buffer_t                                 active_buf = nullptr;
     std::unordered_map<ggml_backend_buffer_t, graph_slot> parked;
+    int                                                   computes_since_switch = GRAPH_SLOTS_IDLE;
 
     void swap_with(graph_slot & s) {
         s.cgraphs.resize(backend_configs.size());
@@ -2103,8 +2103,6 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
-// GGML_META_GRAPH_SLOTS: "2" keeps the splits of the two most recent graphs; "flag:<path>" does so while <path>
-// exists (re-checked at most every 100 ms), so one loaded model can alternate both arms of an A/B
 // the meta compute buffer the scheduler allocated cgraph in, or nullptr when no node lives in one
 static ggml_backend_buffer_t ggml_backend_meta_graph_compute_buffer(const struct ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -2117,22 +2115,28 @@ static ggml_backend_buffer_t ggml_backend_meta_graph_compute_buffer(const struct
     return nullptr;
 }
 
-static bool ggml_backend_meta_graph_slots_on() {
-    static const std::string mode = [] {
-        const char * v = getenv("GGML_META_GRAPH_SLOTS");
-        return std::string(v != nullptr ? v : "");
-    }();
-    if (mode.rfind("flag:", 0) == 0) {
-        static std::atomic<int64_t> next_check_us{0};
-        static std::atomic<bool>    on{false};
-        const int64_t now = ggml_time_us();
-        if (now >= next_check_us.load(std::memory_order_relaxed)) {
-            on.store(std::filesystem::exists(mode.substr(5)), std::memory_order_relaxed);
-            next_check_us.store(now + 100000, std::memory_order_relaxed);
-        }
-        return on.load(std::memory_order_relaxed);
+// The simple tensors of a graph tensor, made again when its buffer no longer holds them. A scheduler reuses the graph
+// it allocated last without allocating it again, so the views that graph made of a buffer another scheduler's graph
+// also views (the KV cache, the weights) are reset when that buffer's compute containers rotate for the other graph,
+// and a later rebuild of the reused graph's split finds them gone. The tensors themselves are unchanged, so their
+// simple tensors are made again in the buffer's current container.
+static void ggml_backend_meta_buffer_remake_simple_tensors(ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer) ||
+            ggml_backend_meta_buffer_simple_tensor(tensor, 0) != nullptr) {
+        return;
     }
-    return atoi(mode.c_str()) >= 2;
+    ggml_backend_meta_buffer_remake_simple_tensors(tensor->view_src);
+    for (int k = 0; k < GGML_MAX_SRC; k++) {
+        if (tensor->src[k] != tensor) {
+            ggml_backend_meta_buffer_remake_simple_tensors(tensor->src[k]);
+        }
+    }
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    const enum ggml_status status = ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
+    GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+    if (buf_ctx->debug > 0) {
+        GGML_LOG_DEBUG("REMADE: %s[%s]\n", tensor->name, ggml_op_name(tensor->op));
+    }
 }
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -2140,16 +2144,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
-    // GGML_META_GRAPH_SLOTS=2: keep one split per compute buffer, i.e. per scheduler. A graph that is not the active one
-    // activates its buffer's split: either it is that split's graph, reused by its scheduler, or its scheduler allocated
-    // it since, and the split gets rebuilt.
-    const bool graph_slots = ggml_backend_meta_graph_slots_on();
-    if (graph_slots && cgraph->uid != 0 && cgraph->uid != backend_ctx->uid) {
-        backend_ctx->select_slot(ggml_backend_meta_graph_compute_buffer(cgraph));
+    // A graph from a compute buffer other than the active split's comes from another scheduler of the same context:
+    // park the active split under its buffer and activate that buffer's. Either it is the split of this graph, which its
+    // scheduler reused, or that scheduler allocated this graph since, and the split gets rebuilt.
+    ggml_backend_buffer_t compute_buf = ggml_backend_meta_graph_compute_buffer(cgraph);
+    if (compute_buf != nullptr && compute_buf != backend_ctx->active_buf) {
+        if (backend_ctx->active_buf != nullptr) {
+            backend_ctx->select_slot(compute_buf);
+            backend_ctx->computes_since_switch = 0;
+        } else {
+            backend_ctx->active_buf = compute_buf;
+        }
+    } else if (backend_ctx->computes_since_switch < ggml_backend_meta_context::GRAPH_SLOTS_IDLE &&
+            ++backend_ctx->computes_since_switch == ggml_backend_meta_context::GRAPH_SLOTS_IDLE) {
+        backend_ctx->parked.clear();
     }
+    const bool graph_slots = backend_ctx->computes_since_switch < ggml_backend_meta_context::GRAPH_SLOTS_IDLE;
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
-    // A split built while slots were off points into the rotating compute containers, so with slots on it is rebuilt.
+    // A split built before graphs came from several buffers points into the rotating compute containers, so while they
+    // do it is rebuilt from clones.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid) ||
                                (graph_slots && !backend_ctx->cloned);
 
@@ -2203,6 +2217,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
                 bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
+                if (bcj.nodes[i] == nullptr) {
+                    ggml_backend_meta_buffer_remake_simple_tensors(node);
+                    bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
+                }
                 GGML_ASSERT(bcj.nodes[i]);
             }
         }

@@ -1599,6 +1599,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         n_reused++;
     } else {
         gf_res_prev_active = nullptr;
+        // the graph results are per n_outputs > 0, not per scheduler: with the second slot off this scheduler also
+        // builds the graph the other one last allocated, which that one must not reuse when the slot comes back
+        if (gf_res_prev_active_alt == res) {
+            gf_res_prev_active_alt = nullptr;
+        }
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
