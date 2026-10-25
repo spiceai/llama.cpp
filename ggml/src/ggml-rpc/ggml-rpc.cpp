@@ -2927,18 +2927,25 @@ bool rpc_server::comm_allreduce_mesh(comm_state & state, ggml_backend_t backend,
         }
         return state.peers[j]->recv_data(state.parts[j].data() + sizeof(hdr), nbytes);
     };
+    // the header and the partial go as two messages, as recv_part reads them: the RDMA transport delivers each message
+    // whole, so a read must take exactly what one send wrote
     auto send_part = [&](uint32_t j) {
-        return state.peers[j]->send_data(own, frame) && state.peers[j]->flush();
+        return state.peers[j]->send_data(own, sizeof(hdr)) && state.peers[j]->send_data(own + sizeof(hdr), nbytes) &&
+               state.peers[j]->flush();
+    };
+    auto lost = [&](uint32_t j) {
+        LOG_ERROR("[%s] rank %u lost rank %u during all-reduce %" PRIu64 "\n", __func__, rank, j, hdr.seq);
+        return false;
     };
     if (nbytes <= RPC_COMM_MESH_EAGER_BYTES) {
         for (uint32_t j = 0; j < world; j++) {
             if (j != rank && !send_part(j)) {
-                return false;
+                return lost(j);
             }
         }
         for (uint32_t j = 0; j < world; j++) {
             if (j != rank && !recv_part(j)) {
-                return false;
+                return lost(j);
             }
         }
     } else {
@@ -2950,7 +2957,7 @@ bool rpc_server::comm_allreduce_mesh(comm_state & state, ggml_backend_t backend,
             }
             const bool ok = rank < j ? send_part(j) && recv_part(j) : recv_part(j) && send_part(j);
             if (!ok) {
-                return false;
+                return lost(j);
             }
         }
     }
