@@ -182,6 +182,10 @@ int main(int argc, char ** argv) {
         return 2;
     }
     int failures = run(endpoints, 1234);
+    // two ranks through the mesh
+    setenv("GGML_RPC_COMM_MESH", "1", 1);
+    failures += run({ endpoints[0], endpoints[1] }, 4321);
+    unsetenv("GGML_RPC_COMM_MESH");
     // by default the pairwise comm sends a large partial as BF16 and adds it to its own F32 partial, so the two ranks
     // hold different sums; with an F32 wire both hold the exact sum
     setenv("GGML_RPC_COMM_WIRE_F32", "1", 1);
