@@ -1850,8 +1850,8 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
-    // GGML_META_GRAPH_SLOTS=2: the split of the other recent graph, swapped with the fields above, and the
-    // simple tensor clones each split's subgraphs point at
+    // GGML_META_GRAPH_SLOTS=2: the split of a graph that is not the active one, and the simple tensor clones its
+    // subgraphs point at
     struct graph_slot {
         std::vector<std::vector<cgraph_config>> cgraphs; // per backend
         std::vector<std::vector<ggml_tensor *>> nodes;   // per backend
@@ -1864,26 +1864,49 @@ struct ggml_backend_meta_context {
         size_t                                  n_subgraphs   = 0;
         uint64_t                                uid           = 0;
         bool                                    cloned        = false;
-    } alt;
+    };
     ggml_context_ptr ctx_clones;
     bool             cloned = false; // the active split points only at slot-owned clones, weights and graph tensors
 
-    void swap_slot() {
-        alt.cgraphs.resize(backend_configs.size());
-        alt.nodes.resize(backend_configs.size());
+    // A scheduler reuses only the graph it allocated last, so one split is kept per compute buffer: the active one in
+    // the fields above (graph allocated in active_buf), the others parked here. An LRU of recent graphs would instead
+    // evict the split of a graph its scheduler still reuses, and rebuilding that graph would look up views that the
+    // compute containers have since rotated away.
+    ggml_backend_buffer_t                                 active_buf = nullptr;
+    std::unordered_map<ggml_backend_buffer_t, graph_slot> parked;
+
+    void swap_with(graph_slot & s) {
+        s.cgraphs.resize(backend_configs.size());
+        s.nodes.resize(backend_configs.size());
         for (size_t j = 0; j < backend_configs.size(); j++) {
-            std::swap(backend_configs[j].cgraphs, alt.cgraphs[j]);
-            std::swap(backend_configs[j].nodes,   alt.nodes[j]);
+            std::swap(backend_configs[j].cgraphs, s.cgraphs[j]);
+            std::swap(backend_configs[j].nodes,   s.nodes[j]);
         }
-        std::swap(ctx,           alt.ctx);
-        std::swap(ctx_clones,    alt.ctx_clones);
-        std::swap(cgraphs_aux,   alt.cgraphs_aux);
-        std::swap(nodes_aux,     alt.nodes_aux);
-        std::swap(max_nnodes,    alt.max_nnodes);
-        std::swap(max_subgraphs, alt.max_subgraphs);
-        std::swap(n_subgraphs,   alt.n_subgraphs);
-        std::swap(uid,           alt.uid);
-        std::swap(cloned,        alt.cloned);
+        std::swap(ctx,           s.ctx);
+        std::swap(ctx_clones,    s.ctx_clones);
+        std::swap(cgraphs_aux,   s.cgraphs_aux);
+        std::swap(nodes_aux,     s.nodes_aux);
+        std::swap(max_nnodes,    s.max_nnodes);
+        std::swap(max_subgraphs, s.max_subgraphs);
+        std::swap(n_subgraphs,   s.n_subgraphs);
+        std::swap(uid,           s.uid);
+        std::swap(cloned,        s.cloned);
+    }
+
+    // makes the split kept for compute buffer buf the active one, parking the active split under its own buffer
+    void select_slot(ggml_backend_buffer_t buf) {
+        if (buf == active_buf) {
+            return;
+        }
+        graph_slot incoming;
+        auto it = parked.find(buf);
+        if (it != parked.end()) {
+            incoming = std::move(it->second);
+            parked.erase(it);
+        }
+        swap_with(incoming);
+        parked[active_buf] = std::move(incoming);
+        active_buf = buf;
     }
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
@@ -2044,6 +2067,18 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
 
 // GGML_META_GRAPH_SLOTS: "2" keeps the splits of the two most recent graphs; "flag:<path>" does so while <path>
 // exists (re-checked at most every 100 ms), so one loaded model can alternate both arms of an A/B
+// the meta compute buffer the scheduler allocated cgraph in, or nullptr when no node lives in one
+static ggml_backend_buffer_t ggml_backend_meta_graph_compute_buffer(const struct ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_backend_buffer_t buf = cgraph->nodes[i]->buffer;
+        if (buf != nullptr && ggml_backend_buffer_is_meta(buf) &&
+                ggml_backend_buffer_get_usage(buf) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            return buf;
+        }
+    }
+    return nullptr;
+}
+
 static bool ggml_backend_meta_graph_slots_on() {
     static const std::string mode = [] {
         const char * v = getenv("GGML_META_GRAPH_SLOTS");
@@ -2067,11 +2102,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
-    // GGML_META_GRAPH_SLOTS=2: keep the splits of the two most recent graphs. A graph that is not the active one
-    // swaps in the other slot: either it is that slot's graph, or that slot is the older one and gets rebuilt.
+    // GGML_META_GRAPH_SLOTS=2: keep one split per compute buffer, i.e. per scheduler. A graph that is not the active one
+    // activates its buffer's split: either it is that split's graph, reused by its scheduler, or its scheduler allocated
+    // it since, and the split gets rebuilt.
     const bool graph_slots = ggml_backend_meta_graph_slots_on();
     if (graph_slots && cgraph->uid != 0 && cgraph->uid != backend_ctx->uid) {
-        backend_ctx->swap_slot();
+        backend_ctx->select_slot(ggml_backend_meta_graph_compute_buffer(cgraph));
     }
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
