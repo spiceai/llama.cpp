@@ -26,7 +26,8 @@ struct socket_t {
     void update_caps(const uint8_t * remote_caps);
     const char * transport_name() const;
 
-    static socket_ptr create_server(const char * host, int port);
+    // backlog: how many connections may wait for accept()
+    static socket_ptr create_server(const char * host, int port, int backlog = 1);
     static socket_ptr connect(const char * host, int port);
 
 private:
