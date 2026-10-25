@@ -929,12 +929,27 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+// DIAG (not for merge): LLAMA_DECODE_TIMING=1 prints one line per decode call: the context's arch, its tokens and
+// outputs, whether its graph was reused, the main thread's time since the previous decode of any context (waiting in
+// synchronize, and the rest outside), and the time inside the call (graph build or reuse, inputs, submit, the rest)
+struct llama_decode_timing {
+    bool    on = [] { const char * v = getenv("LLAMA_DECODE_TIMING"); return v != nullptr && atoi(v) != 0; }();
+    int64_t last_exit = 0; // the previous decode's exit, of any context
+    int64_t sync_us   = 0; // time in synchronize() since the last decode entry or exit
+    int64_t build_us = 0, inputs_us = 0, submit_us = 0; // phases of the current call
+};
+static llama_decode_timing g_decode_timing;
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
     }
 
+    const int64_t t_sync0 = g_decode_timing.on ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
+    if (g_decode_timing.on) {
+        g_decode_timing.sync_us += ggml_time_us() - t_sync0;
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1585,6 +1600,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    const int64_t t_dt0 = g_decode_timing.on ? ggml_time_us() : 0;
+
     // with LLAMA_GRAPH_SLOTS=2 each graph slot has its own scheduler: switch to this ubatch's
     if (sched_alt) {
         const int slot = llama_graph_slots_on() && n_outputs > 0;
@@ -1646,6 +1663,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    const int64_t t_dt1 = g_decode_timing.on ? ggml_time_us() : 0;
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1656,7 +1675,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_dt2 = g_decode_timing.on ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (g_decode_timing.on) {
+        const int64_t t_dt3 = ggml_time_us();
+        g_decode_timing.build_us  += t_dt1 - t_dt0;
+        g_decode_timing.inputs_us += t_dt2 - t_dt1;
+        g_decode_timing.submit_us += t_dt3 - t_dt2;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1912,6 +1938,37 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
     }
+
+    struct decode_timing_guard {
+        llama_context & lctx;
+        int64_t t_entry = 0, gap = 0, sync_before = 0, reused0 = 0;
+        int n_tokens = 0;
+        decode_timing_guard(llama_context & lctx, int n_tokens) : lctx(lctx), n_tokens(n_tokens) {
+            if (!g_decode_timing.on) {
+                return;
+            }
+            t_entry     = ggml_time_us();
+            gap         = g_decode_timing.last_exit > 0 ? t_entry - g_decode_timing.last_exit : 0;
+            sync_before = g_decode_timing.sync_us;
+            reused0     = lctx.n_reused;
+            g_decode_timing.sync_us  = 0;
+            g_decode_timing.build_us = g_decode_timing.inputs_us = g_decode_timing.submit_us = 0;
+        }
+        ~decode_timing_guard() {
+            if (!g_decode_timing.on) {
+                return;
+            }
+            const int64_t t_exit = ggml_time_us();
+            const auto & dt = g_decode_timing;
+            const int64_t inside = t_exit - t_entry;
+            fprintf(stderr, "DT %s tok %d out %d reused %d | before: gap %.3f sync %.3f cpu %.3f | inside %.3f: build %.3f inputs %.3f submit %.3f sync %.3f rest %.3f\n",
+                    llm_arch_name(lctx.model.arch), n_tokens, (int) lctx.n_outputs, (int) (lctx.n_reused - reused0),
+                    gap/1e3, sync_before/1e3, (gap - sync_before)/1e3, inside/1e3, dt.build_us/1e3, dt.inputs_us/1e3,
+                    dt.submit_us/1e3, dt.sync_us/1e3, (inside - dt.build_us - dt.inputs_us - dt.submit_us - dt.sync_us)/1e3);
+            g_decode_timing.last_exit = t_exit;
+            g_decode_timing.sync_us   = 0;
+        }
+    } timing_guard(*this, (int) batch_inp.tokens.size());
 
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
