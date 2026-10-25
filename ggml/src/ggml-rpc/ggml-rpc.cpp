@@ -723,6 +723,25 @@ static bool rpc_set_batch() {
     return std::atoi(mode.c_str()) != 0;
 }
 
+// DIAG GGML_RPC_NO_RECOMPUTE=1|flag:<path>: send every graph in full, never as a recompute of a stored one
+static bool rpc_no_recompute() {
+    static const std::string mode = [] {
+        const char * e = std::getenv("GGML_RPC_NO_RECOMPUTE");
+        return std::string(e != nullptr ? e : "");
+    }();
+    if (mode.rfind("flag:", 0) == 0) {
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(fs::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return std::atoi(mode.c_str()) != 0;
+}
+
 static constexpr size_t RPC_SET_BATCH_MAX_WRITES = 256;
 static constexpr size_t RPC_SET_BATCH_MAX_BYTES  = 64u << 20;
 // how long a batch waits for the next write while the queue is empty (GGML_RPC_SET_BATCH_LINGER_US, default 100): a
@@ -1387,8 +1406,26 @@ static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, co
 void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) {
     std::lock_guard<std::mutex> lock(graph_mutex);
     GGML_ASSERT(cgraph->n_nodes > 0);
+    // DIAG: a flash-attention node whose output width differs from its V rows came from a malformed split
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op == GGML_OP_FLASH_ATTN_EXT && n->src[2] != nullptr && n->ne[0] != n->src[2]->ne[0]) {
+            static std::atomic<int> n_bad{0};
+            if (n_bad.fetch_add(1) < 10) {
+                const ggml_tensor * q = n->src[0];
+                const ggml_tensor * k = n->src[1];
+                const ggml_tensor * v = n->src[2];
+                GGML_LOG_ERROR("DIAG malformed FA node %d '%s' %p dst [%lld %lld %lld %lld] q '%s' %p [%lld %lld %lld %lld] k '%s' %p [%lld %lld %lld %lld] v '%s' %p [%lld %lld %lld %lld] v.view_src '%s' %p\n",
+                    i, n->name, (void *) n, (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3],
+                    q->name, (void *) q, (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3],
+                    k->name, (void *) k, (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3],
+                    v->name, (void *) v, (long long) v->ne[0], (long long) v->ne[1], (long long) v->ne[2], (long long) v->ne[3],
+                    v->view_src ? v->view_src->name : "-", (void *) v->view_src);
+            }
+        }
+    }
     auto & device_graph_uids = graph_uids[device];
-    bool reuse = cgraph->uid != 0 && device_graph_uids.count(cgraph->uid) > 0;
+    bool reuse = cgraph->uid != 0 && device_graph_uids.count(cgraph->uid) > 0 && !rpc_no_recompute();
     LOG_DBG("[%s] device: %u, uid: %" PRIu64 ", n_nodes: %u, reuse: %s\n", __func__, device, cgraph->uid, cgraph->n_nodes, reuse ? "yes" : "no");
     if (reuse) {
         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
