@@ -1608,7 +1608,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        dbg_reused = true;
     } else {
+        dbg_reused = false;
         gf_res_prev_active = nullptr;
         // the graph results are per n_outputs > 0, not per scheduler: with the second slot off this scheduler also
         // builds the graph the other one last allocated, which that one must not reuse when the slot comes back
@@ -1900,6 +1902,32 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
         }
     }
     return false; // all sequences use backend sampling
+}
+
+// LLAMA_DEBUG_CALL_SUMS=dft|all: after every ubatch of a draft context (dft: one made with ctx_other) or of every context,
+// wait for the outputs and print the ubatch's shape, whether its graph was reused, the scheduler slot, and checksums of the
+// logits and nextn embeddings it produced, so two runs of the same request can be compared call by call
+static int llama_debug_call_sums_mode() {
+    static const int mode = [] {
+        const char * v = getenv("LLAMA_DEBUG_CALL_SUMS");
+        if (v == nullptr) {
+            return 0;
+        }
+        return strcmp(v, "all") == 0 ? 2 : 1;
+    }();
+    return mode;
+}
+
+static double llama_debug_checksum(const float * x, int64_t n, int64_t * n_nonfinite) {
+    double sum = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+        if (!std::isfinite(x[i])) {
+            (*n_nonfinite)++;
+            continue;
+        }
+        sum += (double) x[i] * (double) ((i % 97) + 1);
+    }
+    return sum;
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
@@ -2242,6 +2270,39 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+        }
+
+        if (llama_debug_call_sums_mode() == 2 || (llama_debug_call_sums_mode() == 1 && cparams.ctx_other != nullptr)) {
+            synchronize();
+            int64_t nonfinite = 0;
+            double  sum_logits = 0.0;
+            int32_t argmax_last = -1;
+            if (logits.data && n_outputs > 0 && n_vocab > 0) {
+                const float * l = logits.data + n_outputs_prev*n_vocab;
+                sum_logits = llama_debug_checksum(l, (int64_t) n_outputs*n_vocab, &nonfinite);
+                const float * last = l + (int64_t) (n_outputs - 1)*n_vocab;
+                for (int64_t v = 0; v < n_vocab; v++) {
+                    if (argmax_last < 0 || last[v] > last[argmax_last]) {
+                        argmax_last = (int32_t) v;
+                    }
+                }
+            }
+            double sum_nextn = 0.0;
+            if (embd_nextn.data && cparams.embeddings_nextn) {
+                const bool    masked = cparams.embeddings_nextn_masked;
+                const int64_t n_rows = masked ? n_outputs      : (int64_t) ubatch.n_tokens;
+                const int64_t offset = masked ? n_outputs_prev : n_tokens_prev;
+                const int64_t n_e    = hparams.n_embd_out();
+                if (n_rows > 0 && (offset + n_rows)*n_e <= (int64_t) embd_nextn.size) {
+                    sum_nextn = llama_debug_checksum(embd_nextn.data + offset*n_e, n_rows*n_e, &nonfinite);
+                }
+            }
+            fprintf(stderr, "DBGSUM %s call %" PRId64 " %s n_tokens %u n_outputs %d seq %d pos %d..%d slot %d %s"
+                    " logits %.9e argmax %d nextn %.9e nonfinite %" PRId64 "\n",
+                    cparams.ctx_other != nullptr ? "dft" : "tgt", dbg_calls, ubatch.embd ? "embd" : "tok", ubatch.n_tokens,
+                    n_outputs, ubatch.seq_id[0][0], ubatch.pos[0], ubatch.pos[ubatch.n_tokens - 1], sched_slot,
+                    dbg_reused ? "reused" : "built", sum_logits, argmax_last, sum_nextn, nonfinite);
+            dbg_calls++;
         }
 
         n_outputs_prev += n_outputs;

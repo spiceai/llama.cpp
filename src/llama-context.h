@@ -448,4 +448,8 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // LLAMA_DEBUG_CALL_SUMS: whether the last ubatch reused its graph, and a per-context count of decoded ubatches
+    bool    dbg_reused = false;
+    int64_t dbg_calls  = 0;
 };

@@ -1822,6 +1822,11 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     }
     result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
     if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
+        static std::atomic<int> n_stale{0};
+        if (n_stale.fetch_add(1) < 20) {
+            LOG_ERROR("[%s] DIAG tensor '%s' (op %s) names buffer 0x%" PRIx64 ", which this server does not hold, data 0x%" PRIx64 "\n",
+                      __func__, tensor->name, ggml_op_name((ggml_op) tensor->op), tensor->buffer, tensor->data);
+        }
         result->buffer = nullptr;
     }
 
