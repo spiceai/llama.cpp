@@ -900,6 +900,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 continue;
             }
             src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
+            if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN && ggml_nelements(tensor->src[i]) == 0) {
+                // an empty source holds the same (no) data on every device, e.g. the logits of a ubatch without
+                // outputs that backend samplers pad to one row
+                src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            }
             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         }
 

@@ -16,6 +16,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <map>
@@ -992,6 +993,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
+    std::vector<bool>            backend_chains_attached;
+    int64_t                      backend_flag_next_check_us = 0;
 
     int32_t n_embd_dec = 0;  // draft hidden size
     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
@@ -1115,6 +1118,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
+        backend_chains_attached.assign(n_seq, false);
         if (this->params.backend_sampling && !is_dflash2 && !is_lilicorr) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
@@ -1126,6 +1130,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     chain = nullptr;
                 }
                 backend_chains[seq_id] = chain;
+                backend_chains_attached[seq_id] = chain != nullptr;
             }
         }
 
@@ -1274,8 +1279,36 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return true;
     }
 
+    // LLAMA_DRAFT_BACKEND_SAMPLING=flag:<path>: keep the backend sampler chains attached only while <path> exists
+    // (re-checked at most every 100 ms), so one loaded model can alternate both arms of an A/B
+    void apply_backend_sampling_flag() {
+        static const std::string mode = [] {
+            const char * v = getenv("LLAMA_DRAFT_BACKEND_SAMPLING");
+            return std::string(v != nullptr ? v : "");
+        }();
+        if (mode.rfind("flag:", 0) != 0) {
+            return;
+        }
+        const int64_t now = ggml_time_us();
+        if (now < backend_flag_next_check_us) {
+            return;
+        }
+        backend_flag_next_check_us = now + 100000;
+        const bool want = std::filesystem::exists(mode.substr(5));
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
+            if (backend_chains[seq_id] == nullptr || backend_chains_attached[seq_id] == want) {
+                continue;
+            }
+            if (llama_set_sampler(params.ctx_dft, seq_id, want ? backend_chains[seq_id] : nullptr)) {
+                backend_chains_attached[seq_id] = want;
+            }
+        }
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        apply_backend_sampling_flag();
 
         batch.clear();
 
