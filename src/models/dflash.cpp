@@ -1070,6 +1070,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     cur = build_lora_mm(output, cur, output_s);
+    if (cparams.logits_gather) {
+        // the draft heads below read whole rows
+        cur = build_logits_gather(cur);
+    }
 
     // DFlash2 feeds these logits to the selector, so they need the target's output
     // transforms; DFlash1 and DSpark read them through the sampler instead
@@ -1280,6 +1284,10 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     }
 
     cur = build_lora_mm(output, cur, output_s);
+    if (cparams.logits_gather) {
+        // the draft heads below read whole rows
+        cur = build_logits_gather(cur);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -1525,6 +1533,10 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
     }
 
     cur = build_lora_mm(output, cur, output_s);
+    if (cparams.logits_gather) {
+        // the draft heads below read whole rows
+        cur = build_logits_gather(cur);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

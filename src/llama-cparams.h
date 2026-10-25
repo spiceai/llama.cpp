@@ -56,6 +56,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
+    bool logits_gather;      // gather a split output head whole onto every device, see llama_tensor_logits_gather
 
     size_t moe_cache_size;
 

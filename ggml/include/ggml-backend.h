@@ -430,6 +430,10 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // a copy of a that a meta backend holds whole on every device: a split along an axis is gathered from the devices'
+    // slices, so ops that need whole rows (top-k, argmax, soft_max) can consume it; on any other backend a plain copy
+    GGML_API struct ggml_tensor * ggml_backend_meta_gather(struct ggml_context * ctx, struct ggml_tensor * a);
+
     //
     // Utils
     //

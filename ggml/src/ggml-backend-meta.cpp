@@ -493,6 +493,24 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
+// A gather is a PAD by nothing whose op param GATHER_PARAM holds GATHER_MAGIC, so on its own it is a copy. On a meta
+// backend each device pads its slice of the split source with zeros to the whole tensor, at the slice's offset: the
+// result is a partial sum, and its all-reduce is the whole tensor on every device. Adding zeros to F32 is exact.
+static constexpr int     GGML_BACKEND_META_GATHER_PARAM = 9;          // after PAD's eight paddings and circular flag
+static constexpr int32_t GGML_BACKEND_META_GATHER_MAGIC = 0x52485447; // "GTHR"
+
+struct ggml_tensor * ggml_backend_meta_gather(struct ggml_context * ctx, struct ggml_tensor * a) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    ggml_tensor * result = ggml_pad_ext(ctx, a, 0, 0, 0, 0, 0, 0, 0, 0);
+    ggml_set_op_params_i32(result, GGML_BACKEND_META_GATHER_PARAM, GGML_BACKEND_META_GATHER_MAGIC);
+    return result;
+}
+
+static bool ggml_backend_meta_is_gather(const struct ggml_tensor * tensor) {
+    return tensor->op == GGML_OP_PAD &&
+        ggml_get_op_params_i32(tensor, GGML_BACKEND_META_GATHER_PARAM) == GGML_BACKEND_META_GATHER_MAGIC;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
@@ -776,6 +794,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return src_ss[0];
     };
 
+    // a gather of a split tensor is whole on every device, as a partial sum until it is all-reduced
+    auto handle_gather = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS) {
+            GGML_ASSERT(src_ss[0].n_segments == 1 && src_ss[0].nr[0] == 1);
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        return src_ss[0];
+    };
+
     auto handle_pool_1d = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
@@ -1013,7 +1040,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_pool_1d(src_ss);
             } break;
             case GGML_OP_PAD: {
-                split_state = handle_pad(src_ss);
+                split_state = ggml_backend_meta_is_gather(tensor) ? handle_gather(src_ss) : handle_pad(src_ss);
             } break;
             case GGML_OP_PAD_REFLECT_1D:
             case GGML_OP_ROLL:
@@ -1262,6 +1289,20 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
         t_ij->flags = tensor->flags;
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
+        if (ggml_backend_meta_is_gather(tensor)) {
+            // pad the device's slice to the whole tensor, at the offset of the slice
+            const ggml_backend_meta_split_state ss_src = ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ true);
+            if (ss_src.axis >= 0 && ss_src.axis < GGML_MAX_DIMS) {
+                int64_t lp = 0;
+                for (size_t jj = 0; jj < j; jj++) {
+                    lp += ss_src.ne[jj];
+                }
+                const int64_t rp = tensor->ne[ss_src.axis] - lp - ss_src.ne[j];
+                GGML_ASSERT(rp >= 0 && lp <= INT32_MAX && rp <= INT32_MAX);
+                ggml_set_op_params_i32(t_ij, 2*ss_src.axis + 0, (int32_t) lp);
+                ggml_set_op_params_i32(t_ij, 2*ss_src.axis + 1, (int32_t) rp);
+            }
+        }
         ggml_set_name(t_ij, tensor->name);
         t_ij->buffer = simple_buf;
         t_ij->view_src = tensor->view_src;
@@ -1590,7 +1631,11 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
-    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && ggml_backend_meta_is_gather(tensor)) {
+        // a gather is all-reduced in place after the graph computing it, whole on every device
+        split_state.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    }
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
@@ -2023,9 +2068,13 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
-    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(split_state.n_segments == 1);
     GGML_ASSERT(split_state.nr[0]      == 1);
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && ggml_backend_meta_is_gather(tensor)) {
+        // a gather is all-reduced in place after the graph computing it, whole on every device
+        split_state.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    }
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -2678,6 +2727,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    // a graph that ends in a partial sum (a gather as its last node) is reduced like the boundary between two subgraphs
+    const bool reduce_last = n_backends > 1 && cgraph->n_nodes > 0 &&
+        ggml_backend_buffer_is_meta(cgraph->nodes[cgraph->n_nodes - 1]->buffer) &&
+        ggml_backend_meta_get_split_state(cgraph->nodes[cgraph->n_nodes - 1], /*assume_sync =*/ false).axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -2687,7 +2741,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+        if (n_backends > 1 && (i < backend_ctx->n_subgraphs - 1 || reduce_last)) {
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;

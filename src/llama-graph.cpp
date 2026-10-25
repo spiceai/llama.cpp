@@ -1454,6 +1454,8 @@ void llm_graph_result::reset() {
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
 
+    t_logits_gathered = false;
+
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
@@ -4267,8 +4269,19 @@ void llm_graph_context::build_logits() const {
 
     // the models declare t_logits without expanding it, so the LM head is computed only when it is expanded here
     if (res->t_logits != nullptr) {
+        if (cparams.logits_gather && !res->t_logits_gathered) {
+            res->t_logits = build_logits_gather(res->t_logits);
+        }
         ggml_build_forward_expand(gf, res->t_logits);
     }
+}
+
+ggml_tensor * llm_graph_context::build_logits_gather(ggml_tensor * logits) const {
+    GGML_ASSERT(cparams.logits_gather);
+    ggml_tensor * cur = ggml_backend_meta_gather(ctx0, logits);
+    cb(cur, "result_output_gathered", -1);
+    res->t_logits_gathered = true;
+    return cur;
 }
 
 void llm_graph_context::build_sampling() const {

@@ -376,6 +376,8 @@ llama_context::llama_context(
     cparams.pipeline_parallel = false;
     cparams.training = false;
 
+    cparams.logits_gather = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && llama_tensor_logits_gather();
+
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;

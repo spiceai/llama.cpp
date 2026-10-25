@@ -975,6 +975,8 @@ public:
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
+    bool t_logits_gathered = false; // t_logits derives from a gather of the output head, see build_logits_gather
+
     std::vector<ggml_tensor *> t_layer_inp;
 
     std::vector<ggml_tensor *> t_sampled;
@@ -1472,6 +1474,10 @@ struct llm_graph_context {
     //
 
     void build_logits() const;
+
+    // the logits of a split output head gathered whole onto every device (cparams.logits_gather), for a graph whose
+    // own ops consume them before build_logits
+    ggml_tensor * build_logits_gather(ggml_tensor * logits) const;
 
     //
     // sampling (backend sampling)
