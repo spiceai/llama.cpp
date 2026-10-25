@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
@@ -2720,6 +2721,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
 
             if (!backend_allreduce_success) {
+                // GGML_META_LOG_FALLBACK: say why the backend's all-reduce declined, for the first 64 and then every
+                // 10000th, since the fallback copies every partial through this process
+                static const bool log_fallback = getenv("GGML_META_LOG_FALLBACK") != nullptr;
+                static std::atomic<uint64_t> n_fallbacks{0};
+                const uint64_t n = n_fallbacks.fetch_add(1, std::memory_order_relaxed);
+                if (log_fallback && (n < 64 || n % 10000 == 0)) {
+                    std::string why;
+                    for (size_t j = 0; j < n_backends; j++) {
+                        const ggml_cgraph * cg = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
+                        const ggml_tensor * node = cg->nodes[cg->n_nodes - 1];
+                        why += " " + std::to_string(j) + ":" + node->name + "(" + ggml_op_name(node->op) + "," +
+                               ggml_type_name(node->type) + ",ne=" + std::to_string(ggml_nelements(node)) +
+                               (ggml_is_contiguously_allocated(node) ? "" : ",strided") +
+                               ((node->flags & GGML_TENSOR_FLAG_COMPUTE) ? "" : ",disabled") + "," +
+                               (node->buffer ? ggml_backend_buffer_name(node->buffer) : "no buffer") + ")";
+                    }
+                    GGML_LOG_INFO("meta: all-reduce %" PRIu64 " (subgraph %zu of %zu) falls back:%s\n", n, i,
+                                  backend_ctx->n_subgraphs, why.c_str());
+                }
                 const ggml_status status = allreduce_fallback(i);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
