@@ -6,11 +6,13 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <set>
@@ -2106,6 +2108,25 @@ static void ggml_backend_meta_buffer_remake_simple_tensors(ggml_tensor * tensor)
     }
 }
 
+// DIAG GGML_META_ALWAYS_REBUILD=1|flag:<path>: rebuild the split of every graph, even one computed before with its uid
+static bool ggml_backend_meta_always_rebuild() {
+    static const std::string mode = [] {
+        const char * e = std::getenv("GGML_META_ALWAYS_REBUILD");
+        return std::string(e != nullptr ? e : "");
+    }();
+    if (mode.rfind("flag:", 0) == 0) {
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(std::filesystem::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return std::atoi(mode.c_str()) != 0;
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -2132,7 +2153,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // A split built before graphs came from several buffers points into the rotating compute containers, so while they
     // do it is rebuilt from clones.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid) ||
-                               (graph_slots && !backend_ctx->cloned);
+                               (graph_slots && !backend_ctx->cloned) || ggml_backend_meta_always_rebuild();
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -2189,6 +2210,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
                 }
                 GGML_ASSERT(bcj.nodes[i]);
+
             }
         }
 
