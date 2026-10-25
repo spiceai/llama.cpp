@@ -24,6 +24,7 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <limits>
 #include <atomic>
 #if !defined(_WIN32)
 #  include <arpa/inet.h>
@@ -1561,6 +1562,7 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
 // RPC server-side implementation
 
 struct rpc_comm_async;
+static bool rpc_comm_async_broken(const rpc_comm_async & async);
 struct rpc_comm_async_deleter {
     void operator()(rpc_comm_async * async) const;
 };
@@ -1606,6 +1608,7 @@ public:
 private:
     void sync_all_backends();
     bool set_tensor_impl(const uint8_t * input, size_t input_size); // one SET_TENSOR request, without the sync
+    bool comm_failed(const char * func) const;
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
@@ -2150,6 +2153,9 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
 
 bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response) {
     sync_all_backends();
+    if (comm_failed(__func__)) {
+        return false;
+    }
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -2188,6 +2194,9 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
 
 bool rpc_server::get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response) {
     sync_all_backends();
+    if (comm_failed(__func__)) {
+        return false;
+    }
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -2446,6 +2455,20 @@ void rpc_server::sync_all_backends() {
     for (ggml_backend_t backend : backends) {
         ggml_backend_synchronize(backend);
     }
+}
+
+// An all-reduce queued on a stream (GGML_RPC_COMM_ASYNC) whose exchange failed let the stream go on with NaN in place
+// of the sum: data read after that must not reach the client, which is dropped instead.
+bool rpc_server::comm_failed(const char * func) const {
+    for (size_t device = 0; device < comm_states.size(); device++) {
+        const comm_state & state = comm_states[device];
+        if (state.async != nullptr && rpc_comm_async_broken(*state.async)) {
+            LOG_ERROR("[%s] device %zu: an all-reduce failed, so this rank's results are not valid; dropping the client\n",
+                      func, device);
+            return true;
+        }
+    }
+    return false;
 }
 
 // The comm link between two servers uses the same caps negotiation as the client HELLO,
@@ -2897,17 +2920,7 @@ struct rpc_comm_async {
     uint32_t rank = 0, world = 0;
 
     ~rpc_comm_async() {
-        // all-reduces still queued on the stream wait on `done`: the thread releases them, without exchanging, before
-        // it stops, so the stream drains instead of waiting forever
-        broken.store(true, std::memory_order_release);
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (thread.joinable() && !idle() && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-        }
-        stop.store(true, std::memory_order_release);
-        if (thread.joinable()) {
-            thread.join();
-        }
+        release();
         if (host_free != nullptr) {
             host_free(flags);
             host_free(out);
@@ -2917,6 +2930,52 @@ struct rpc_comm_async {
 
     bool idle() const {
         return processed.load(std::memory_order_acquire) == queued.load(std::memory_order_acquire);
+    }
+
+    void start() {
+        stop.store(false, std::memory_order_release);
+        thread = std::thread([this] { run(); });
+    }
+
+    // Stops the exchange thread, lets every all-reduce still queued on the stream through without its sum, and waits for
+    // the stream, so that nothing on it uses the host buffers any more. The comm is marked broken first: a server never
+    // returns data computed after this, and drops its client instead.
+    void release() {
+        broken.store(true, std::memory_order_release);
+        stop.store(true, std::memory_order_release);
+        if (thread.joinable()) {
+            // an exchange in progress may wait on a peer that never sends; cutting the connections ends it
+            if (peers != nullptr) {
+                for (const auto & peer : *peers) {
+                    if (peer != nullptr) {
+                        peer->shutdown();
+                    }
+                }
+            }
+            thread.join();
+        }
+        if (flags != nullptr) {
+            // the thread has stopped, so nothing lowers `done` again
+            __atomic_store_n(&flags[1], 0xffffffffu, __ATOMIC_RELEASE);
+            if (backend != nullptr) {
+                ggml_backend_synchronize(backend);
+            }
+        }
+    }
+
+    // Before the flags wrap, with the stream and the exchange drained: the thread is stopped while the counters restart,
+    // since it reads them without a lock and must not see one of them reset and the other not.
+    void restart_flags() {
+        stop.store(true, std::memory_order_release);
+        if (thread.joinable()) {
+            thread.join();
+        }
+        __atomic_store_n(&flags[0], 0u, __ATOMIC_RELEASE);
+        __atomic_store_n(&flags[1], 0u, __ATOMIC_RELEASE);
+        next_flag = 0;
+        queued.store(0, std::memory_order_release);
+        processed.store(0, std::memory_order_release);
+        start();
     }
 
     void run() {
@@ -2938,10 +2997,12 @@ struct rpc_comm_async {
                     return;
                 }
             }
-            if (!broken.load(std::memory_order_relaxed) &&
+            if (broken.load(std::memory_order_relaxed) ||
                 !rpc_comm_mesh_exchange(*peers, rank, world, j.seq, j.nbytes, out, *parts, in)) {
-                // the stream is released either way, so it drains; the server drops the client before using any result
+                // the stream is released either way, so it drains; what it copies back is NaN rather than an older
+                // sum, and the server drops the client before it returns any result
                 broken.store(true, std::memory_order_release);
+                std::fill(in, in + j.nbytes / sizeof(float), std::numeric_limits<float>::quiet_NaN());
             }
             __atomic_store_n(&flags[1], j.flag, __ATOMIC_RELEASE);
             processed.store(j.flag, std::memory_order_release);
@@ -2951,6 +3012,10 @@ struct rpc_comm_async {
 
 void rpc_comm_async_deleter::operator()(rpc_comm_async * async) const {
     delete async;
+}
+
+static bool rpc_comm_async_broken(const rpc_comm_async & async) {
+    return async.broken.load(std::memory_order_acquire);
 }
 
 static bool rpc_comm_async_enabled() {
@@ -3166,14 +3231,15 @@ bool rpc_server::comm_allreduce_mesh_async(comm_state & state, ggml_backend_t ba
             host_free(async->flags);
             async->flags = nullptr;
             async->host_free = nullptr;
+            // kept without flags, so the device is probed once
+            state.async = std::move(async);
             return false;
         }
         async->peers = &state.peers;
         async->parts = &state.parts;
         async->rank  = state.rank;
         async->world = state.world;
-        rpc_comm_async * a = async.get();
-        async->thread = std::thread([a] { a->run(); });
+        async->start();
         state.async = std::move(async);
         LOG_INFO("[%s] rank %u queues its all-reduces on the device's stream\n", __func__, state.rank);
     }
@@ -3202,11 +3268,7 @@ bool rpc_server::comm_allreduce_mesh_async(comm_state & state, ggml_backend_t ba
             a.capacity = capacity;
         }
         if (a.next_flag >= 0xfffffff0u) {
-            __atomic_store_n(&a.flags[0], 0u, __ATOMIC_RELEASE);
-            __atomic_store_n(&a.flags[1], 0u, __ATOMIC_RELEASE);
-            a.next_flag = 0;
-            a.queued.store(0, std::memory_order_release);
-            a.processed.store(0, std::memory_order_release);
+            a.restart_flags();
         }
     }
     // no more than RING all-reduces ahead of the exchange
@@ -3230,11 +3292,8 @@ bool rpc_server::comm_free(const rpc_msg_comm_free_req & request) {
         return false;
     }
     comm_state & state = comm_states[request.device];
-    if (state.async != nullptr) {
-        // the stream and the exchange drain before the connections they use close
-        ggml_backend_synchronize(backends[request.device]);
-        state.async.reset();
-    }
+    // the stream drains, and the exchange stops, before the connections they use close
+    state.async.reset();
     if (!state.peers.empty()) {
         LOG_INFO("[%s] device %u: rank %u of the %u-rank mesh ran %" PRIu64 " all-reduces\n", __func__, request.device,
                  state.rank, state.world, state.seq);
@@ -3262,6 +3321,11 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    // an all-reduce still queued on a stream copies its sum into a tensor of one of the buffers freed below: the stream
+    // is released and drained first
+    for (auto & state : comm_states) {
+        state.async.reset();
+    }
     // a client that disconnects without COMM_FREE still leaves no NCCL communicator behind; abort it rather than
     // destroy it, since the client may have sent a collective to this rank only, which the peer never joins
     for (size_t device = 0; device < comm_states.size(); device++) {

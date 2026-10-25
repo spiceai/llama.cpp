@@ -6260,6 +6260,25 @@ static bool ggml_backend_cuda_comm_can_stage(ggml_backend_t backend, uint32_t * 
     return ok;
 }
 
+// The sum the host writes before `done` must be what the copy after the wait reads. Where the device can flush writes
+// that reached it before a wait is satisfied, the wait asks it to.
+static unsigned int ggml_backend_cuda_comm_wait_flags(int device) {
+    static std::atomic<int> flush[GGML_CUDA_MAX_DEVICES] = {};  // 0 unknown, 1 no, 2 yes
+    int known = flush[device].load(std::memory_order_relaxed);
+    if (known == 0) {
+        CUdevice dev;
+        int can = 0;
+        if (cuDeviceGet(&dev, device) != CUDA_SUCCESS ||
+                cuDeviceGetAttribute(&can, CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES, dev) != CUDA_SUCCESS) {
+            can = 0;
+        }
+        known = can ? 2 : 1;
+        flush[device].store(known, std::memory_order_relaxed);
+        GGML_LOG_INFO("%s: device %d %s flush writes after waiting on host memory\n", __func__, device, can ? "can" : "cannot");
+    }
+    return CU_STREAM_WAIT_VALUE_GEQ | (known == 2 ? CU_STREAM_WAIT_VALUE_FLUSH : 0);
+}
+
 static bool ggml_backend_cuda_comm_stage(ggml_backend_t backend, ggml_tensor * t, void * out, const void * in,
                                          uint32_t * ready, uint32_t * done, uint32_t seq) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -6274,7 +6293,8 @@ static bool ggml_backend_cuda_comm_stage(ggml_backend_t backend, ggml_tensor * t
     const size_t nbytes = ggml_nbytes(t);
     CUDA_CHECK(cudaMemcpyAsync(out, t->data, nbytes, cudaMemcpyDeviceToHost, stream));
     CU_CHECK(cuStreamWriteValue32((CUstream) stream, (CUdeviceptr) ready_dev, seq, CU_STREAM_WRITE_VALUE_DEFAULT));
-    CU_CHECK(cuStreamWaitValue32((CUstream) stream, (CUdeviceptr) done_dev, seq, CU_STREAM_WAIT_VALUE_GEQ));
+    CU_CHECK(cuStreamWaitValue32((CUstream) stream, (CUdeviceptr) done_dev, seq,
+                                 ggml_backend_cuda_comm_wait_flags(cuda_ctx->device)));
     CUDA_CHECK(cudaMemcpyAsync(t->data, in, nbytes, cudaMemcpyHostToDevice, stream));
     return true;
 }
