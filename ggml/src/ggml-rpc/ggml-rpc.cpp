@@ -747,6 +747,9 @@ static bool rpc_read_pipeline() {
 }
 
 static constexpr size_t RPC_READ_PIPELINE_MAX_BYTES = 1u << 20;
+// replies in flight at once, below the 24 receives the RoCE transport keeps posted (RDMA_RX_DEPTH), so a run of small
+// reads never waits on the receiver-not-ready retry
+static constexpr size_t RPC_READ_PIPELINE_MAX_MSGS  = 16;
 
 static constexpr size_t RPC_SET_BATCH_MAX_WRITES = 256;
 static constexpr size_t RPC_SET_BATCH_MAX_BYTES  = 64u << 20;
@@ -840,6 +843,7 @@ void rpc_dispatcher::work() {
             break;
         }
         const bool pipelined = msg_ptr->cmd != RPC_CMD_NONE && msg_ptr->output != nullptr && rpc_read_pipeline() &&
+                               pending.size() < RPC_READ_PIPELINE_MAX_MSGS &&
                                pending_bytes + msg_ptr->output_size <= RPC_READ_PIPELINE_MAX_BYTES;
         if (!pipelined && !pending.empty()) {
             // anything else, a barrier included, goes after the replies of the run before it
