@@ -377,6 +377,9 @@ llama_context::llama_context(
     cparams.training = false;
 
     cparams.logits_gather = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && llama_tensor_logits_gather();
+    if (cparams.logits_gather) {
+        LLAMA_LOG_WARN("%s: LLAMA_TENSOR_LOGITS_GATHER: the output head is split by vocabulary rows and its logits are gathered onto every device\n", __func__);
+    }
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
