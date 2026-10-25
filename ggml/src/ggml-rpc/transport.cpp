@@ -681,6 +681,15 @@ bool socket_t::flush() {
     return pimpl->flush();
 }
 
+// an RDMA receive notices too: it watches the TCP socket for a hang-up while it waits for a completion
+void socket_t::shutdown() {
+#ifdef _WIN32
+    if (pimpl->fd != INVALID_SOCKET) ::shutdown(pimpl->fd, SD_BOTH);
+#else
+    if (pimpl->fd >= 0) ::shutdown(pimpl->fd, SHUT_RDWR);
+#endif
+}
+
 void socket_t::get_caps(uint8_t * local_caps) {
     return pimpl->get_caps(local_caps);
 }
