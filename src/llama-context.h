@@ -368,6 +368,7 @@ private:
     // LLAMA_GRAPH_SLOTS=2: the scheduler of the graph slot not in use, swapped with sched when the slot changes
     ggml_backend_sched_ptr sched_alt;
     int                    sched_slot = 0;
+    bool                   sched_slots_on = false; // the graph slots were on for the last ubatch (one decision per ubatch)
 
     bool sched_need_reserve = true;
 

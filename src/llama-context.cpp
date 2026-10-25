@@ -752,6 +752,24 @@ static bool llama_graph_slots_on() {
     return atoi(mode.c_str()) >= 2;
 }
 
+static bool llama_graph_slots_all_outputs() {
+    static const std::string mode = [] {
+        const char * v = getenv("LLAMA_GRAPH_SLOTS_ALL_OUTPUTS");
+        return std::string(v != nullptr ? v : "");
+    }();
+    if (mode.rfind("flag:", 0) == 0) {
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(std::filesystem::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return atoi(mode.c_str()) != 0;
+}
+
 void llama_context::sched_new(size_t max_nodes, bool parallel) {
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
@@ -1604,7 +1622,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // with LLAMA_GRAPH_SLOTS=2 each graph slot has its own scheduler: switch to this ubatch's
     if (sched_alt) {
-        const int slot = llama_graph_slots_on() && n_outputs > 0;
+        // LLAMA_GRAPH_SLOTS_ALL_OUTPUTS=1 (or flag:<path>): the second slot holds only ubatches whose every token is an
+        // output (a speculative verify or draft), so a prompt's last chunk, which outputs one token, does not evict the
+        // verify
+        const bool all_outputs = llama_graph_slots_all_outputs();
+        sched_slots_on = llama_graph_slots_on();
+        const int slot = sched_slots_on && n_outputs > 0 && (!all_outputs || n_outputs == ubatch.n_tokens);
         if (slot != sched_slot) {
             std::swap(sched, sched_alt);
             std::swap(gf_res_prev_active, gf_res_prev_active_alt);
@@ -1619,6 +1642,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    if (getenv("LLAMA_DEBUG_REUSE") && n_outputs > 0) {
+        fprintf(stderr, "DBGREUSE arch %s tok %u out %u slot %d prev_active %d can_reuse %d\n", llm_arch_name(model.arch),
+                ubatch.n_tokens, n_outputs, sched_slot, (int) (gf_res_prev_active == res), (int) (gf_res_prev_active == res && res->can_reuse(gparams)));
+    }
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -2702,7 +2729,9 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 llm_graph_result * llama_context::get_gf_res_prev() {
-    auto & res = gf_res_prev[n_outputs > 0];
+    // with the graph slots on, one result per scheduler slot: a prompt's last chunk outputs a token but runs in the
+    // first slot (LLAMA_GRAPH_SLOTS_ALL_OUTPUTS=1), and must not overwrite the verify graph the second slot holds
+    auto & res = gf_res_prev[sched_alt && sched_slots_on ? sched_slot : (n_outputs > 0)];
     if (!res) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
     }
