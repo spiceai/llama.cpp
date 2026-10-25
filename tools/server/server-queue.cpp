@@ -223,9 +223,10 @@ void server_queue::worker_stop() {
     worker.thread.join();
 }
 
-// LLAMA_SERVER_INLINE_YIELD=1 (or flag:<path>, re-checked at most every 100 ms): when no task is waiting, run the work
-// without handing the queue to the worker thread, which costs two thread wake-ups per yield; a task that arrives
-// meanwhile waits for the main loop, which processes new tasks between two updates of the slots
+// LLAMA_SERVER_INLINE_YIELD=1 (or flag:<path>, re-checked at most every 100 ms): when no queued task could be processed
+// during the yield (the slots' NEXT_RESPONSE and the requests waiting for a slot are always queued, and the worker only
+// declines them), run the work without handing the queue to the worker thread, which costs two thread wake-ups per
+// yield; a task that arrives meanwhile waits for the yield to end, at most one encode / decode
 static bool server_inline_yield() {
     static const char * v = getenv("LLAMA_SERVER_INLINE_YIELD");
     if (v == nullptr) {
@@ -249,10 +250,18 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
 
     if (server_inline_yield()) {
         bool pending;
+        size_t n_queued, n_deferred;
         {
             std::unique_lock<std::mutex> lock(mutex_tasks);
             GGML_ASSERT(!worker.busy && "yield_to_queue() cannot be nested");
-            pending = !queue_tasks.empty();
+            pending = std::any_of(queue_tasks.begin(), queue_tasks.end(),
+                    [](const server_task & task) { return server_task_type_handled_while_yielding(task.type); });
+            n_queued = queue_tasks.size();
+            n_deferred = queue_tasks_deferred.size();
+        }
+        static const bool dbg = getenv("LLAMA_SERVER_INLINE_YIELD_DEBUG") != nullptr;
+        if (dbg) {
+            fprintf(stderr, "IY %s queued %zu deferred %zu\n", pending ? "normal" : "inline", n_queued, n_deferred);
         }
         if (!pending) {
             work();

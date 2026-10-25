@@ -3042,7 +3042,7 @@ private:
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
-        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+        if (is_yielding && !server_task_type_handled_while_yielding(task.type)) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
         }
