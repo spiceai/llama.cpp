@@ -16,11 +16,14 @@
 #  include <netinet/tcp.h>
 #  include <netdb.h>
 #  include <unistd.h>
+#  include <poll.h>
 #endif
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <thread>
 
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
@@ -685,6 +688,29 @@ void socket_t::update_caps(const uint8_t * remote_caps) {
 
 const char * socket_t::transport_name() const {
     return pimpl->use_rdma ? "RDMA" : "TCP";
+}
+
+bool socket_t::detects_peer_close() {
+#if !defined(_WIN32) && defined(POLLRDHUP)
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool socket_t::wait_peer_closed(int timeout_ms) {
+#if !defined(_WIN32) && defined(POLLRDHUP)
+    if (pimpl->fd < 0) {
+        return false;
+    }
+    // POLLHUP and POLLERR are always reported
+    struct pollfd pfd = { pimpl->fd, POLLRDHUP, 0 };
+    const int r = poll(&pfd, 1, timeout_ms);
+    return r > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLRDHUP));
+#else
+    std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
+    return false;
+#endif
 }
 
 static bool is_valid_fd(sockfd_t sockfd) {

@@ -1459,6 +1459,8 @@ public:
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
+    // aborts every NCCL communicator this client left open; safe to call from another thread (the client watchdog)
+    void abort_comms();
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -1489,7 +1491,11 @@ private:
         bool                  (*nccl_allreduce)(ggml_backend_t, void *, ggml_tensor *) = nullptr;
         void                  (*nccl_free)(void *) = nullptr;   // COMM_FREE: both ranks free the communicator together
         void                  (*nccl_abort)(void *) = nullptr;  // disconnect without COMM_FREE: the peer may not take part
+        bool                    nccl_aborted = false;          // the communicator was aborted: all-reduces fail from now on
     };
+
+    // guards nccl and nccl_aborted in comm_states, which abort_comms changes from the client watchdog thread
+    std::mutex comm_mutex;
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
@@ -2369,17 +2375,24 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
             return true;
         }
         if (ok && peer_ok) {
-            state.nccl = init_rank(backend, id, (int) request.world, (int) request.rank);
+            void * nccl = init_rank(backend, id, (int) request.world, (int) request.rank);
+            {
+                std::lock_guard<std::mutex> lock(comm_mutex);
+                state.nccl = nccl;
+            }
             // ncclCommInitRank can succeed on one rank and fail on the other, so the ranks agree on its result as
             // well: unless both have a communicator, neither keeps one, and both copy through the host
-            uint8_t inited = state.nccl != nullptr;
+            uint8_t inited = nccl != nullptr;
             uint8_t peer_inited = 0;
             const bool agreed = request.rank == 0 ?
                 state.peer->send_data(&inited, 1) && state.peer->flush() && state.peer->recv_data(&peer_inited, 1) :
                 state.peer->recv_data(&peer_inited, 1) && state.peer->send_data(&inited, 1) && state.peer->flush();
-            if ((!agreed || !peer_inited) && state.nccl != nullptr) {
-                state.nccl_abort(state.nccl);
-                state.nccl = nullptr;
+            if (!agreed || !peer_inited) {
+                std::lock_guard<std::mutex> lock(comm_mutex);
+                if (state.nccl != nullptr) {
+                    state.nccl_abort(state.nccl);
+                    state.nccl = nullptr;
+                }
             }
             if (!agreed) {
                 state.peer = nullptr;
@@ -2423,6 +2436,11 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     if (nbytes == 0) {
         return true;
     }
+    std::unique_lock<std::mutex> comm_lock(comm_mutex);
+    if (state.nccl_aborted) {
+        LOG_ERROR("[%s] device %u: the NCCL communicator was aborted after the client left\n", __func__, request.device);
+        return false;
+    }
     if (state.nccl != nullptr) {
         // NCCL reduces ggml_nelements floats in place, so it takes only a dense F32 tensor whose floats are exactly the
         // ggml_nbytes that deserialize_tensor kept inside the buffer; for a huge ne, ggml_nbytes wraps and is smaller
@@ -2433,6 +2451,7 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
         }
         return state.nccl_allreduce(backend, state.nccl, t_dst);
     }
+    comm_lock.unlock();
     // reduce large partials in bf16 to halve the wire bytes; small (decode-sized) ones
     // stay f32 since the extra casts and sync cost more than the bytes saved
     const bool   wire_bf16  = !state.wire_f32 && t_dst->type == GGML_TYPE_F32 && ne >= 32768;
@@ -2529,10 +2548,19 @@ bool rpc_server::comm_free(const rpc_msg_comm_free_req & request) {
         return false;
     }
     comm_state & state = comm_states[request.device];
-    if (state.nccl != nullptr) {
-        state.nccl_free(state.nccl);
+    void * nccl = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(comm_mutex);
+        nccl = state.nccl;
+        state.nccl = nullptr;
     }
-    comm_states[request.device] = comm_state();
+    if (nccl != nullptr) {
+        state.nccl_free(nccl);
+    }
+    {
+        std::lock_guard<std::mutex> lock(comm_mutex);
+        comm_states[request.device] = comm_state();
+    }
     return true;
 }
 
@@ -2551,17 +2579,23 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     return true;
 }
 
-rpc_server::~rpc_server() {
+void rpc_server::abort_comms() {
     // a client that disconnects without COMM_FREE still leaves no NCCL communicator behind; abort it rather than
     // destroy it, since the client may have sent a collective to this rank only, which the peer never joins
+    std::lock_guard<std::mutex> lock(comm_mutex);
     for (size_t device = 0; device < comm_states.size(); device++) {
         comm_state & state = comm_states[device];
         if (state.nccl != nullptr && state.nccl_abort != nullptr) {
             state.nccl_abort(state.nccl);
             state.nccl = nullptr;
+            state.nccl_aborted = true;
             LOG_INFO("[%s] device %zu: aborted the NCCL communicator the client left open\n", __func__, device);
         }
     }
+}
+
+rpc_server::~rpc_server() {
+    abort_comms();
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
@@ -2607,6 +2641,40 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
     LOG_DBG("[%s] client connected, transport: %s\n", __func__, sock->transport_name());
+
+    // A command can leave this thread waiting on a GPU stream that never finishes: a client that dies after sending an
+    // NCCL all-reduce to this rank but not to the peer leaves that collective waiting for the peer, and a later command
+    // (get_tensor, free_buffer, ...) synchronizes behind it. This thread then never reads the closed connection, so a
+    // watchdog waits for it to close and aborts the NCCL communicators, which ends the collective. After the close it
+    // keeps aborting, so a communicator this thread finishes creating afterwards is aborted too.
+    // Not covered: a COMM_FREE whose ncclCommDestroy waits behind such a collective (the communicator is no longer
+    // visible to abort), a COMM_INIT only one rank received, a peer server that dies while the client lives, and a
+    // client host that vanishes without closing the connection.
+    struct client_watchdog {
+        std::atomic<bool> done{false};
+        std::thread       thread;
+        ~client_watchdog() {
+            done = true;
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    } watchdog;
+    if (socket_t::detects_peer_close()) {
+        watchdog.thread = std::thread([&server, &sock, &watchdog] {
+            bool closed = false;
+            while (!watchdog.done) {
+                if (!closed) {
+                    closed = sock->wait_peer_closed(100);
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                if (closed) {
+                    server.abort_comms();
+                }
+            }
+        });
+    }
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {
             break;
@@ -2901,6 +2969,13 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         LOG_ERROR("Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
     }
+#ifndef _WIN32
+    // NCCL 2.22+ connects a channel the first time a collective uses it, inside that ncclAllReduce, waiting for the peer
+    // without a timeout. A client lost between the two ranks' first all-reduce would leave a rank waiting there with
+    // comm_mutex held, where the client watchdog cannot abort it, so NCCL communicators connect while they initialize
+    // instead (unless NCCL_RUNTIME_CONNECT is set). Set before any thread starts, since NCCL reads it once per process.
+    setenv("NCCL_RUNTIME_CONNECT", "0", 0);
+#endif
     std::vector<ggml_backend_t> backends;
     LOG_INFO("Starting RPC server v%d.%d.%d\n",
         RPC_PROTO_MAJOR_VERSION,
