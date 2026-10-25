@@ -755,7 +755,10 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
     // LLAMA_GRAPH_SLOTS=2: one scheduler per graph slot, so a context alternating between two graphs reuses both
-    const bool graph_slots = llama_graph_slots_mode().rfind("flag:", 0) == 0 || atoi(llama_graph_slots_mode().c_str()) >= 2;
+    // DIAG LLAMA_GRAPH_SLOTS_DRAFT_ONLY=1: only a context that drafts for another one (ctx_other) gets the second scheduler
+    static const bool draft_only = getenv("LLAMA_GRAPH_SLOTS_DRAFT_ONLY") != nullptr && atoi(getenv("LLAMA_GRAPH_SLOTS_DRAFT_ONLY")) != 0;
+    const bool graph_slots = (llama_graph_slots_mode().rfind("flag:", 0) == 0 || atoi(llama_graph_slots_mode().c_str()) >= 2) &&
+                             (!draft_only || cparams.ctx_other != nullptr);
     sched_alt.reset();
     sched_slot = 0;
     gf_res_prev_active_alt = nullptr;
@@ -1597,7 +1600,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    // DIAG LLAMA_GRAPH_SLOTS_INJECT_REUSE=0: with graph slots, a draft context rebuilds its graphs without outputs
+    static const bool inject_reuse = getenv("LLAMA_GRAPH_SLOTS_INJECT_REUSE") == nullptr || atoi(getenv("LLAMA_GRAPH_SLOTS_INJECT_REUSE")) != 0;
+    const bool reuse_allowed = inject_reuse || !sched_alt || cparams.ctx_other == nullptr || n_outputs > 0;
+    if (!graph_reuse_disable && reuse_allowed && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
