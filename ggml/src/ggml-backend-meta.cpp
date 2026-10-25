@@ -2189,6 +2189,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
                 }
                 GGML_ASSERT(bcj.nodes[i]);
+
+                // The simple tensor of a node that outlived its buffer's container rotations (a graph its scheduler
+                // reused) still points at the simple tensors its sources had when it was made. A source in another
+                // buffer whose containers rotated since (the KV cache, which another scheduler's graphs view too) may
+                // have been reset and its memory handed to other tensors, so point the sources at the current ones,
+                // as allocating the graph does.
+                for (int k = 0; k < GGML_MAX_SRC; k++) {
+                    ggml_tensor * src = node->src[k];
+                    if (src == nullptr || src == node || src->buffer == nullptr || !ggml_backend_buffer_is_meta(src->buffer)) {
+                        continue;
+                    }
+                    ggml_tensor * src_j = ggml_backend_meta_buffer_simple_tensor(src, j);
+                    if (src_j == nullptr) {
+                        ggml_backend_meta_buffer_remake_simple_tensors(src);
+                        src_j = ggml_backend_meta_buffer_simple_tensor(src, j);
+                    }
+                    GGML_ASSERT(src_j);
+                    bcj.nodes[i]->src[k] = src_j;
+                }
             }
         }
 
