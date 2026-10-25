@@ -4,7 +4,11 @@
 #include "log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <thread>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -219,8 +223,46 @@ void server_queue::worker_stop() {
     worker.thread.join();
 }
 
+// LLAMA_SERVER_INLINE_YIELD=1 (or flag:<path>, re-checked at most every 100 ms): when no task is waiting, run the work
+// without handing the queue to the worker thread, which costs two thread wake-ups per yield; a task that arrives
+// meanwhile waits for the main loop, which processes new tasks between two updates of the slots
+static bool server_inline_yield() {
+    static const char * v = getenv("LLAMA_SERVER_INLINE_YIELD");
+    if (v == nullptr) {
+        return false;
+    }
+    if (strncmp(v, "flag:", 5) != 0) {
+        return atoi(v) != 0;
+    }
+    static std::atomic<int64_t> next_check_us{0};
+    static std::atomic<bool>    on{false};
+    const int64_t now = ggml_time_us();
+    if (now >= next_check_us.load(std::memory_order_relaxed)) {
+        on.store(std::filesystem::exists(v + 5), std::memory_order_relaxed);
+        next_check_us.store(now + 100000, std::memory_order_relaxed);
+    }
+    return on.load(std::memory_order_relaxed);
+}
+
 void server_queue::yield_to_queue(std::function<void()> && work) {
     GGML_ASSERT(worker.thread.joinable() && "yield_to_queue() requires start_loop() to be running");
+
+    if (server_inline_yield()) {
+        bool pending;
+        {
+            std::unique_lock<std::mutex> lock(mutex_tasks);
+            GGML_ASSERT(!worker.busy && "yield_to_queue() cannot be nested");
+            pending = !queue_tasks.empty();
+        }
+        if (!pending) {
+            work();
+
+            std::unique_lock<std::mutex> lock(mutex_tasks);
+            // as after a yield: the work is not idle time
+            time_last_task = ggml_time_ms();
+            return;
+        }
+    }
 
     QUE_DBG("%s", "yielding to queue\n");
 
