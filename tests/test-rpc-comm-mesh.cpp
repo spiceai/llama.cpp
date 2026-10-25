@@ -169,6 +169,8 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "usage: %s <endpoint> <endpoint> [<endpoint>...]\n", argv[0]);
         return 2;
     }
+    // one line at a time, so a run that hangs still shows how far it got
+    setvbuf(stdout, nullptr, _IOLBF, 0);
     ggml_backend_load_all();
     ggml_time_init();
     std::vector<const char *> endpoints(argv + 1, argv + argc);

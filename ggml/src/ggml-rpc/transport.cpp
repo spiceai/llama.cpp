@@ -517,6 +517,12 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
 
         int slot = (int)wc.wr_id;
         size_t got = wc.byte_len;
+        // a message is delivered whole, so one longer than what is left of this read belongs to a read of another size:
+        // copying it would write past the caller's buffer
+        if (got > rem) {
+            LOG_ERROR("RDMA received a %zu-byte message for a read with %zu bytes left\n", got, rem);
+            return false;
+        }
         memcpy(dst, c->rx_slot(slot), got);
 
         if (!c->post_rx(slot)) return false;
