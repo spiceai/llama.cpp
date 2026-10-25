@@ -17,6 +17,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <filesystem>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -1481,9 +1482,44 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
+// LLAMA_ENGRAM_PREFETCH_FIRST=1 (or flag:<path>, re-checked at most every 100 ms): see llm_graph_input_i::prefetch
+bool llama_engram_prefetch_first() {
+    static const std::string mode = [] {
+        const char * v = getenv("LLAMA_ENGRAM_PREFETCH_FIRST");
+        return std::string(v != nullptr ? v : "");
+    }();
+    if (mode.rfind("flag:", 0) == 0) {
+        static int64_t next_check_us = 0;
+        static bool    on            = false;
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us) {
+            on            = std::filesystem::exists(mode.substr(5));
+            next_check_us = now + 100000;
+        }
+        return on;
+    }
+    return atoi(mode.c_str()) != 0;
+}
+
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    if (!llama_engram_prefetch_first()) {
+        for (auto & input : inputs) {
+            input->set_input(ubatch);
+        }
+        return;
+    }
     for (auto & input : inputs) {
-        input->set_input(ubatch);
+        input->prefetch(ubatch);
+    }
+    for (auto & input : inputs) {
+        if (!input->set_late()) {
+            input->set_input(ubatch);
+        }
+    }
+    for (auto & input : inputs) {
+        if (input->set_late()) {
+            input->set_input(ubatch);
+        }
     }
 }
 
