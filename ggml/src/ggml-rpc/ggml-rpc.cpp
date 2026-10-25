@@ -79,6 +79,7 @@ enum rpc_cmd {
     RPC_CMD_COMM_INIT,
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
+    RPC_CMD_SET_TENSOR_MULTI,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -110,6 +111,7 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_COMM_INIT:         return "COMM_INIT";
         case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
         case RPC_CMD_COMM_FREE:         return "COMM_FREE";
+        case RPC_CMD_SET_TENSOR_MULTI:  return "SET_TENSOR_MULTI";
         case RPC_CMD_NONE:              return "NONE";
         default:                        return "UNKNOWN";
     }
@@ -501,6 +503,23 @@ public:
         return true;
     }
 
+    enum class pop_result { popped, empty, rejected };
+
+    // pops the front without waiting, only when pred accepts it
+    template <typename Pred>
+    pop_result try_pop_if(T* out, Pred pred) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (interrupted || queue.empty()) {
+            return pop_result::empty;
+        }
+        if (!pred(queue.front())) {
+            return pop_result::rejected;
+        }
+        *out = queue.front();
+        queue.pop();
+        return pop_result::popped;
+    }
+
     void interrupt() {
         std::unique_lock<std::mutex> lock(mutex);
         interrupted = true;
@@ -551,6 +570,7 @@ private:
     };
     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
     using rpc_msg_queue = message_queue<rpc_msg_ptr>;
+    void send_set_tensor_batch(const rpc_msg_ptr & first);
     struct rpc_event {
         rpc_msg_ptr              msg;
         std::shared_future<void> sf;
@@ -682,6 +702,83 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     thread = std::thread(rpc_dispatcher_trampoline, this);
 }
 
+// GGML_RPC_SET_BATCH=1 (or flag:<path>, re-checked at most every 100 ms): the writes queued behind a write go to the
+// server with it as one RPC_CMD_SET_TENSOR_MULTI instead of one message each, so a graph's inputs cost one message. A
+// server from a build without that command closes the connection on it: use the switch only with servers from this build.
+static bool rpc_set_batch() {
+    static const std::string mode = [] {
+        const char * e = std::getenv("GGML_RPC_SET_BATCH");
+        return std::string(e != nullptr ? e : "");
+    }();
+    if (mode.rfind("flag:", 0) == 0) {
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(fs::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return std::atoi(mode.c_str()) != 0;
+}
+
+static constexpr size_t RPC_SET_BATCH_MAX_WRITES = 256;
+static constexpr size_t RPC_SET_BATCH_MAX_BYTES  = 64u << 20;
+// how long a batch waits for the next write while the queue is empty (GGML_RPC_SET_BATCH_LINGER_US, default 100): a
+// graph's input writes come in a burst followed by the command that computes it, which ends the wait
+static std::chrono::microseconds rpc_set_batch_linger() {
+    static const std::chrono::microseconds v = [] {
+        const char * e = std::getenv("GGML_RPC_SET_BATCH_LINGER_US");
+        return std::chrono::microseconds(e != nullptr ? std::atoll(e) : 100);
+    }();
+    return v;
+}
+
+// sends first with the writes queued right behind it, and completes those; the caller completes first
+void rpc_dispatcher::send_set_tensor_batch(const rpc_msg_ptr & first) {
+    std::vector<rpc_msg_ptr> batch = { first };
+    size_t data_size = first->input_size;
+    rpc_msg_ptr next;
+    const auto linger_end = std::chrono::steady_clock::now() + rpc_set_batch_linger();
+    while (batch.size() < RPC_SET_BATCH_MAX_WRITES && data_size < RPC_SET_BATCH_MAX_BYTES) {
+        const auto r = queue.try_pop_if(&next, [](const rpc_msg_ptr & m) { return m->cmd == RPC_CMD_SET_TENSOR && m->output == nullptr; });
+        if (r == rpc_msg_queue::pop_result::popped) {
+            data_size += next->input_size;
+            batch.push_back(next);
+            continue;
+        }
+        if (r == rpc_msg_queue::pop_result::rejected || std::chrono::steady_clock::now() >= linger_end) {
+            break;
+        }
+        rpc_cpu_relax();
+    }
+    bool status;
+    if (batch.size() == 1) {
+        status = send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, first->input.get(), first->input_size);
+    } else {
+        // | n_writes (4 bytes) | n_writes x (| size (8 bytes) | SET_TENSOR request (size bytes) |) |
+        const uint32_t n_writes = (uint32_t) batch.size();
+        std::vector<uint8_t> input(sizeof(n_writes) + batch.size() * sizeof(uint64_t) + data_size);
+        uint8_t * p = input.data();
+        memcpy(p, &n_writes, sizeof(n_writes));
+        p += sizeof(n_writes);
+        for (const rpc_msg_ptr & m : batch) {
+            const uint64_t size = m->input_size;
+            memcpy(p, &size, sizeof(size));
+            p += sizeof(size);
+            memcpy(p, m->input.get(), size);
+            p += size;
+        }
+        LOG_DBG2("[%s] %u writes, %s\n", __func__, n_writes, rpc_log_format_size(data_size).c_str());
+        status = send_rpc_cmd(sock, RPC_CMD_SET_TENSOR_MULTI, input.data(), input.size());
+    }
+    RPC_STATUS_ASSERT(status);
+    for (size_t i = 1; i < batch.size(); i++) {
+        batch[i]->completion.set_value();
+    }
+}
+
 void rpc_dispatcher::work() {
     auto last_cmd = std::chrono::steady_clock::now();
     while (running) {
@@ -705,6 +802,8 @@ void rpc_dispatcher::work() {
             if (msg_ptr->output) {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
                 RPC_STATUS_ASSERT(status);
+            } else if (msg_ptr->cmd == RPC_CMD_SET_TENSOR && rpc_set_batch()) {
+                send_set_tensor_batch(msg_ptr);
             } else {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
                 RPC_STATUS_ASSERT(status);
@@ -1455,6 +1554,7 @@ public:
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool memset_tensor(const rpc_msg_memset_tensor_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
+    bool set_tensor_multi(const std::vector<uint8_t> & input);
     bool set_tensor_2d(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
@@ -1476,6 +1576,7 @@ public:
 
 private:
     void sync_all_backends();
+    bool set_tensor_impl(const uint8_t * input, size_t input_size); // one SET_TENSOR request, without the sync
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
@@ -1753,17 +1854,48 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 
 bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     sync_all_backends();
+    return set_tensor_impl(input.data(), input.size());
+}
+
+bool rpc_server::set_tensor_multi(const std::vector<uint8_t> & input) {
+    // serialization format: | n_writes (4 bytes) | n_writes x (| size (8 bytes) | SET_TENSOR request (size bytes) |) |
+    sync_all_backends();
+    uint32_t n_writes;
+    if (input.size() < sizeof(n_writes)) {
+        return false;
+    }
+    memcpy(&n_writes, input.data(), sizeof(n_writes));
+    size_t pos = sizeof(n_writes);
+    for (uint32_t i = 0; i < n_writes; i++) {
+        uint64_t size;
+        if (input.size() - pos < sizeof(size)) {
+            return false;
+        }
+        memcpy(&size, input.data() + pos, sizeof(size));
+        pos += sizeof(size);
+        if (input.size() - pos < size) {
+            return false;
+        }
+        if (!set_tensor_impl(input.data() + pos, size)) {
+            return false;
+        }
+        pos += size;
+    }
+    return pos == input.size();
+}
+
+bool rpc_server::set_tensor_impl(const uint8_t * input, size_t input_size) {
     // serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data (size bytes) |
     uint8_t  cache_flag;
     uint64_t offset;
     const size_t header_size = sizeof(rpc_tensor) + sizeof(cache_flag) + sizeof(offset);
-    if (input.size() < header_size) {
+    if (input_size < header_size) {
         return false;
     }
-    const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
-    memcpy(&cache_flag, input.data() + sizeof(rpc_tensor), sizeof(cache_flag));
-    memcpy(&offset,     input.data() + sizeof(rpc_tensor) + sizeof(cache_flag), sizeof(offset));
-    const size_t size = input.size() - header_size;
+    const rpc_tensor * in_tensor = (const rpc_tensor *)input;
+    memcpy(&cache_flag, input + sizeof(rpc_tensor), sizeof(cache_flag));
+    memcpy(&offset,     input + sizeof(rpc_tensor) + sizeof(cache_flag), sizeof(offset));
+    const size_t size = input_size - header_size;
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -1794,7 +1926,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         }
     }
 
-    const void * data = input.data() + header_size;
+    const void * data = input + header_size;
     if (cache_dir && cache_flag) {
         uint64_t hash = fnv_hash((const uint8_t*)data, size);
         char hash_str[17];
@@ -2747,6 +2879,16 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.set_tensor(input)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_MULTI: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!server.set_tensor_multi(input)) {
                     return;
                 }
                 break;

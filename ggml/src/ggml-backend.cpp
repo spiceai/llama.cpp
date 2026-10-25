@@ -20,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <filesystem>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -1820,7 +1823,43 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
-static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+// GGML_SCHED_SYNC_INPUTS_ONCE=1 (or flag:<path>, re-checked at most every 100 ms): wait for a split's backend once before
+// copying the split's inputs instead of before each input. The wait makes sure the backend no longer uses the input
+// copies of its previous graph, and only these copies reach it in between, so one wait covers the split. A backend whose
+// synchronize is a round trip, like the meta backend over RPC servers, then pays it once per split.
+static bool ggml_backend_sched_sync_inputs_once() {
+    static const std::string mode = [] {
+        const char * v = getenv("GGML_SCHED_SYNC_INPUTS_ONCE");
+        return std::string(v != nullptr ? v : "");
+    }();
+    if (mode.rfind("flag:", 0) == 0) {
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(std::filesystem::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return atoi(mode.c_str()) != 0;
+}
+
+// waits until the split backend no longer uses the input copies of its previous graph; split_backend_idle records a wait
+// that covers the rest of the split's inputs
+static void ggml_backend_sched_wait_split_backend(ggml_backend_sched_t sched, int split_backend_id, bool * split_backend_idle) {
+    if (*split_backend_idle) {
+        return;
+    }
+    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+    } else {
+        ggml_backend_synchronize(sched->backends[split_backend_id]);
+    }
+    *split_backend_idle = ggml_backend_sched_sync_inputs_once();
+}
+
+static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, bool * split_backend_idle) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
@@ -1828,11 +1867,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-        } else {
-            ggml_backend_synchronize(split_backend);
-        }
+        ggml_backend_sched_wait_split_backend(sched, split_backend_id, split_backend_idle);
         ggml_backend_tensor_copy(input, input_cpy);
         return;
     }
@@ -1841,7 +1876,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
     } else {
-        ggml_backend_synchronize(split_backend);
+        ggml_backend_sched_wait_split_backend(sched, split_backend_id, split_backend_idle);
     }
 
     if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
@@ -1853,11 +1888,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
         ggml_backend_synchronize(input_backend);
-        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-        } else {
-            ggml_backend_synchronize(split_backend);
-        }
+        ggml_backend_sched_wait_split_backend(sched, split_backend_id, split_backend_idle);
         ggml_backend_tensor_copy(input, input_cpy);
     }
 }
@@ -1885,14 +1916,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+        bool split_backend_idle = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], &split_backend_idle);
             }
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], &split_backend_idle);
             }
         }
 
