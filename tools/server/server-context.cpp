@@ -52,6 +52,59 @@ static void dtm(const char * mark) {
     }
 }
 
+// a server switch: "1" turns it on, "flag:<path>" turns it on while <path> exists (re-checked at most every 100 ms)
+struct server_switch {
+    const char *         name;
+    std::atomic<int64_t> next_check_us{0};
+    std::atomic<bool>    on{false};
+
+    bool get() {
+        static_assert(std::atomic<int64_t>::is_always_lock_free);
+        const char * v = getenv(name);
+        if (v == nullptr) {
+            return false;
+        }
+        if (strncmp(v, "flag:", 5) != 0) {
+            return atoi(v) != 0;
+        }
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(std::filesystem::exists(v + 5), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+};
+
+// LLAMA_SERVER_REUSE_SAMPLER (with -np 1): a slot keeps a stateless greedy sampler (temperature <= 0 and no grammar,
+// bias, penalties, mirostat or reasoning budget), attached, for its next task with the same parameters, so the backend
+// sampler chain a context's graphs were built with stays the same object and those graphs are reused across requests
+static bool server_reuse_sampler() {
+    static server_switch sw{"LLAMA_SERVER_REUSE_SAMPLER"};
+    return sw.get();
+}
+
+// the parameters of a sampler that can be kept across tasks, or "" when it cannot
+static std::string server_greedy_sampler_key(const common_params_sampling & p) {
+    const bool stateless = p.temp <= 0.0f && p.grammar.grammar.empty() && p.grammar_triggers.empty() &&
+        p.logit_bias.empty() && p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f &&
+        p.dry_multiplier == 0.0f && p.mirostat == 0 && p.reasoning_budget_tokens < 0 && !p.reasoning_control &&
+        p.n_probs == 0;
+    if (!stateless) {
+        return "";
+    }
+    std::string key = p.print();
+    key += string_format("|seed %u|min_keep %d|n_prev %d|backend %d|ignore_eos %d|eog %zu|samplers",
+            p.seed, p.min_keep, p.n_prev, (int) p.backend_sampling, (int) p.ignore_eos, p.logit_bias_eog.size());
+    for (const auto s : p.samplers) {
+        key += string_format(" %d", (int) s);
+    }
+    for (const auto & b : p.logit_bias_eog) {
+        key += string_format("|%d:%g", b.token, b.bias);
+    }
+    return key;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
         const auto mcaps = mtmd_get_cap_from_file(params.mmproj.path.c_str());
@@ -397,6 +450,8 @@ struct server_slot {
     json json_schema;
 
     common_sampler_ptr smpl;
+    std::string        smpl_greedy_key;        // see server_greedy_sampler_key
+    bool               smpl_attached = false;  // smpl is the context's backend sampler for this slot's sequence
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -453,7 +508,12 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        // a kept greedy sampler stays attached for the slot's next task (server_reuse_sampler); with several slots an
+        // idle slot's chain would be built into every graph, so this is for a single slot
+        if (!server_reuse_sampler() || smpl_greedy_key.empty()) {
+            llama_set_sampler(ctx_tgt, id, nullptr);
+            smpl_attached = false;
+        }
 
         // clear alora start
         alora_invocation_start = -1;
@@ -583,7 +643,10 @@ struct server_slot {
         //       also, need to leave space for 1 extra token to allow context shifts
         int n_draft_max = n_ctx - prompt.n_tokens() - 2;
 
-        if (n_remaining() > 0) {
+        // LLAMA_SERVER_FULL_DRAFTS=1: draft full blocks up to the end of a generation too, so the verify keeps one
+        // shape (and its graph) to the last step; the tokens past the limit are dropped before they are sent
+        static server_switch full_drafts{"LLAMA_SERVER_FULL_DRAFTS"};
+        if (n_remaining() > 0 && !full_drafts.get()) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
@@ -2019,13 +2082,29 @@ private:
 
         // initialize samplers
         if (task.need_sampling()) {
-            try {
-                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
-            } catch (std::exception & e) {
-                std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
-                send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
-                return false;
+            // a kept sampler is only for a single slot: an idle slot's attached chain would be built into every graph
+            const std::string greedy_key = server_reuse_sampler() && slots.size() == 1 ? server_greedy_sampler_key(task.params.sampling) : "";
+            const bool keep = !greedy_key.empty() && slot.smpl && greedy_key == slot.smpl_greedy_key;
+            if (keep) {
+                common_sampler_reset(slot.smpl.get());
+            } else {
+                // a sampler kept from the previous task may still be attached: detach it before it is freed, so the
+                // context never holds a freed chain (a new one could even be allocated at the same address)
+                if (slot.smpl_attached) {
+                    llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                    slot.smpl_attached = false;
+                }
+                slot.smpl_greedy_key.clear();
+                try {
+                    slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                } catch (std::exception & e) {
+                    slot.smpl_greedy_key.clear();
+                    std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
+                    send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
+                    return false;
+                }
             }
+            slot.smpl_greedy_key = greedy_key;
 
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
@@ -2039,9 +2118,14 @@ private:
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                // a kept chain that is still attached stays as it is: setting it again would make the context reserve
+                // and rebuild its graphs
+                if (!slot.smpl_attached) {
+                    slot.smpl_attached = llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                }
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                slot.smpl_attached = false;
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -2054,6 +2138,11 @@ private:
                 slot.spec_synth_rng.seed(seed);
             }
         } else {
+            if (slot.smpl_attached) {
+                llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                slot.smpl_attached = false;
+            }
+            slot.smpl_greedy_key.clear();
             slot.smpl.reset();
         }
 
