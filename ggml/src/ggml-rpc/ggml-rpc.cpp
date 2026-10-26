@@ -2955,6 +2955,13 @@ static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32
                 return lost(j);
             }
         }
+        // the exchange has succeeded only once every peer has this rank's partial: a deferred send that failed fails
+        // this all-reduce, not a later send that may never come
+        for (uint32_t j = 0; defer && j < world; j++) {
+            if (j != rank && !peers[j]->wait_sends()) {
+                return lost(j);
+            }
+        }
     } else {
         // pair by pair in rank order, the lower rank of each pair sending first: the unfinished pair with the lowest
         // ranks always has both of its ranks waiting on it, so the exchange cannot deadlock

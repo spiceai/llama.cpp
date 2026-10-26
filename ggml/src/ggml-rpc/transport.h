@@ -15,9 +15,12 @@ struct socket_t {
 
     bool send_data(const void * data, size_t size);
     // Like send_data, but over RDMA it returns once the message is posted: its completion is waited for when this
-    // connection next needs the send queue or buffer, or by its next send_data, which also reports a failure of it.
-    // The data may change as soon as it returns. Elsewhere it is send_data.
+    // connection next needs the send queue or buffer, or by its next send_data or wait_sends, which also report a
+    // failure of it. The data may change as soon as it returns. Elsewhere it is send_data.
     bool send_data_deferred(const void * data, size_t size);
+    // Waits until every send_data_deferred of this connection has completed; false when one of them failed. A no-op
+    // where send_data_deferred is send_data.
+    bool wait_sends();
     bool recv_data(void * data, size_t size);
     // Must be called at every message boundary: the RDMA transport coalesces
     // writes into fixed-size frames and posts the trailing partial frame only
