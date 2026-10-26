@@ -45,20 +45,12 @@ env:
 jobs:
   ctest:
     continue-on-error: true
-    # the UNDEFINED leg runs on a self-hosted runner this repository does not have, so on a pull request it would sit
-    # pending for good; ADDRESS and THREAD run on GitHub-hosted runners and are the legs a pull request needs
-    if: ${{ github.event_name != 'pull_request' || matrix.sanitizer != 'UNDEFINED' }}
 
     strategy:
-      matrix:
-        include:
-        # thread and address doesn't run properly on some self hosted machines, so run it on Github instead
-        - sanitizer: ADDRESS
-          machine: ubuntu-24.04
-        - sanitizer: THREAD
-          machine: ubuntu-24.04
-        - sanitizer: UNDEFINED
-          machine: [self-hosted, X64, Linux]
+      # thread and address doesn't run properly on some self hosted machines, so run it on Github instead; the UNDEFINED
+      # leg's self-hosted runner does not exist for this repository's pull requests, where it would sit pending for good,
+      # so a pull request runs the two GitHub-hosted legs only (the matrix context is not available in a job-level `if`)
+      matrix: ${{ fromJSON(github.event_name == 'pull_request' && '{"include":[{"sanitizer":"ADDRESS","machine":"ubuntu-24.04"},{"sanitizer":"THREAD","machine":"ubuntu-24.04"}]}' || '{"include":[{"sanitizer":"ADDRESS","machine":"ubuntu-24.04"},{"sanitizer":"THREAD","machine":"ubuntu-24.04"},{"sanitizer":"UNDEFINED","machine":["self-hosted","X64","Linux"]}]}') }}
 
     runs-on: ${{ matrix.machine }}
 
