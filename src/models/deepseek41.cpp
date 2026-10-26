@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -398,6 +399,25 @@ bool llm_graph_input_dsv41::can_reuse(const llm_graph_params & params) {
         const int64_t bs = model.hparams.dsv41_cand_block_size;
         res &= plan.n_kv > 0 && cand_pin->ne[0] == (plan.n_kv + bs - 1)/bs;
         res &= cand_pin->ne[1]*cand_pin->ne[3] == (int64_t) params.ubatch.n_tokens;
+    }
+    if (!res && getenv("LLAMA_DEBUG_REUSE")) {
+        for (auto * t : engram_ids) {
+            fprintf(stderr, "DBGREUSE dsv41 %s type %s old [%lld,%lld] expected [%lld,%lld]\n",
+                    t->name, ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1],
+                    (long long) (t->type == GGML_TYPE_F32 ? model.engram_head_dim*model.engram_n_cols() : model.engram_n_cols()*params.ubatch.n_tokens),
+                    (long long) (t->type == GGML_TYPE_F32 ? params.ubatch.n_tokens : 1));
+        }
+        fprintf(stderr, "DBGREUSE dsv41 engram_keep present %d expected %d ne2 %lld expected_tokens %u\n",
+                (int) (engram_keep != nullptr), (int) (!engram_ids.empty() && params.ubatch.embd != nullptr),
+                (long long) (engram_keep ? engram_keep->ne[2] : -1), params.ubatch.n_tokens);
+        if (cand_pin) {
+            const auto & plan = cand_plan(params.ubatch);
+            const int64_t bs = model.hparams.dsv41_cand_block_size;
+            fprintf(stderr, "DBGREUSE dsv41 cand_pin old [%lld,%lld,%lld,%lld] expected_blocks %lld expected_tokens %u n_kv %lld n_stream %lld block_size %lld\n",
+                    (long long) cand_pin->ne[0], (long long) cand_pin->ne[1], (long long) cand_pin->ne[2], (long long) cand_pin->ne[3],
+                    (long long) ((plan.n_kv + bs - 1)/bs), params.ubatch.n_tokens,
+                    (long long) plan.n_kv, (long long) plan.n_stream, (long long) bs);
+        }
     }
     return res;
 }
