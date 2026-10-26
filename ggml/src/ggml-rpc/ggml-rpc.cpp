@@ -2790,14 +2790,15 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     if (nbytes == 0) {
         return true;
     }
-    if (!state.peers.empty()) {
+    std::unique_lock<std::mutex> comm_lock(comm_mutex);
+    if (!state.peers.empty() && state.nccl == nullptr && !state.nccl_aborted) {
+        comm_lock.unlock();
         return comm_allreduce_mesh(state, backend, t_dst, request.zero != 0);
     }
-    if (request.zero != 0) {
+    if (request.zero != 0 && state.peers.empty()) {
         LOG_ERROR("[%s] device %u: only the mesh comm takes a zero partial\n", __func__, request.device);
         return false;
     }
-    std::unique_lock<std::mutex> comm_lock(comm_mutex);
     if (state.nccl_aborted) {
         LOG_ERROR("[%s] device %u: the NCCL communicator was aborted after the client left\n", __func__, request.device);
         return false;
@@ -2809,6 +2810,11 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
             LOG_ERROR("[%s] NCCL all-reduce needs a contiguous F32 tensor whose size matches its element count, got %s with %" PRId64 " elements in %zu bytes\n",
                       __func__, ggml_type_name(t_dst->type), ne, nbytes);
             return false;
+        }
+        if (request.zero != 0) {
+            // this rank's share of the work was empty (the meta backend disabled its node), so its partial is garbage
+            // and contributes zero to the sum; the memset waits for the stream, which a mesh rank rarely needs
+            ggml_backend_tensor_memset(t_dst, 0, 0, nbytes);
         }
         return state.nccl_allreduce(backend, state.nccl, t_dst);
     }
@@ -3356,9 +3362,85 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
         }
         peers[peer_rank] = peer;
     }
+    // RPC_COMM_FLAG_NCCL: one NCCL communicator over all the ranks, queued on each backend's stream, instead of the
+    // host-side mesh exchange. The mesh links carry the setup: rank 0's unique id reaches every rank, each rank reports
+    // whether it has the backend's NCCL procs and, after ncclCommInitRank (which waits for every rank to join), whether
+    // its init succeeded; rank 0 gathers the reports and tells every rank the verdict, so that unless every rank has a
+    // communicator none keeps one and all reduce through the host. Rank 0 sends before it receives and the others
+    // receive before they send, so the small messages never wait on each other.
+    void * nccl = nullptr;
     if ((request.flags & RPC_COMM_FLAG_NCCL) != 0) {
-        LOG_INFO("[%s] device %u: NCCL all-reduce takes two ranks, so %u ranks reduce through the host\n", __func__,
-                 request.device, world);
+        ggml_backend_t backend = backends[request.device];
+        auto unique_id = (rpc_nccl_unique_id_t)      rpc_backend_proc(backend, "ggml_backend_cuda_nccl_unique_id");
+        auto init_rank = (rpc_nccl_comm_init_rank_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_init_rank");
+        state.nccl_allreduce = (rpc_nccl_allreduce_t)  rpc_backend_proc(backend, "ggml_backend_cuda_nccl_allreduce");
+        state.nccl_free      = (rpc_nccl_comm_free_t)  rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_free");
+        state.nccl_abort     = (rpc_nccl_comm_abort_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_abort");
+        uint8_t ok = unique_id != nullptr && init_rank != nullptr && state.nccl_allreduce != nullptr && state.nccl_free != nullptr &&
+                     state.nccl_abort != nullptr;
+        uint8_t id[128] = {};
+        // gather ROUND: every rank sends a byte to rank 0, which answers every rank with one verdict byte; rank 0's
+        // own byte and, in the first round, the unique id go out first
+        auto gather = [&](uint8_t mine, uint8_t * payload, size_t payload_size, uint8_t & verdict) -> bool {
+            if (rank == 0) {
+                for (uint32_t j = 1; j < world; j++) {
+                    if (!peers[j]->send_data(&mine, 1) || (payload_size > 0 && !peers[j]->send_data(payload, payload_size)) ||
+                        !peers[j]->flush()) {
+                        return false;
+                    }
+                }
+                verdict = mine;
+                for (uint32_t j = 1; j < world; j++) {
+                    uint8_t theirs = 0;
+                    if (!peers[j]->recv_data(&theirs, 1)) {
+                        return false;
+                    }
+                    verdict = verdict && theirs;
+                }
+                for (uint32_t j = 1; j < world; j++) {
+                    if (!peers[j]->send_data(&verdict, 1) || !peers[j]->flush()) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            uint8_t zero_ok = 0;
+            if (!peers[0]->recv_data(&zero_ok, 1) || (payload_size > 0 && !peers[0]->recv_data(payload, payload_size)) ||
+                !peers[0]->send_data(&mine, 1) || !peers[0]->flush() || !peers[0]->recv_data(&verdict, 1)) {
+                return false;
+            }
+            return true;
+        };
+        if (rank == 0) {
+            ok = ok && unique_id(id, sizeof(id));
+        }
+        uint8_t all_ok = 0;
+        if (!gather(ok, id, sizeof(id), all_ok)) {
+            LOG_ERROR("[%s] device %u: the mesh links failed while the ranks set up NCCL\n", __func__, request.device);
+            return false;
+        }
+        if (all_ok) {
+            nccl = init_rank(backend, id, (int) world, (int) rank);
+            uint8_t inited = nccl != nullptr;
+            uint8_t all_inited = 0;
+            if (!gather(inited, nullptr, 0, all_inited)) {
+                if (nccl != nullptr) {
+                    state.nccl_abort(nccl);
+                }
+                LOG_ERROR("[%s] device %u: the mesh links failed while the ranks agreed on NCCL\n", __func__, request.device);
+                return false;
+            }
+            if (!all_inited && nccl != nullptr) {
+                state.nccl_abort(nccl);
+                nccl = nullptr;
+            }
+        }
+        LOG_INFO("[%s] device %u: %u-rank NCCL all-reduce %s\n", __func__, request.device, world,
+                 nccl != nullptr ? "on" : "unavailable, reducing through the host");
+    }
+    {
+        std::lock_guard<std::mutex> lock(comm_mutex);
+        state.nccl = nccl;
     }
     state.peers    = std::move(peers);
     state.rank     = rank;
