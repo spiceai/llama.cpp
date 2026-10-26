@@ -956,7 +956,8 @@ struct llama_decode_timing {
     int64_t sync_us   = 0; // time in synchronize() since the last decode entry or exit
     int64_t build_us = 0, inputs_us = 0, submit_us = 0; // phases of the current call
 };
-static llama_decode_timing g_decode_timing;
+// per thread: contexts decoding on different threads would otherwise race on these counters and mix their phases
+static thread_local llama_decode_timing g_decode_timing;
 
 void llama_context::synchronize() {
     if (!sched) {

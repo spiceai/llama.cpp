@@ -2815,7 +2815,11 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     comm_lock.unlock();
     // reduce large partials in bf16 to halve the wire bytes; small (decode-sized) ones
     // stay f32 since the extra casts and sync cost more than the bytes saved
-    const bool   wire_bf16  = !state.wire_f32 && t_dst->type == GGML_TYPE_F32 && ne >= 32768;
+    // a meta-backend gather (ggml_backend_meta_gather: a PAD by nothing whose op param 9 holds "GTHR") must come
+    // out the same on every rank, as the logits each rank samples from do; rounded to bf16 on the wire, each rank
+    // would hold its own slice exact and the others rounded, so it is reduced exactly whatever its size
+    const bool   gather     = t_dst->op == GGML_OP_PAD && ggml_get_op_params_i32(t_dst, 9) == 0x52485447;
+    const bool   wire_bf16  = !state.wire_f32 && !gather && t_dst->type == GGML_TYPE_F32 && ne >= 32768;
     const size_t wire_bytes = wire_bf16 ? (size_t) ne*2 : nbytes;
     const size_t need       = wire_bf16 ? 2*nbytes : nbytes;
     if (state.scratch_size < need) {
