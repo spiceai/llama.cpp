@@ -45,6 +45,9 @@ env:
 jobs:
   ctest:
     continue-on-error: true
+    # the UNDEFINED leg runs on a self-hosted runner this repository does not have, so on a pull request it would sit
+    # pending for good; ADDRESS and THREAD run on GitHub-hosted runners and are the legs a pull request needs
+    if: ${{ github.event_name != 'pull_request' || matrix.sanitizer != 'UNDEFINED' }}
 
     strategy:
       matrix:
