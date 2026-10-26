@@ -6211,7 +6211,27 @@ static void ggml_backend_cuda_nccl_comm_abort(void * comm) {
 static bool ggml_backend_cuda_nccl_allreduce(ggml_backend_t backend, void * comm, ggml_tensor * t) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
-    return ncclAllReduce(t->data, t->data, ggml_nelements(t), ncclFloat, ncclSum, (ncclComm_t) comm, cuda_ctx->stream()) == ncclSuccess;
+    const int64_t ne = ggml_nelements(t);
+    // GGML_NCCL_WIRE_BF16=1: a large F32 reduction travels as BF16 (converted on the device, summed by NCCL in BF16,
+    // converted back), the rule the direct multi-GPU communicator applies from 32768 elements; a prompt chunk's partial
+    // sums (512 x n_embd) are far above that and bandwidth-bound on the fabric. Off unless set, so it can be measured.
+    static const int64_t bf16_min = [] {
+        const char * v = getenv("GGML_NCCL_WIRE_BF16");
+        return (v != nullptr && atoi(v) != 0) ? (int64_t) 32768 : INT64_MAX;
+    }();
+    if (t->type == GGML_TYPE_F32 && ne >= bf16_min) {
+        to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+        to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+        ggml_cuda_pool_alloc<nv_bfloat16> tmp;
+        tmp.pool = &cuda_ctx->pool();
+        tmp.alloc(ne);
+        to_bf16(t->data, tmp.get(), ne, cuda_ctx->stream());
+        const bool ok = ncclAllReduce(tmp.get(), tmp.get(), ne, ncclBfloat16, ncclSum, (ncclComm_t) comm, cuda_ctx->stream()) == ncclSuccess;
+        to_fp32(tmp.get(), (float *) t->data, ne, cuda_ctx->stream());
+        CUDA_CHECK(cudaGetLastError());
+        return ok;
+    }
+    return ncclAllReduce(t->data, t->data, ne, ncclFloat, ncclSum, (ncclComm_t) comm, cuda_ctx->stream()) == ncclSuccess;
 }
 #endif // GGML_USE_NCCL
 
