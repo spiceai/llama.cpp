@@ -488,6 +488,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
+        st.n_pool_pad  = kpool_pad(st.n_pool_real);
         st.n_new   = st.n_pool_real;
         st.n_new_g = std::max(st.n_new, 1u);
         kpool_st = std::make_unique<kpool_state>(std::move(st));
@@ -613,6 +614,7 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 
     kpool_state st;
     st.n_pool_real = lay.n_pool_real;
+    st.n_pool_pad  = kpool_pad(st.n_pool_real);
 
     return st;
 }
@@ -717,10 +719,10 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
 
     // while a prompt is read, size the pool list for the whole LLAMA_KV_PROMPT_PAD bucket, as the visible KV range is,
     // so the chunks of one prompt share a graph shape (the padded pools point at the sentinel row, like the one pool
-    // kpool_pad always adds); decode steps keep the tight padding
+    // kpool_pad always adds); decode steps, batched ones included, keep the tight padding
     st.n_pool_pad = kpool_pad(st.n_pool_real);
     const uint32_t prompt_pad = llama_kv_prompt_pad();
-    if (prompt_pad > 0 && ubatch.n_tokens > 1) {
+    if (prompt_pad > 0 && llama_kv_prompt_tokens(ubatch) > 1) {
         st.n_pool_pad = std::max(st.n_pool_pad, std::min(kpool_pad(prompt_pad / kpool), kpool_pad(n_pool_max)));
     }
 }
@@ -763,6 +765,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     const bool by_order = mem->get_kpool_by_order();
 
     GGML_ASSERT(n_pool == st.n_pool_pad);
+    GGML_ASSERT(st.n_pool_pad >= kpool_pad(st.n_pool_real) && "pool list sized below what the cache holds");
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
