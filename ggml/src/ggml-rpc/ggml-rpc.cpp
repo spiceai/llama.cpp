@@ -2980,6 +2980,27 @@ static std::string rpc_comm_best_link(const std::vector<rpc_comm_link> & ours, c
 // Sends this rank's partial (`nbytes` at `own`) to every peer and receives theirs into `parts`, then sums all of them
 // in rank order into `sum`, so every rank holds the same bits. Each partial goes behind its rpc_comm_part_hdr, as a
 // separate message: the RDMA transport delivers messages whole, so a read must take exactly what one send wrote.
+// GGML_RPC_COMM_SEND_DEFER=1 (or flag:<path>, re-checked at most every 100 ms): an eager all-reduce posts its partial to
+// every peer without waiting for each send to complete; over RDMA a send's completion only frees the connection's send
+// buffer, so it is waited for when that buffer or the send queue is needed again, not before the peers' partials are read
+static bool rpc_comm_send_defer() {
+    static const std::string mode = [] {
+        const char * e = std::getenv("GGML_RPC_COMM_SEND_DEFER");
+        return std::string(e != nullptr ? e : "");
+    }();
+    if (mode.rfind("flag:", 0) == 0) {
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(fs::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return mode == "1";
+}
+
 static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32_t rank, uint32_t world, uint64_t seq,
                                    size_t nbytes, const uint8_t * own, std::vector<std::vector<uint8_t>> & parts, float * sum) {
     const rpc_comm_part_hdr hdr = { seq, (uint64_t) nbytes };
@@ -3005,13 +3026,17 @@ static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32
     auto send_part = [&](uint32_t j) {
         return peers[j]->send_data(&hdr, sizeof(hdr)) && peers[j]->send_data(own, nbytes) && peers[j]->flush();
     };
+    auto send_part_deferred = [&](uint32_t j) {
+        return peers[j]->send_data_deferred(&hdr, sizeof(hdr)) && peers[j]->send_data_deferred(own, nbytes) && peers[j]->flush();
+    };
     auto lost = [&](uint32_t j) {
         LOG_ERROR("[%s] rank %u lost rank %u during all-reduce %" PRIu64 "\n", __func__, rank, j, hdr.seq);
         return false;
     };
     if (nbytes <= RPC_COMM_MESH_EAGER_BYTES) {
+        const bool defer = rpc_comm_send_defer();
         for (uint32_t j = 0; j < world; j++) {
-            if (j != rank && !send_part(j)) {
+            if (j != rank && !(defer ? send_part_deferred(j) : send_part(j))) {
                 return lost(j);
             }
         }
