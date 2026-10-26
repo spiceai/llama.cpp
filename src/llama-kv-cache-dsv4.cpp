@@ -644,7 +644,24 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                 append_dummy_block(ubatch.seq_id[i][0], i);
             }
         } else {
-            const uint32_t n_blocks = (std::max<uint32_t>(1, ubatch.n_seq_tokens) + ratio - 1)/ratio;
+            static const bool verify_reuse = [] {
+                const char * v = getenv("LLAMA_DSV4_VERIFY_REUSE");
+                return v != nullptr && atoi(v) != 0;
+            }();
+            uint32_t n_pad_tokens = std::max<uint32_t>(1, ubatch.n_seq_tokens);
+            if (verify_reuse && ubatch.n_seqs_unq == 1 && ubatch.n_tokens > n_pad_tokens && plan.n_kv < (int64_t) kv_size) {
+                // A split ubatch can hold several one-token sequences with the same ID.
+                bool consecutive = ubatch.pos[0] >= 0;
+                for (uint32_t i = 0; consecutive && i < ubatch.n_tokens; ++i) {
+                    consecutive = ubatch.n_seq_id[i] == 1 && ubatch.seq_id[i][0] == ubatch.seq_id_unq[0] &&
+                                  (int64_t) ubatch.pos[i] == (int64_t) ubatch.pos[0] + i;
+                }
+                if (consecutive) {
+                    // The last cache slot is still masked, so it can hold a dummy block.
+                    n_pad_tokens = ubatch.n_tokens;
+                }
+            }
+            const uint32_t n_blocks = n_pad_tokens/ratio + (n_pad_tokens%ratio != 0);
 
             for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
                 const llama_seq_id seq_id = ubatch.seq_id_unq[s];
