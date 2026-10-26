@@ -17,8 +17,14 @@ on:
 
   pull_request:
     types: [opened, synchronize, reopened]
+    # the meta backend shares one process between contexts that compute on different threads, and only a race
+    # detector sees what that costs (spiceai/llama.cpp#9 reproduced a buffer-free race under ThreadSanitizer that
+    # every other job passed), so a change to it or to its tests runs the sanitizers here
     paths: [
-      '.github/workflows/build-sanitize.yml'
+      '.github/workflows/build-sanitize.yml',
+      'ggml/src/ggml-backend-meta.cpp',
+      'ggml/src/ggml-backend-impl.h',
+      'tests/test-meta-*.cpp'
     ]
 
 cache-mode: none
