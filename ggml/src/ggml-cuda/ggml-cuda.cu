@@ -6182,6 +6182,32 @@ static bool ggml_backend_cuda_nccl_unique_id(void * out, size_t size) {
     return true;
 }
 
+// a communicator handed out by ggml_backend_cuda_nccl_comm_init_rank: the NCCL communicator and the wire its ranks agreed on
+struct ggml_cuda_nccl_comm {
+    ncclComm_t comm;
+    bool       wire_bf16; // large F32 reductions travel as BF16, see ggml_backend_cuda_nccl_wire_bf16_wanted
+};
+
+// GGML_NCCL_WIRE_BF16=1 asks for a large F32 reduction to travel as BF16 (converted on the device, summed by NCCL in
+// BF16, converted back), the rule the direct multi-GPU communicator applies from 32768 elements; a prompt chunk's
+// partial sums (512 x n_embd) are far above that and bandwidth-bound on the fabric. Off unless set, so it can be
+// measured. NCCL sums one datatype per collective, so the setting is only a wish: the ranks exchange it when they
+// initialize the communicator and set the wire they agreed on with ggml_backend_cuda_nccl_comm_set_wire_bf16, and
+// an all-reduce reads the communicator's wire, never this process's environment.
+static bool ggml_backend_cuda_nccl_wire_bf16_wanted(void) {
+    static const bool wanted = [] {
+        const char * v = getenv("GGML_NCCL_WIRE_BF16");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return wanted;
+}
+
+static void ggml_backend_cuda_nccl_comm_set_wire_bf16(void * comm, bool on) {
+    if (comm != nullptr) {
+        ((ggml_cuda_nccl_comm *) comm)->wire_bf16 = on;
+    }
+}
+
 static void * ggml_backend_cuda_nccl_comm_init_rank(ggml_backend_t backend, const void * id, int nranks, int rank) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
@@ -6191,19 +6217,23 @@ static void * ggml_backend_cuda_nccl_comm_init_rank(ggml_backend_t backend, cons
     if (ncclCommInitRank(&comm, nranks, uid, rank) != ncclSuccess) {
         return nullptr;
     }
-    return comm;
+    return new ggml_cuda_nccl_comm{ comm, /*wire_bf16 =*/ false };
 }
 
 static void ggml_backend_cuda_nccl_comm_free(void * comm) {
     if (comm != nullptr) {
-        ncclCommDestroy((ncclComm_t) comm);
+        ggml_cuda_nccl_comm * c = (ggml_cuda_nccl_comm *) comm;
+        ncclCommDestroy(c->comm);
+        delete c;
     }
 }
 
 // for a peer that may no longer take part: ends any collective still waiting on it instead of waiting for it
 static void ggml_backend_cuda_nccl_comm_abort(void * comm) {
     if (comm != nullptr) {
-        ncclCommAbort((ncclComm_t) comm);
+        ggml_cuda_nccl_comm * c = (ggml_cuda_nccl_comm *) comm;
+        ncclCommAbort(c->comm);
+        delete c;
     }
 }
 
@@ -6211,27 +6241,21 @@ static void ggml_backend_cuda_nccl_comm_abort(void * comm) {
 static bool ggml_backend_cuda_nccl_allreduce(ggml_backend_t backend, void * comm, ggml_tensor * t) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
+    const ggml_cuda_nccl_comm * c = (const ggml_cuda_nccl_comm *) comm;
     const int64_t ne = ggml_nelements(t);
-    // GGML_NCCL_WIRE_BF16=1: a large F32 reduction travels as BF16 (converted on the device, summed by NCCL in BF16,
-    // converted back), the rule the direct multi-GPU communicator applies from 32768 elements; a prompt chunk's partial
-    // sums (512 x n_embd) are far above that and bandwidth-bound on the fabric. Off unless set, so it can be measured.
-    static const int64_t bf16_min = [] {
-        const char * v = getenv("GGML_NCCL_WIRE_BF16");
-        return (v != nullptr && atoi(v) != 0) ? (int64_t) 32768 : INT64_MAX;
-    }();
-    if (t->type == GGML_TYPE_F32 && ne >= bf16_min) {
+    if (c->wire_bf16 && t->type == GGML_TYPE_F32 && ne >= 32768) {
         to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
         to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
         ggml_cuda_pool_alloc<nv_bfloat16> tmp;
         tmp.pool = &cuda_ctx->pool();
         tmp.alloc(ne);
         to_bf16(t->data, tmp.get(), ne, cuda_ctx->stream());
-        const bool ok = ncclAllReduce(tmp.get(), tmp.get(), ne, ncclBfloat16, ncclSum, (ncclComm_t) comm, cuda_ctx->stream()) == ncclSuccess;
+        const bool ok = ncclAllReduce(tmp.get(), tmp.get(), ne, ncclBfloat16, ncclSum, c->comm, cuda_ctx->stream()) == ncclSuccess;
         to_fp32(tmp.get(), (float *) t->data, ne, cuda_ctx->stream());
         CUDA_CHECK(cudaGetLastError());
         return ok;
     }
-    return ncclAllReduce(t->data, t->data, ne, ncclFloat, ncclSum, (ncclComm_t) comm, cuda_ctx->stream()) == ncclSuccess;
+    return ncclAllReduce(t->data, t->data, ne, ncclFloat, ncclSum, c->comm, cuda_ctx->stream()) == ncclSuccess;
 }
 #endif // GGML_USE_NCCL
 
@@ -6252,6 +6276,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_nccl_allreduce") == 0) {
         return (void *)ggml_backend_cuda_nccl_allreduce;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_wire_bf16_wanted") == 0) {
+        return (void *)ggml_backend_cuda_nccl_wire_bf16_wanted;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_comm_set_wire_bf16") == 0) {
+        return (void *)ggml_backend_cuda_nccl_comm_set_wire_bf16;
     }
 #endif // GGML_USE_NCCL
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
