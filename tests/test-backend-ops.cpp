@@ -11292,6 +11292,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         // experts that receive no rows at all
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 1, false, 512, 1, 256));
+        // one token at a small K takes the mat-vec path with several rows per block; m = 66 leaves a two-row tail,
+        // whose guard must count the rows of dst and not its column stride (m * n_used on this path)
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 6, false, 66, 1, 768));
+    }
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ2_XXS}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 6, false, 66, 1, 768));
     }
 
     for (ggml_type type_a : other_types) {
