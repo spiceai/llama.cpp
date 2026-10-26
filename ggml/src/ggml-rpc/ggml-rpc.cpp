@@ -862,6 +862,13 @@ void rpc_dispatcher::send_set_tensor_batch(const rpc_msg_ptr & first) {
 
 void rpc_dispatcher::work() {
     auto last_cmd = std::chrono::steady_clock::now();
+    // a strided read's reply lands packed (send_async_unpacked) and is copied out to its destination row by row before
+    // the message completes, whether its reply is read right away or after a pipelined run
+    auto unpack = [](const rpc_msg & m) {
+        for (size_t i = 0; m.packed && i < m.unpack_n; i++) {
+            memcpy((char *) m.unpack_dst + i*m.unpack_stride, m.packed->data() + i*m.unpack_size, m.unpack_size);
+        }
+    };
     // commands sent with GGML_RPC_READ_PIPELINE whose replies are not read yet, and the bytes those replies hold
     std::vector<rpc_msg_ptr> pending;
     size_t pending_bytes = 0;
@@ -871,6 +878,7 @@ void rpc_dispatcher::work() {
             const bool status = sock->recv_data(&out_size, sizeof(out_size)) && out_size == m->output_size &&
                                 sock->recv_data(m->output, m->output_size);
             RPC_STATUS_ASSERT(status);
+            unpack(*m);
             m->completion.set_value();
         }
         pending.clear();
@@ -920,12 +928,7 @@ void rpc_dispatcher::work() {
             if (msg_ptr->output) {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
                 RPC_STATUS_ASSERT(status);
-                if (msg_ptr->packed) {
-                    for (size_t i = 0; i < msg_ptr->unpack_n; i++) {
-                        memcpy((char *) msg_ptr->unpack_dst + i*msg_ptr->unpack_stride, msg_ptr->packed->data() + i*msg_ptr->unpack_size,
-                               msg_ptr->unpack_size);
-                    }
-                }
+                unpack(*msg_ptr);
             } else if (msg_ptr->cmd == RPC_CMD_SET_TENSOR && rpc_set_batch()) {
                 send_set_tensor_batch(msg_ptr);
             } else {
