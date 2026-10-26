@@ -732,6 +732,28 @@ static const std::string & llama_graph_slots_mode() {
     return mode;
 }
 
+// LLAMA_GRAPH_SLOT_VERIFY: "1" (or "flag:<path>", re-checked at most every 100 ms) keys the graph slots by whether every
+// token of the ubatch is an output (a verify or a one-token decode) instead of whether any is. A prompt's ubatch, whose only
+// output is its last token, then takes the other slot, so a speculative verify graph survives the next request's prompt
+// instead of being rebuilt after it; for a model split over RPC a rebuild re-serializes every rank's graph.
+static bool llama_graph_slot_verify_on() {
+    static const std::string mode = [] {
+        const char * v = getenv("LLAMA_GRAPH_SLOT_VERIFY");
+        return std::string(v != nullptr ? v : "");
+    }();
+    if (mode.rfind("flag:", 0) == 0) {
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(std::filesystem::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return atoi(mode.c_str()) != 0;
+}
+
 static bool llama_graph_slots_on() {
     const std::string & mode = llama_graph_slots_mode();
     if (mode.rfind("flag:", 0) == 0) {
@@ -1581,8 +1603,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     // with LLAMA_GRAPH_SLOTS=2 each graph slot has its own scheduler: switch to this ubatch's
+    int key = n_outputs > 0;
     if (sched_alt) {
-        const int slot = llama_graph_slots_on() && n_outputs > 0;
+        const bool slots_on = llama_graph_slots_on();
+        if (slots_on && llama_graph_slot_verify_on()) {
+            key = n_outputs > 0 && (uint32_t) n_outputs == ubatch.n_tokens;
+        }
+        const int slot = slots_on && key;
         if (slot != sched_slot) {
             std::swap(sched, sched_alt);
             std::swap(gf_res_prev_active, gf_res_prev_active_alt);
@@ -1590,7 +1617,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
-    auto * res = get_gf_res_prev();
+    auto * res = get_gf_res_prev(key);
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -2639,7 +2666,11 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 llm_graph_result * llama_context::get_gf_res_prev() {
-    auto & res = gf_res_prev[n_outputs > 0];
+    return get_gf_res_prev(n_outputs > 0);
+}
+
+llm_graph_result * llama_context::get_gf_res_prev(int key) {
+    auto & res = gf_res_prev[key != 0];
     if (!res) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
     }

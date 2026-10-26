@@ -264,6 +264,8 @@ public:
 
 private:
     llm_graph_result * get_gf_res_prev();
+    // the graph result of a graph slot's key (see LLAMA_GRAPH_SLOT_VERIFY)
+    llm_graph_result * get_gf_res_prev(int key);
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
