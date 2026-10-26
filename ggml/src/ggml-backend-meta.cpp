@@ -17,6 +17,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <mutex>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -490,8 +491,13 @@ struct ggml_backend_meta_buffer_context {
     }
 };
 
+// a meta backend keeps one graph split per compute buffer (graph slots, below); a buffer that is freed, as when
+// a scheduler is recreated, takes its split with it
+static void ggml_backend_meta_forget_buffer(ggml_backend_buffer_t buffer);
+
 static void ggml_backend_meta_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
+    ggml_backend_meta_forget_buffer(buffer);
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     delete buf_ctx;
 }
@@ -1974,6 +1980,16 @@ struct ggml_backend_meta_context {
         std::swap(cloned,        s.cloned);
     }
 
+    // drops what is kept for a compute buffer that is being freed: its parked split, or the active split's claim
+    // on it, so a recreated scheduler's buffers never find a stale split under a reused address and the parked
+    // splits never outlive their buffers
+    void forget_buffer(ggml_backend_buffer_t buf) {
+        parked.erase(buf);
+        if (active_buf == buf) {
+            active_buf = nullptr;
+        }
+    }
+
     // makes the split kept for compute buffer buf the active one, parking the active split under its own buffer
     void select_slot(ggml_backend_buffer_t buf) {
         if (buf == active_buf) {
@@ -1990,7 +2006,15 @@ struct ggml_backend_meta_context {
         active_buf = buf;
     }
 
+    // every live meta backend, so a buffer being freed can drop the split kept for it (ggml_backend_meta_forget_buffer)
+    static std::mutex & live_mutex() { static std::mutex m; return m; }
+    static std::unordered_set<ggml_backend_meta_context *> & live() { static std::unordered_set<ggml_backend_meta_context *> s; return s; }
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
+        {
+            std::lock_guard<std::mutex> lock(live_mutex());
+            live().insert(this);
+        }
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
         name = "Meta(";
@@ -2024,6 +2048,10 @@ struct ggml_backend_meta_context {
     }
 
     ~ggml_backend_meta_context() {
+        {
+            std::lock_guard<std::mutex> lock(live_mutex());
+            live().erase(this);
+        }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2040,6 +2068,13 @@ static const char * ggml_backend_meta_get_name(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_meta(backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) backend->context;
     return backend_ctx->name.c_str();
+}
+
+static void ggml_backend_meta_forget_buffer(ggml_backend_buffer_t buffer) {
+    std::lock_guard<std::mutex> lock(ggml_backend_meta_context::live_mutex());
+    for (ggml_backend_meta_context * backend_ctx : ggml_backend_meta_context::live()) {
+        backend_ctx->forget_buffer(buffer);
+    }
 }
 
 static void ggml_backend_meta_free(ggml_backend_t backend) {
