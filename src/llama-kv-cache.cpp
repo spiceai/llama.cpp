@@ -6,6 +6,7 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1114,6 +1115,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
     assert(res.s1 >= res.s0);
 
+    res.n_seq_tokens_max = llama_kv_prompt_tokens(ubatch);
+
     return res;
 }
 
@@ -1299,6 +1302,19 @@ uint32_t llama_kv_prompt_pad() {
     return prompt_pad;
 }
 
+uint32_t llama_kv_prompt_tokens(const llama_ubatch & ubatch) {
+    std::array<uint32_t, LLAMA_MAX_SEQ> n_seq_tokens{};
+
+    uint32_t res = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+            res = std::max(res, ++n_seq_tokens[ubatch.seq_id[i][s]]);
+        }
+    }
+
+    return res;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -1306,13 +1322,13 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
     uint32_t n_pad_cur = std::max(n_pad, 256u);
 
-    // while a ubatch reads a prompt (more than one token), pad the visible range to the LLAMA_KV_PROMPT_PAD bucket
-    // instead, so the chunks of one prompt share a graph shape and the split graph is reused across them (a
-    // tensor-parallel head otherwise rebuilds and re-sends the graph for every 512-token chunk, since each chunk moves
-    // n_kv past a 256-cell boundary). Decode steps keep the 256 padding. Off unless set.
-    const uint32_t prompt_pad  = llama_kv_prompt_pad();
-    const uint32_t n_tokens_ub = sinfo.idxs.empty() ? 0 : (uint32_t) sinfo.idxs[0].size();
-    if (prompt_pad > 0 && n_tokens_ub > 1) {
+    // while a ubatch reads a prompt (a sequence contributing more than one token), pad the visible range to the
+    // LLAMA_KV_PROMPT_PAD bucket instead, so the chunks of one prompt share a graph shape and the split graph is reused
+    // across them (a tensor-parallel head otherwise rebuilds and re-sends the graph for every 512-token chunk, since
+    // each chunk moves n_kv past a 256-cell boundary). Decode steps, batched ones included, keep the 256 padding.
+    // Off unless set.
+    const uint32_t prompt_pad = llama_kv_prompt_pad();
+    if (prompt_pad > 0 && sinfo.n_seq_tokens_max > 1) {
         n_pad_cur = std::max(n_pad_cur, prompt_pad);
     }
 

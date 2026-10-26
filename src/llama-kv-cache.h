@@ -14,6 +14,10 @@ struct llama_hparams;
 // LLAMA_KV_PROMPT_PAD=<power of two of at least 256>: the bucket the visible KV range and the indexer's key-pool count are
 // padded to while a ubatch reads a prompt, so the chunks of one prompt share a graph shape; 0 when unset (off)
 uint32_t llama_kv_prompt_pad();
+
+// Tokens the longest sequence of a ubatch contributes: above 1 a prompt is being read, while a batched decode step
+// (one token for each of several sequences, which a unified KV cache keeps in one stream) stays at 1.
+uint32_t llama_kv_prompt_tokens(const llama_ubatch & ubatch);
 struct llama_model;
 struct llama_context;
 
@@ -45,6 +49,9 @@ public:
 
         std::vector<llama_seq_id> strm; // [ns]
         std::vector<idx_vec_t>    idxs; // [ns]
+
+        // tokens of the ubatch's longest sequence (llama_kv_prompt_tokens), what tells a prompt from a decode step
+        uint32_t n_seq_tokens_max = 0;
 
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
