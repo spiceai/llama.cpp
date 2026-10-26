@@ -140,6 +140,7 @@ struct socket_t::impl {
     ~impl();
     bool send_data(const void * data, size_t size);
     bool send_data_deferred(const void * data, size_t size);
+    bool wait_sends();
     bool recv_data(void * data, size_t size);
     bool flush();
     void get_caps(uint8_t * local_caps);
@@ -615,6 +616,17 @@ bool socket_t::impl::send_data_deferred(const void * data, size_t size) {
     return send_data(data, size);
 }
 
+bool socket_t::impl::wait_sends() {
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
+    if (use_rdma) {
+        while (rdma->pend_count > 0) {
+            if (!rdma_reap_send()) return false;
+        }
+    }
+#endif
+    return true;
+}
+
 bool socket_t::impl::send_data(const void * data, size_t size) {
     LOG_DBG3("[%s] transport: %s, size: %s\n", __func__, use_rdma ? "RDMA" : "TCP", rpc_log_format_size(size).c_str());
 #ifdef GGML_RPC_RDMA_APPLE
@@ -753,6 +765,10 @@ bool socket_t::send_data(const void * data, size_t size) {
 
 bool socket_t::send_data_deferred(const void * data, size_t size) {
     return pimpl->send_data_deferred(data, size);
+}
+
+bool socket_t::wait_sends() {
+    return pimpl->wait_sends();
 }
 
 bool socket_t::recv_data(void * data, size_t size) {
