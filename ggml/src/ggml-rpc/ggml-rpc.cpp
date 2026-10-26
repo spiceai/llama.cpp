@@ -1667,6 +1667,7 @@ private:
         void                  (*nccl_free)(void *) = nullptr;   // COMM_FREE: both ranks free the communicator together
         void                  (*nccl_abort)(void *) = nullptr;  // disconnect without COMM_FREE: the peer may not take part
         bool                    nccl_aborted = false;          // the communicator was aborted: all-reduces fail from now on
+        bool                    nccl_wire_bf16 = false;        // both ranks asked for the BF16 wire (GGML_NCCL_WIRE_BF16)
     };
 
     // guards nccl and nccl_aborted in comm_states, which abort_comms changes from the client watchdog thread
@@ -2486,6 +2487,8 @@ typedef void * (*rpc_nccl_comm_init_rank_t)(ggml_backend_t backend, const void *
 typedef void   (*rpc_nccl_comm_free_t)(void * comm);
 typedef void   (*rpc_nccl_comm_abort_t)(void * comm);
 typedef bool   (*rpc_nccl_allreduce_t)(ggml_backend_t backend, void * comm, ggml_tensor * t);
+typedef bool   (*rpc_nccl_wire_bf16_wanted_t)(void);
+typedef void   (*rpc_nccl_comm_set_wire_bf16_t)(void * comm, bool on);
 
 static void * rpc_backend_proc(ggml_backend_t backend, const char * name) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -2603,14 +2606,44 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
                 state.peer = nullptr;
                 return true;
             }
+            // NCCL sums one datatype per collective, so the BF16 wire (GGML_NCCL_WIRE_BF16, read by the backend) must be
+            // the same on both ranks: each sends its setting, and the wire is BF16 only when both asked for it
+            if (inited && peer_inited) {
+                auto wanted   = (rpc_nccl_wire_bf16_wanted_t)   rpc_backend_proc(backend, "ggml_backend_cuda_nccl_wire_bf16_wanted");
+                auto set_wire = (rpc_nccl_comm_set_wire_bf16_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_set_wire_bf16");
+                uint8_t wire      = wanted != nullptr && set_wire != nullptr && wanted();
+                uint8_t peer_wire = 0;
+                const bool exchanged = request.rank == 0 ?
+                    state.peer->send_data(&wire, 1) && state.peer->flush() && state.peer->recv_data(&peer_wire, 1) :
+                    state.peer->recv_data(&peer_wire, 1) && state.peer->send_data(&wire, 1) && state.peer->flush();
+                if (!exchanged) {
+                    std::lock_guard<std::mutex> lock(comm_mutex);
+                    if (state.nccl != nullptr) {
+                        state.nccl_abort(state.nccl);
+                        state.nccl = nullptr;
+                    }
+                    state.peer = nullptr;
+                    return true;
+                }
+                if (wire != peer_wire) {
+                    LOG_WARN("[%s] device %u GGML_NCCL_WIRE_BF16 is set on %s rank of this pair, so the all-reduce wire stays F32 on both ranks; set it on every rank, or on none\n",
+                             __func__, request.device, wire ? "this rank but not the peer" : "the peer but not this");
+                }
+                std::lock_guard<std::mutex> lock(comm_mutex);
+                state.nccl_wire_bf16 = wire && peer_wire;
+                set_wire(state.nccl, state.nccl_wire_bf16);
+            }
         }
         bool nccl_on;
+        bool nccl_wire_bf16;
         {
             // the client watchdog may abort the communicator at any time from here on
             std::lock_guard<std::mutex> lock(comm_mutex);
-            nccl_on = state.nccl != nullptr;
+            nccl_on        = state.nccl != nullptr;
+            nccl_wire_bf16 = state.nccl_wire_bf16;
         }
-        LOG_INFO("[%s] device %u NCCL all-reduce %s\n", __func__, request.device, nccl_on ? "on" : "unavailable, copying through the host");
+        LOG_INFO("[%s] device %u NCCL all-reduce %s\n", __func__, request.device,
+                 !nccl_on ? "unavailable, copying through the host" : nccl_wire_bf16 ? "on, BF16 wire for large F32 reductions" : "on");
     }
     LOG_INFO("[%s] device %u joined pairwise comm as rank %u\n", __func__, request.device, request.rank);
     response.ok = 1;
