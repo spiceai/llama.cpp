@@ -17,14 +17,18 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <filesystem>
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <sstream>
 #include <thread>
 #include <string>
+#include <typeinfo>
 #include <unordered_set>
 
 // dedup helpers
@@ -68,6 +72,14 @@ static bool can_reuse_kq_mask(
 }
 
 // impl
+
+static void debug_reuse_tensor(const char * name, const ggml_tensor * t, int64_t ne0, int64_t ne1 = 1, int64_t ne2 = 1, int64_t ne3 = 1) {
+    fprintf(stderr, "DBGREUSE tensor %s present %d buffer %d old [%lld,%lld,%lld,%lld] expected [%lld,%lld,%lld,%lld]\n",
+            name, (int) (t != nullptr), (int) (t && t->buffer),
+            (long long) (t ? t->ne[0] : -1), (long long) (t ? t->ne[1] : -1),
+            (long long) (t ? t->ne[2] : -1), (long long) (t ? t->ne[3] : -1),
+            (long long) ne0, (long long) ne1, (long long) ne2, (long long) ne3);
+}
 
 bool llm_graph_host_rows_supported(const ggml_tensor * tab) {
     if (!tab || !tab->buffer || !tab->data || !ggml_backend_buffer_is_host(tab->buffer) || tab->view_src) {
@@ -190,6 +202,14 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     res &= (!mixed_embd)   || mixed_embd->ne[1]   == params.ubatch.n_tokens;
     res &= (!scale_rows) || scale_rows->ne[1] == params.ubatch.n_tokens;
 
+    if (!res && getenv("LLAMA_DEBUG_REUSE")) {
+        debug_reuse_tensor("tokens", tokens, params.ubatch.n_tokens);
+        debug_reuse_tensor("embd", embd, n_embd, params.ubatch.n_tokens);
+        debug_reuse_tensor("mixed_tokens", mixed_tokens, llm_graph_n_tok_rows(params.ubatch));
+        debug_reuse_tensor("mixed_embd", mixed_embd, n_embd, params.ubatch.n_tokens);
+        debug_reuse_tensor("scale_rows", scale_rows, 1, params.ubatch.n_tokens);
+    }
+
     return res;
 }
 
@@ -262,6 +282,10 @@ bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= pos->ne[0] == params.ubatch.n_tokens*n_pos_per_embd;
+
+    if (!res && getenv("LLAMA_DEBUG_REUSE")) {
+        debug_reuse_tensor("pos", pos, params.ubatch.n_tokens*n_pos_per_embd);
+    }
 
     return res;
 }
@@ -1064,6 +1088,32 @@ static bool dsv4_can_reuse_comp_input(
     return res;
 }
 
+static void dsv4_debug_reuse_comp_input(
+        const llm_graph_input_dsv4::comp_input & inp,
+        const llama_kv_cache_dsv4_context::comp_plan & plan,
+        const char * name,
+        uint32_t n_tokens,
+        int64_t n_stream) {
+    std::ostringstream ss;
+    const auto field = [&](const char * field_name, const ggml_tensor * t, size_t size) {
+        ss << " " << field_name << "=" << (t ? t->ne[0] : -1) << "/" << size;
+    };
+    field("state_pos", inp.state_pos, plan.state_pos.size());
+    field("persist_src", inp.state_persist_src_idxs, plan.state_persist_src_idxs.size());
+    field("persist_dst", inp.state_persist_dst_idxs, plan.state_persist_dst_idxs.size());
+    field("restore_src", inp.state_restore_src_idxs, plan.state_restore_src_idxs.size());
+    field("restore_dst", inp.state_restore_dst_idxs, plan.state_restore_dst_idxs.size());
+    field("snapshot_src", inp.state_snapshot_src_idxs, plan.state_snapshot_src_idxs.size());
+    field("snapshot_dst", inp.state_snapshot_dst_idxs, plan.state_snapshot_dst_idxs.size());
+    field("read", inp.state_read_idxs, plan.state_read_idxs.size());
+    field("write", inp.state_write_idxs, plan.state_write_idxs.size());
+    field("write_pos", inp.state_write_pos, plan.state_write_pos.size());
+    fprintf(stderr, "DBGREUSE dsv4 %s can_reuse %d old/expected (-1=null)%s plan_n_stream %lld mask_n_stream %lld n_kv %lld\n",
+            name, (int) dsv4_can_reuse_comp_input(inp, plan, n_tokens, n_stream), ss.str().c_str(),
+            (long long) plan.n_stream, (long long) n_stream, (long long) plan.n_kv);
+    debug_reuse_tensor(name, inp.kq_mask, plan.n_kv, n_tokens/n_stream, 1, n_stream);
+}
+
 static ggml_tensor * dsv4_build_input_1d(
         ggml_context * ctx,
         ggml_type type,
@@ -1176,6 +1226,14 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     res &= dsv4_can_reuse_comp_input(inp_csa, plan_csa, params.ubatch.n_tokens, n_stream);
     res &= dsv4_can_reuse_comp_input(inp_hca, plan_hca, params.ubatch.n_tokens, n_stream);
     res &= dsv4_can_reuse_comp_input(inp_lid, plan_lid, params.ubatch.n_tokens, n_stream);
+
+    if (!res && getenv("LLAMA_DEBUG_REUSE")) {
+        debug_reuse_tensor("dsv4_raw_k_idxs", inp_raw->self_k_idxs, raw_ctx->get_n_write());
+        debug_reuse_tensor("dsv4_raw_kq_mask", inp_raw->self_kq_mask, raw_ctx->get_n_kv(), params.ubatch.n_tokens/n_stream, 1, n_stream);
+        dsv4_debug_reuse_comp_input(inp_csa, plan_csa, "csa", params.ubatch.n_tokens, n_stream);
+        dsv4_debug_reuse_comp_input(inp_hca, plan_hca, "hca", params.ubatch.n_tokens, n_stream);
+        dsv4_debug_reuse_comp_input(inp_lid, plan_lid, "lid", params.ubatch.n_tokens, n_stream);
+    }
 
     return res;
 }
@@ -1454,6 +1512,8 @@ void llm_graph_result::reset() {
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
 
+    t_logits_gathered = false;
+
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
@@ -1481,9 +1541,45 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
+// LLAMA_ENGRAM_PREFETCH_FIRST=1 (or flag:<path>, re-checked at most every 100 ms): see llm_graph_input_i::prefetch
+bool llama_engram_prefetch_first() {
+    static const std::string mode = [] {
+        const char * v = getenv("LLAMA_ENGRAM_PREFETCH_FIRST");
+        return std::string(v != nullptr ? v : "");
+    }();
+    if (mode.rfind("flag:", 0) == 0) {
+        // shared by every context, so a relaxed atomic each: a stale read only delays a flip by one check
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(std::filesystem::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return atoi(mode.c_str()) != 0;
+}
+
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    if (!llama_engram_prefetch_first()) {
+        for (auto & input : inputs) {
+            input->set_input(ubatch);
+        }
+        return;
+    }
     for (auto & input : inputs) {
-        input->set_input(ubatch);
+        input->prefetch(ubatch);
+    }
+    for (auto & input : inputs) {
+        if (!input->set_late()) {
+            input->set_input(ubatch);
+        }
+    }
+    for (auto & input : inputs) {
+        if (input->set_late()) {
+            input->set_input(ubatch);
+        }
     }
 }
 
@@ -1533,6 +1629,17 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     if (!this->params.allow_reuse(params)) {
+        if (getenv("LLAMA_DEBUG_REUSE")) {
+            const auto & prev = this->params;
+            fprintf(stderr, "DBGREUSE params arch %s old/new tok %u/%u out %u/%u seq_tokens %u/%u seqs %u/%u seqs_unq %u/%u equal_seqs %d/%d owned %d/%d mixed %d/%d token %d/%d embd %d/%d embd_state %d/%d samplers_equal %d\n",
+                    llm_arch_name(params.arch), prev.ubatch.n_tokens, params.ubatch.n_tokens, prev.n_outputs, params.n_outputs,
+                    prev.ubatch.n_seq_tokens, params.ubatch.n_seq_tokens, prev.ubatch.n_seqs, params.ubatch.n_seqs,
+                    prev.ubatch.n_seqs_unq, params.ubatch.n_seqs_unq,
+                    (int) prev.ubatch.equal_seqs(), (int) params.ubatch.equal_seqs(), (int) !!prev.ubatch.data, (int) !!params.ubatch.data,
+                    (int) prev.ubatch.is_mixed(), (int) params.ubatch.is_mixed(), (int) !!prev.ubatch.token, (int) !!params.ubatch.token,
+                    (int) !!prev.ubatch.embd, (int) !!params.ubatch.embd, (int) !!prev.ubatch.embd_state, (int) !!params.ubatch.embd_state,
+                    (int) llm_graph_params::samplers_equal(prev.samplers, params.samplers));
+        }
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
@@ -1548,6 +1655,14 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
+
+        if (!cur && getenv("LLAMA_DEBUG_REUSE")) {
+            const auto * inp = input.get();
+            fprintf(stderr, "DBGREUSE input %s arch %s tok %u out %u seq_tokens %u seqs %u seqs_unq %u pos0 %d can_reuse 0\n",
+                    typeid(*inp).name(), llm_arch_name(params.arch), params.ubatch.n_tokens, params.n_outputs,
+                    params.ubatch.n_seq_tokens, params.ubatch.n_seqs, params.ubatch.n_seqs_unq,
+                    params.ubatch.pos && params.ubatch.n_tokens ? params.ubatch.pos[0] : -1);
+        }
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
@@ -4267,8 +4382,19 @@ void llm_graph_context::build_logits() const {
 
     // the models declare t_logits without expanding it, so the LM head is computed only when it is expanded here
     if (res->t_logits != nullptr) {
+        if (cparams.logits_gather && !res->t_logits_gathered) {
+            res->t_logits = build_logits_gather(res->t_logits);
+        }
         ggml_build_forward_expand(gf, res->t_logits);
     }
+}
+
+ggml_tensor * llm_graph_context::build_logits_gather(ggml_tensor * logits) const {
+    GGML_ASSERT(cparams.logits_gather);
+    ggml_tensor * cur = ggml_backend_meta_gather(ctx0, logits);
+    cb(cur, "result_output_gathered", -1);
+    res->t_logits_gathered = true;
+    return cur;
 }
 
 void llm_graph_context::build_sampling() const {

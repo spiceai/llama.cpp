@@ -43,6 +43,80 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+
+// DIAG (not for merge): with LLAMA_DECODE_TIMING=1, a "DTM <mark> <us>" line at each speculative-loop phase boundary
+static void dtm(const char * mark) {
+    static const bool on = [] { const char * v = getenv("LLAMA_DECODE_TIMING"); return v != nullptr && atoi(v) != 0; }();
+    if (on) {
+        fprintf(stderr, "DTM %s %lld\n", mark, (long long) ggml_time_us());
+    }
+}
+
+// a server switch: "1" turns it on, "flag:<path>" turns it on while <path> exists (re-checked at most every 100 ms)
+struct server_switch {
+    const char *         name;
+    std::atomic<int64_t> next_check_us{0};
+    std::atomic<bool>    on{false};
+
+    bool get() {
+        static_assert(std::atomic<int64_t>::is_always_lock_free);
+        const char * v = getenv(name);
+        if (v == nullptr) {
+            return false;
+        }
+        if (strncmp(v, "flag:", 5) != 0) {
+            return atoi(v) != 0;
+        }
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(std::filesystem::exists(v + 5), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+};
+
+// LLAMA_SERVER_REUSE_SAMPLER (with -np 1): a slot keeps a stateless greedy sampler (temperature <= 0 and no grammar,
+// bias, penalties, mirostat or reasoning budget), attached, for its next task with the same parameters, so the backend
+// sampler chain a context's graphs were built with stays the same object and those graphs are reused across requests
+static bool server_reuse_sampler() {
+    static server_switch sw{"LLAMA_SERVER_REUSE_SAMPLER"};
+    return sw.get();
+}
+
+// the parameters of a sampler that can be kept across tasks, or "" when it cannot: the chain common_sampler_init
+// builds for them ends in a greedy pick (a temperature of exactly 0 with no dynamic range, or top-k 1, last) and holds
+// no sampler that draws from a distribution (dist, adaptive-p, mirostat), removes the most likely token (XTC), or keeps
+// state across tokens (penalties, DRY, grammar, logit bias, a reasoning budget), so its output is a function of the
+// logits alone and a reset leaves nothing behind
+static std::string server_greedy_sampler_key(const common_params_sampling & p, bool backend_sampling) {
+    bool adaptive = false;
+    for (const auto s : p.samplers) {
+        adaptive |= s == COMMON_SAMPLER_TYPE_ADAPTIVE_P;
+    }
+    const bool greedy_end = !p.samplers.empty() &&
+        ((p.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && p.temp == 0.0f && p.dynatemp_range == 0.0f) ||
+         (p.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && p.top_k == 1));
+    const bool stateless = greedy_end && !adaptive && p.n_probs == 0 && p.grammar.grammar.empty() &&
+        p.grammar_triggers.empty() && p.logit_bias.empty() && p.logit_bias_eog.empty() && !p.ignore_eos &&
+        p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f && p.dry_multiplier == 0.0f &&
+        p.mirostat == 0 && p.xtc_probability == 0.0f && p.reasoning_budget_tokens < 0 && !p.reasoning_control;
+    if (!stateless) {
+        return "";
+    }
+    // every parameter that shapes the chain, exactly (%a is the float's hex form): not p.print(), which rounds its
+    // floats and leaves the dynamic-temperature settings out
+    std::string key = string_format(
+            "temp %a|dynatemp %a %a|top_k %d|top_p %a|min_p %a|typ_p %a|top_n_sigma %a|xtc %a %a|min_keep %d|n_prev %d|backend %d|samplers",
+            (double) p.temp, (double) p.dynatemp_range, (double) p.dynatemp_exponent, p.top_k, (double) p.top_p, (double) p.min_p,
+            (double) p.typ_p, (double) p.top_n_sigma, (double) p.xtc_probability, (double) p.xtc_threshold,
+            p.min_keep, p.n_prev, (int) backend_sampling);
+    for (const auto s : p.samplers) {
+        key += string_format(" %d", (int) s);
+    }
+    return key;
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
         const auto mcaps = mtmd_get_cap_from_file(params.mmproj.path.c_str());
@@ -388,6 +462,8 @@ struct server_slot {
     json json_schema;
 
     common_sampler_ptr smpl;
+    std::string        smpl_greedy_key;        // see server_greedy_sampler_key
+    bool               smpl_attached = false;  // smpl is the context's backend sampler for this slot's sequence
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -444,7 +520,15 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        // a kept greedy sampler stays attached for the slot's next task (server_reuse_sampler); with several slots an
+        // idle slot's chain would be built into every graph, so this is for a single slot
+        if (!server_reuse_sampler() || smpl_greedy_key.empty()) {
+            llama_set_sampler(ctx_tgt, id, nullptr);
+            smpl_attached = false;
+            // a detached chain is never attached again: the context initialized it for its backend once, and
+            // llama_sampler_chain_backend_init asserts on a second time, so the next task builds a new chain
+            smpl_greedy_key.clear();
+        }
 
         // clear alora start
         alora_invocation_start = -1;
@@ -574,7 +658,10 @@ struct server_slot {
         //       also, need to leave space for 1 extra token to allow context shifts
         int n_draft_max = n_ctx - prompt.n_tokens() - 2;
 
-        if (n_remaining() > 0) {
+        // LLAMA_SERVER_FULL_DRAFTS=1: draft full blocks up to the end of a generation too, so the verify keeps one
+        // shape (and its graph) to the last step; the tokens past the limit are dropped before they are sent
+        static server_switch full_drafts{"LLAMA_SERVER_FULL_DRAFTS"};
+        if (n_remaining() > 0 && !full_drafts.get()) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
         }
 
@@ -2010,14 +2097,6 @@ private:
 
         // initialize samplers
         if (task.need_sampling()) {
-            try {
-                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
-            } catch (std::exception & e) {
-                std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
-                send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
-                return false;
-            }
-
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
             bool use_backend_sampling = task.params.sampling.backend_sampling;
@@ -2028,11 +2107,44 @@ private:
             // TODO: check verify if this actually works with TTS
             use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
 
+            // a kept sampler is only for a single slot (an idle slot's attached chain would be built into every graph),
+            // never for TTS, and only for a request sampled the way the kept chain is attached: a chain initialized for
+            // the backend cannot sample on the CPU (its offloaded samplers would be skipped) nor be attached again
+            const std::string greedy_key = server_reuse_sampler() && slots.size() == 1 && task.type != SERVER_TASK_TYPE_TTS
+                ? server_greedy_sampler_key(task.params.sampling, use_backend_sampling) : "";
+            const bool keep = !greedy_key.empty() && slot.smpl && greedy_key == slot.smpl_greedy_key &&
+                slot.smpl_attached == use_backend_sampling;
+            if (keep) {
+                common_sampler_reset(slot.smpl.get());
+            } else {
+                // a sampler kept from the previous task may still be attached: detach it before it is freed, so the
+                // context never holds a freed chain (a new one could even be allocated at the same address)
+                if (slot.smpl_attached) {
+                    llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                    slot.smpl_attached = false;
+                }
+                slot.smpl_greedy_key.clear();
+                try {
+                    slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                } catch (std::exception & e) {
+                    slot.smpl_greedy_key.clear();
+                    std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
+                    send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
+                    return false;
+                }
+            }
+            slot.smpl_greedy_key = greedy_key;
+
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                // a kept chain that is still attached stays as it is: setting it again would make the context reserve
+                // and rebuild its graphs
+                if (!slot.smpl_attached) {
+                    slot.smpl_attached = llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                }
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                slot.smpl_attached = false;
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -2045,6 +2157,11 @@ private:
                 slot.spec_synth_rng.seed(seed);
             }
         } else {
+            if (slot.smpl_attached) {
+                llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                slot.smpl_attached = false;
+            }
+            slot.smpl_greedy_key.clear();
             slot.smpl.reset();
         }
 
@@ -2944,7 +3061,7 @@ private:
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
-        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+        if (is_yielding && !server_task_type_handled_while_yielding(task.type)) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
         }
@@ -3778,9 +3895,13 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            dtm("us.draft_yield");
             queue_tasks.yield_to_queue([&]() {
+                dtm("us.draft_start");
                 common_speculative_draft(spec.get());
+                dtm("us.draft_done");
             });
+            dtm("us.draft_yield_ret");
         }
 
         // make checkpoints if needed
@@ -4556,12 +4677,15 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        dtm("dec.yield");
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            dtm("dec.done");
         });
+        dtm("dec.yield_ret");
 
         if (ret != 0) {
             {
@@ -4622,8 +4746,11 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                dtm("sp.start");
                 ok = common_speculative_process(spec.get(), batch.view);
+                dtm("sp.done");
             });
+            dtm("sp.yield_ret");
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -4662,6 +4789,8 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off) {
+        dtm("pd.start");
+        struct dtm_end { ~dtm_end() { dtm("pd.end"); } } dtm_end_guard;
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -4819,6 +4948,7 @@ private:
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
+                    dtm("pd.accepted");
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4922,6 +5052,7 @@ private:
                 }
             }
 
+            dtm("pd.tokens");
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());

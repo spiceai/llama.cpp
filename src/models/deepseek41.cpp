@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -273,6 +274,8 @@ public:
         model(model), mctx(mctx) {}
 
     void set_input(const llama_ubatch * ubatch) override;
+    void prefetch(const llama_ubatch * ubatch) override;
+    bool set_late() const override { return !engram_ids.empty(); }
     bool can_reuse(const llm_graph_params & params) override;
 
     std::vector<ggml_tensor *> engram_ids;
@@ -288,22 +291,54 @@ private:
     const llama_kv_cache_dsv4_context::comp_plan & cand_plan(const llama_ubatch & ubatch) const {
         return cand_csa ? mctx->get_csa_plan(ubatch) : mctx->get_hca_plan(ubatch);
     }
+
+    // the Engram rows of every layer for the ubatch hashed by prefetch(), which set_input() then gathers
+    void hash_engram(const llama_ubatch & ubatch, std::vector<std::vector<int32_t>> & ids) const;
+    std::vector<std::vector<int32_t>> prefetched_ids;
+    const llama_ubatch *              prefetched_for = nullptr;
 };
+
+void llm_graph_input_dsv41::hash_engram(const llama_ubatch & ubatch, std::vector<std::vector<int32_t>> & ids) const {
+    // a token shared by several sequences has the same history in each, so its first sequence resolves it
+    std::vector<llama_token> prev;
+    mctx->get_raw()->get_prev_tokens(ubatch, model.engram_max_ngram - 1, prev);
+    ids.assign(engram_ids.size(), {});
+    for (size_t e = 0; e < engram_ids.size(); ++e) {
+        model.engram_hash((int) e, ubatch, prev, ids[e]);
+    }
+}
+
+void llm_graph_input_dsv41::prefetch(const llama_ubatch * ubatch) {
+    prefetched_for = nullptr;
+    if (engram_ids.empty() || !model.can_prefetch.count(model.per_layer_tok_embd)) {
+        return;
+    }
+    hash_engram(*ubatch, prefetched_ids);
+    std::vector<int32_t> all;
+    for (const auto & v : prefetched_ids) {
+        all.insert(all.end(), v.begin(), v.end());
+    }
+    llama_prefetch_rows(model.per_layer_tok_embd, all.data(), all.size());
+    prefetched_for = ubatch;
+}
 
 void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
     if (!engram_ids.empty()) {
-        // a token shared by several sequences has the same history in each, so its first sequence resolves it
-        std::vector<llama_token> prev;
-        mctx->get_raw()->get_prev_tokens(*ubatch, model.engram_max_ngram - 1, prev);
-        // hash all Engram layers first so a lazily read table gets one batched readahead before the first gather
-        std::vector<std::vector<int32_t>> ids(engram_ids.size());
-        std::vector<int32_t> all;
-        for (size_t e = 0; e < engram_ids.size(); ++e) {
-            model.engram_hash((int) e, *ubatch, prev, ids[e]);
-            all.insert(all.end(), ids[e].begin(), ids[e].end());
-        }
-        if (model.can_prefetch.count(model.per_layer_tok_embd)) {
-            llama_prefetch_rows(model.per_layer_tok_embd, all.data(), all.size());
+        std::vector<std::vector<int32_t>> ids;
+        if (prefetched_for == ubatch) {
+            // prefetch() hashed this ubatch and started its reads before the other inputs were set
+            ids = std::move(prefetched_ids);
+            prefetched_for = nullptr;
+        } else {
+            // hash all Engram layers first so a lazily read table gets one batched readahead before the first gather
+            hash_engram(*ubatch, ids);
+            std::vector<int32_t> all;
+            for (const auto & v : ids) {
+                all.insert(all.end(), v.begin(), v.end());
+            }
+            if (model.can_prefetch.count(model.per_layer_tok_embd)) {
+                llama_prefetch_rows(model.per_layer_tok_embd, all.data(), all.size());
+            }
         }
         std::vector<float> rows;
         for (size_t e = 0; e < engram_ids.size(); ++e) {
@@ -364,6 +399,25 @@ bool llm_graph_input_dsv41::can_reuse(const llm_graph_params & params) {
         const int64_t bs = model.hparams.dsv41_cand_block_size;
         res &= plan.n_kv > 0 && cand_pin->ne[0] == (plan.n_kv + bs - 1)/bs;
         res &= cand_pin->ne[1]*cand_pin->ne[3] == (int64_t) params.ubatch.n_tokens;
+    }
+    if (!res && getenv("LLAMA_DEBUG_REUSE")) {
+        for (auto * t : engram_ids) {
+            fprintf(stderr, "DBGREUSE dsv41 %s type %s old [%lld,%lld] expected [%lld,%lld]\n",
+                    t->name, ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1],
+                    (long long) (t->type == GGML_TYPE_F32 ? model.engram_head_dim*model.engram_n_cols() : model.engram_n_cols()*params.ubatch.n_tokens),
+                    (long long) (t->type == GGML_TYPE_F32 ? params.ubatch.n_tokens : 1));
+        }
+        fprintf(stderr, "DBGREUSE dsv41 engram_keep present %d expected %d ne2 %lld expected_tokens %u\n",
+                (int) (engram_keep != nullptr), (int) (!engram_ids.empty() && params.ubatch.embd != nullptr),
+                (long long) (engram_keep ? engram_keep->ne[2] : -1), params.ubatch.n_tokens);
+        if (cand_pin) {
+            const auto & plan = cand_plan(params.ubatch);
+            const int64_t bs = model.hparams.dsv41_cand_block_size;
+            fprintf(stderr, "DBGREUSE dsv41 cand_pin old [%lld,%lld,%lld,%lld] expected_blocks %lld expected_tokens %u n_kv %lld n_stream %lld block_size %lld\n",
+                    (long long) cand_pin->ne[0], (long long) cand_pin->ne[1], (long long) cand_pin->ne[2], (long long) cand_pin->ne[3],
+                    (long long) ((plan.n_kv + bs - 1)/bs), params.ubatch.n_tokens,
+                    (long long) plan.n_kv, (long long) plan.n_stream, (long long) bs);
+        }
     }
     return res;
 }

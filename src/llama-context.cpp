@@ -14,9 +14,11 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -374,6 +376,11 @@ llama_context::llama_context(
     cparams.pipeline_parallel = false;
     cparams.training = false;
 
+    cparams.logits_gather = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && llama_tensor_logits_gather();
+    if (cparams.logits_gather) {
+        LLAMA_LOG_WARN("%s: LLAMA_TENSOR_LOGITS_GATHER: the output head is split by vocabulary rows and its logits are gathered onto every device\n", __func__);
+    }
+
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
@@ -720,12 +727,67 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
+// LLAMA_GRAPH_SLOTS: "2" gives each context a second scheduler, so a context alternating between two graphs reuses
+// both; "flag:<path>" uses the second only while <path> exists (re-checked at most every 100 ms)
+static const std::string & llama_graph_slots_mode() {
+    static const std::string mode = [] {
+        const char * v = getenv("LLAMA_GRAPH_SLOTS");
+        return std::string(v != nullptr ? v : "");
+    }();
+    return mode;
+}
+
+static bool llama_graph_slots_on() {
+    const std::string & mode = llama_graph_slots_mode();
+    if (mode.rfind("flag:", 0) == 0) {
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(std::filesystem::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return atoi(mode.c_str()) >= 2;
+}
+
+static bool llama_graph_slots_all_outputs() {
+    static const std::string mode = [] {
+        const char * v = getenv("LLAMA_GRAPH_SLOTS_ALL_OUTPUTS");
+        return std::string(v != nullptr ? v : "");
+    }();
+    if (mode.rfind("flag:", 0) == 0) {
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(std::filesystem::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return atoi(mode.c_str()) != 0;
+}
+
 void llama_context::sched_new(size_t max_nodes, bool parallel) {
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+
+    // LLAMA_GRAPH_SLOTS=2: one scheduler per graph slot, so a context alternating between two graphs reuses both
+    const bool graph_slots = llama_graph_slots_mode().rfind("flag:", 0) == 0 || atoi(llama_graph_slots_mode().c_str()) >= 2;
+    sched_alt.reset();
+    sched_slot = 0;
+    gf_res_prev_active_alt = nullptr;
+    if (graph_slots) {
+        sched_alt.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+        ggml_backend_sched_set_copy_callback(sched_alt.get(), sched_copy_experts, this);
+        ggml_backend_sched_set_realloc_callback(sched_alt.get(), sched_graph_realloc, this);
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -753,6 +815,7 @@ void llama_context::sched_reserve() {
     }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
+    gf_res_prev_active_alt = nullptr;
 
     sched_new(max_nodes, cparams.pipeline_parallel);
 
@@ -884,12 +947,28 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+// DIAG (not for merge): LLAMA_DECODE_TIMING=1 prints one line per decode call: the context's arch, its tokens and
+// outputs, whether its graph was reused, the main thread's time since the previous decode of any context (waiting in
+// synchronize, and the rest outside), and the time inside the call (graph build or reuse, inputs, submit, the rest)
+struct llama_decode_timing {
+    bool    on = [] { const char * v = getenv("LLAMA_DECODE_TIMING"); return v != nullptr && atoi(v) != 0; }();
+    int64_t last_exit = 0; // the previous decode's exit, of any context
+    int64_t sync_us   = 0; // time in synchronize() since the last decode entry or exit
+    int64_t build_us = 0, inputs_us = 0, submit_us = 0; // phases of the current call
+};
+// per thread: contexts decoding on different threads would otherwise race on these counters and mix their phases
+static thread_local llama_decode_timing g_decode_timing;
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
     }
 
+    const int64_t t_sync0 = g_decode_timing.on ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
+    if (g_decode_timing.on) {
+        g_decode_timing.sync_us += ggml_time_us() - t_sync0;
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -995,6 +1074,7 @@ bool llama_context::memory_update(bool optimize) {
             }
         }
         gf_res_prev_active = nullptr;
+        gf_res_prev_active_alt = nullptr;
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1405,6 +1485,17 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+// LLAMA_TENSOR_BACKEND_SAMPLING=1: offload sampler chains with SPLIT_MODE_TENSOR too. This needs logits mirrored on every
+// device, i.e. an output head that is not split (a head tied to the token embeddings is mirrored): the meta backend's
+// per-row ops (top-k) assert when the vocabulary axis of the sampled logits is split.
+static bool llama_tensor_backend_sampling() {
+    static const bool on = [] {
+        const char * v = getenv("LLAMA_TENSOR_BACKEND_SAMPLING");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return on;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1412,7 +1503,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !llama_tensor_backend_sampling()) {
         static bool warned = false;
         if (!warned) {
             LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
@@ -1521,11 +1612,41 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+bool llama_context::sampling_binds_inputs() const {
+    for (const auto & [seq_id, sampler] : sampling.samplers) {
+        if (llama_sampler_backend_has_inputs(sampler)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    const int64_t t_dt0 = g_decode_timing.on ? ggml_time_us() : 0;
+
+    // with LLAMA_GRAPH_SLOTS=2 each graph slot has its own scheduler: switch to this ubatch's
+    if (sched_alt) {
+        // LLAMA_GRAPH_SLOTS_ALL_OUTPUTS=1 (or flag:<path>): the second slot holds only ubatches whose every token is an
+        // output (a speculative verify or draft), so a prompt's last chunk, which outputs one token, does not evict the
+        // verify
+        const bool all_outputs = llama_graph_slots_all_outputs();
+        // a backend sampler that binds input tensors (the dist sampler's uniforms, the penalties' token ids and
+        // counts) binds them to the graph it is built into, and a slot switch would reuse the other graph without
+        // rebinding them, so its inputs would be set in one graph and read in the other: such a chain keeps one
+        // graph slot, as without LLAMA_GRAPH_SLOTS (a greedy chain binds none)
+        sched_slots_on = llama_graph_slots_on() && !sampling_binds_inputs();
+        const int slot = sched_slots_on && n_outputs > 0 && (!all_outputs || n_outputs == ubatch.n_tokens);
+        if (slot != sched_slot) {
+            std::swap(sched, sched_alt);
+            std::swap(gf_res_prev_active, gf_res_prev_active_alt);
+            sched_slot = slot;
+        }
     }
 
     auto * res = get_gf_res_prev();
@@ -1535,6 +1656,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    if (getenv("LLAMA_DEBUG_REUSE") && n_outputs > 0) {
+        fprintf(stderr, "DBGREUSE arch %s tok %u out %u slot %d prev_active %d can_reuse %d\n", llm_arch_name(model.arch),
+                ubatch.n_tokens, n_outputs, sched_slot, (int) (gf_res_prev_active == res), (int) (gf_res_prev_active == res && res->can_reuse(gparams)));
+    }
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1548,6 +1673,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         n_reused++;
     } else {
         gf_res_prev_active = nullptr;
+        // the graph results are per n_outputs > 0, not per scheduler: with the second slot off this scheduler also
+        // builds the graph the other one last allocated, which that one must not reuse when the slot comes back
+        if (gf_res_prev_active_alt == res) {
+            gf_res_prev_active_alt = nullptr;
+        }
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1574,6 +1704,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    const int64_t t_dt1 = g_decode_timing.on ? ggml_time_us() : 0;
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1584,7 +1716,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_dt2 = g_decode_timing.on ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (g_decode_timing.on) {
+        const int64_t t_dt3 = ggml_time_us();
+        g_decode_timing.build_us  += t_dt1 - t_dt0;
+        g_decode_timing.inputs_us += t_dt2 - t_dt1;
+        g_decode_timing.submit_us += t_dt3 - t_dt2;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1840,6 +1979,38 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
     }
+
+    struct decode_timing_guard {
+        llama_context & lctx;
+        int64_t t_entry = 0, gap = 0, sync_before = 0, reused0 = 0;
+        int n_tokens = 0;
+        decode_timing_guard(llama_context & lctx, int n_tokens) : lctx(lctx), n_tokens(n_tokens) {
+            if (!g_decode_timing.on) {
+                return;
+            }
+            t_entry     = ggml_time_us();
+            gap         = g_decode_timing.last_exit > 0 ? t_entry - g_decode_timing.last_exit : 0;
+            sync_before = g_decode_timing.sync_us;
+            reused0     = lctx.n_reused;
+            g_decode_timing.sync_us  = 0;
+            g_decode_timing.build_us = g_decode_timing.inputs_us = g_decode_timing.submit_us = 0;
+        }
+        ~decode_timing_guard() {
+            if (!g_decode_timing.on) {
+                return;
+            }
+            const int64_t t_exit = ggml_time_us();
+            const auto & dt = g_decode_timing;
+            const int64_t inside = t_exit - t_entry;
+            fprintf(stderr, "DT %s tok %d out %d reused %d | before: gap %.3f sync %.3f cpu %.3f | inside %.3f: build %.3f inputs %.3f submit %.3f sync %.3f rest %.3f | at %lld end %lld\n",
+                    llm_arch_name(lctx.model.arch), n_tokens, (int) lctx.n_outputs, (int) (lctx.n_reused - reused0),
+                    gap/1e3, sync_before/1e3, (gap - sync_before)/1e3, inside/1e3, dt.build_us/1e3, dt.inputs_us/1e3,
+                    dt.submit_us/1e3, dt.sync_us/1e3, (inside - dt.build_us - dt.inputs_us - dt.submit_us - dt.sync_us)/1e3,
+                    (long long) t_entry, (long long) t_exit);
+            g_decode_timing.last_exit = t_exit;
+            g_decode_timing.sync_us   = 0;
+        }
+    } timing_guard(*this, (int) batch_inp.tokens.size());
 
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -2572,7 +2743,9 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 llm_graph_result * llama_context::get_gf_res_prev() {
-    auto & res = gf_res_prev[n_outputs > 0];
+    // with the graph slots on, one result per scheduler slot: a prompt's last chunk outputs a token but runs in the
+    // first slot (LLAMA_GRAPH_SLOTS_ALL_OUTPUTS=1), and must not overwrite the verify graph the second slot holds
+    auto & res = gf_res_prev[sched_alt && sched_slots_on ? sched_slot : (n_outputs > 0)];
     if (!res) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
     }
@@ -2655,6 +2828,7 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     }
     gf_res_prev_active = nullptr;
+    gf_res_prev_active_alt = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -3897,6 +4071,7 @@ void llama_context::opt_epoch_iter(
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
             gf_res_prev_active = nullptr;
+            gf_res_prev_active_alt = nullptr;
             res->reset();
 
             auto * gf = model.build_graph(gparams);

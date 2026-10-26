@@ -116,6 +116,11 @@ public:
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
+    // with LLAMA_ENGRAM_PREFETCH_FIRST, runs before any input is set: an input that reads rows of a host table through
+    // its mmap starts those reads here, and set_late() puts its own set_input after the others, which hide the reads
+    virtual void prefetch(const llama_ubatch * ubatch) { GGML_UNUSED(ubatch); }
+    virtual bool set_late() const { return false; }
+
     // return true if the resulting input tensors using the provided graph parameters would be
     //   the same as the previous input tensors that we have currently stored in the object
     virtual bool can_reuse(const llm_graph_params & params) {
@@ -130,6 +135,8 @@ protected:
 };
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
+
+bool llama_engram_prefetch_first();
 
 // dst[i] = row ids[i] of host table tab as F32, same conversion as CPU GET_ROWS (bitwise equal)
 bool llm_graph_host_rows_supported(const ggml_tensor * tab);
@@ -975,6 +982,8 @@ public:
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
+    bool t_logits_gathered = false; // t_logits derives from a gather of the output head, see build_logits_gather
+
     std::vector<ggml_tensor *> t_layer_inp;
 
     std::vector<ggml_tensor *> t_sampled;
@@ -1472,6 +1481,10 @@ struct llm_graph_context {
     //
 
     void build_logits() const;
+
+    // the logits of a split output head gathered whole onto every device (cparams.logits_gather), for a graph whose
+    // own ops consume them before build_logits
+    ggml_tensor * build_logits_gather(ggml_tensor * logits) const;
 
     //
     // sampling (backend sampling)

@@ -6,6 +6,10 @@
 #include "llama-hparams.h"
 #include "llama.h"
 
+#if defined(__linux__)
+#include <fcntl.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -1859,6 +1863,14 @@ bool llama_model_loader::load_all_data(
     if (size_done >= size_data) {
         // unmap offloaded tensors and metadata
         if (use_mmap) {
+#if defined(__linux__)
+            // LLAMA_DROP_UPLOADED_CACHE=1: also drop the page cache of the unmapped ranges, whose tensors now live in
+            // other buffers, so it does not crowd out the pages of the tensors read through the mapping while decoding
+            static const bool drop_cache = [] {
+                const char * v = getenv("LLAMA_DROP_UPLOADED_CACHE");
+                return v != nullptr && atoi(v) != 0;
+            }();
+#endif
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
@@ -1866,6 +1878,20 @@ bool llama_model_loader::load_all_data(
                 if (mmap_used.second != 0) {
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
+#if defined(__linux__)
+                if (drop_cache) {
+                    const int fd = files.at(idx)->file_id();
+                    const size_t first = std::min(mmap_used.first, mapping->size());
+                    const size_t last  = mmap_used.second != 0 ? mmap_used.second : first;
+                    int rc = first > 0 ? posix_fadvise(fd, 0, (off_t) first, POSIX_FADV_DONTNEED) : 0;
+                    if (rc == 0 && last < mapping->size()) {
+                        rc = posix_fadvise(fd, (off_t) last, (off_t) (mapping->size() - last), POSIX_FADV_DONTNEED);
+                    }
+                    if (rc != 0) {
+                        LLAMA_LOG_WARN("%s: could not drop the page cache of model file %u: %s\n", __func__, idx, strerror(rc));
+                    }
+                }
+#endif
             }
         }
         if (progress_callback) {

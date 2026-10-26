@@ -396,6 +396,22 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     return llama_model_create(arch, params);
 }
 
+bool llama_tensor_logits_gather() {
+    static const bool on = [] {
+        const char * v = getenv("LLAMA_TENSOR_LOGITS_GATHER");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return on;
+}
+
+bool llama_dspark_split() {
+    static const bool on = [] {
+        const char * v = getenv("LLAMA_DSPARK_SPLIT");
+        return v != nullptr && atoi(v) != 0 && llama_tensor_logits_gather();
+    }();
+    return on;
+}
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
@@ -618,7 +634,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
-            if (is_dsv4) {
+            if (is_dsv4 && !llama_tensor_logits_gather()) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
@@ -627,6 +643,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
             GGML_ASSERT(output_weight != nullptr);
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+        }
+
+        // the drafter's feature projection and Markov transition, gathered after their matmuls (llama_dspark_split)
+        if (ud->model->arch == LLM_ARCH_DFLASH && llama_dspark_split() &&
+                (tensor_name == "fc.weight" || tensor_name == "markov_w2.weight")) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
 
         // everything else

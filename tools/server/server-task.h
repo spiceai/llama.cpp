@@ -33,6 +33,12 @@ enum server_task_type {
     SERVER_TASK_TYPE_TTS,
 };
 
+// while the main thread yields the queue during an encode / decode (server_queue::yield_to_queue), only a task that
+// reads the server state is processed; every other task waits for the yield to end
+static inline bool server_task_type_handled_while_yielding(server_task_type type) {
+    return type == SERVER_TASK_TYPE_METRICS || type == SERVER_TASK_TYPE_SLOT_GET;
+}
+
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
 enum task_response_type {
     TASK_RESPONSE_TYPE_NONE, // llama.cpp native format
