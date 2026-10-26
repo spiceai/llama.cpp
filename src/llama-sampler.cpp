@@ -975,6 +975,10 @@ bool llama_sampler_backend_has_inputs(const llama_sampler * sampler) {
     if (sampler == nullptr) {
         return false;
     }
+    // the empty sampler stands in for a disabled one (penalties, DRY) and its backend_set_input is a no-op
+    if (sampler->iface == &llama_sampler_empty_i) {
+        return false;
+    }
     if (sampler->iface == &llama_sampler_chain_i) {
         const auto * chain = (const llama_sampler_chain *) sampler->ctx;
         for (const auto & s : chain->samplers) {

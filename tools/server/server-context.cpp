@@ -89,7 +89,7 @@ static bool server_reuse_sampler() {
 // no sampler that draws from a distribution (dist, adaptive-p, mirostat), removes the most likely token (XTC), or keeps
 // state across tokens (penalties, DRY, grammar, logit bias, a reasoning budget), so its output is a function of the
 // logits alone and a reset leaves nothing behind
-static std::string server_greedy_sampler_key(const common_params_sampling & p) {
+static std::string server_greedy_sampler_key(const common_params_sampling & p, bool backend_sampling) {
     bool adaptive = false;
     for (const auto s : p.samplers) {
         adaptive |= s == COMMON_SAMPLER_TYPE_ADAPTIVE_P;
@@ -110,7 +110,7 @@ static std::string server_greedy_sampler_key(const common_params_sampling & p) {
             "temp %a|dynatemp %a %a|top_k %d|top_p %a|min_p %a|typ_p %a|top_n_sigma %a|xtc %a %a|min_keep %d|n_prev %d|backend %d|samplers",
             (double) p.temp, (double) p.dynatemp_range, (double) p.dynatemp_exponent, p.top_k, (double) p.top_p, (double) p.min_p,
             (double) p.typ_p, (double) p.top_n_sigma, (double) p.xtc_probability, (double) p.xtc_threshold,
-            p.min_keep, p.n_prev, (int) p.backend_sampling);
+            p.min_keep, p.n_prev, (int) backend_sampling);
     for (const auto s : p.samplers) {
         key += string_format(" %d", (int) s);
     }
@@ -2097,9 +2097,23 @@ private:
 
         // initialize samplers
         if (task.need_sampling()) {
-            // a kept sampler is only for a single slot: an idle slot's attached chain would be built into every graph
-            const std::string greedy_key = server_reuse_sampler() && slots.size() == 1 ? server_greedy_sampler_key(task.params.sampling) : "";
-            const bool keep = !greedy_key.empty() && slot.smpl && greedy_key == slot.smpl_greedy_key;
+            const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
+
+            bool use_backend_sampling = task.params.sampling.backend_sampling;
+
+            // TODO: getting pre sampling logits is not yet supported with backend sampling
+            use_backend_sampling &= !need_pre_sample_logits;
+
+            // TODO: check verify if this actually works with TTS
+            use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
+
+            // a kept sampler is only for a single slot (an idle slot's attached chain would be built into every graph),
+            // never for TTS, and only for a request sampled the way the kept chain is attached: a chain initialized for
+            // the backend cannot sample on the CPU (its offloaded samplers would be skipped) nor be attached again
+            const std::string greedy_key = server_reuse_sampler() && slots.size() == 1 && task.type != SERVER_TASK_TYPE_TTS
+                ? server_greedy_sampler_key(task.params.sampling, use_backend_sampling) : "";
+            const bool keep = !greedy_key.empty() && slot.smpl && greedy_key == slot.smpl_greedy_key &&
+                slot.smpl_attached == use_backend_sampling;
             if (keep) {
                 common_sampler_reset(slot.smpl.get());
             } else {
@@ -2120,16 +2134,6 @@ private:
                 }
             }
             slot.smpl_greedy_key = greedy_key;
-
-            const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
-
-            bool use_backend_sampling = task.params.sampling.backend_sampling;
-
-            // TODO: getting pre sampling logits is not yet supported with backend sampling
-            use_backend_sampling &= !need_pre_sample_logits;
-
-            // TODO: check verify if this actually works with TTS
-            use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {

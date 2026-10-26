@@ -19,6 +19,7 @@
 
 #include <filesystem>
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -1547,14 +1548,15 @@ bool llama_engram_prefetch_first() {
         return std::string(v != nullptr ? v : "");
     }();
     if (mode.rfind("flag:", 0) == 0) {
-        static int64_t next_check_us = 0;
-        static bool    on            = false;
+        // shared by every context, so a relaxed atomic each: a stale read only delays a flip by one check
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
         const int64_t now = ggml_time_us();
-        if (now >= next_check_us) {
-            on            = std::filesystem::exists(mode.substr(5));
-            next_check_us = now + 100000;
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(std::filesystem::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
         }
-        return on;
+        return on.load(std::memory_order_relaxed);
     }
     return atoi(mode.c_str()) != 0;
 }
