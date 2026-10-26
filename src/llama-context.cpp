@@ -1611,6 +1611,15 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+bool llama_context::sampling_binds_inputs() const {
+    for (const auto & [seq_id, sampler] : sampling.samplers) {
+        if (llama_sampler_backend_has_inputs(sampler)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1626,7 +1635,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // output (a speculative verify or draft), so a prompt's last chunk, which outputs one token, does not evict the
         // verify
         const bool all_outputs = llama_graph_slots_all_outputs();
-        sched_slots_on = llama_graph_slots_on();
+        // a backend sampler that binds input tensors (the dist sampler's uniforms, the penalties' token ids and
+        // counts) binds them to the graph it is built into, and a slot switch would reuse the other graph without
+        // rebinding them, so its inputs would be set in one graph and read in the other: such a chain keeps one
+        // graph slot, as without LLAMA_GRAPH_SLOTS (a greedy chain binds none)
+        sched_slots_on = llama_graph_slots_on() && !sampling_binds_inputs();
         const int slot = sched_slots_on && n_outputs > 0 && (!all_outputs || n_outputs == ubatch.n_tokens);
         if (slot != sched_slot) {
             std::swap(sched, sched_alt);

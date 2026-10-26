@@ -84,23 +84,35 @@ static bool server_reuse_sampler() {
     return sw.get();
 }
 
-// the parameters of a sampler that can be kept across tasks, or "" when it cannot
+// the parameters of a sampler that can be kept across tasks, or "" when it cannot: the chain common_sampler_init
+// builds for them ends in a greedy pick (a temperature of exactly 0 with no dynamic range, or top-k 1, last) and holds
+// no sampler that draws from a distribution (dist, adaptive-p, mirostat), removes the most likely token (XTC), or keeps
+// state across tokens (penalties, DRY, grammar, logit bias, a reasoning budget), so its output is a function of the
+// logits alone and a reset leaves nothing behind
 static std::string server_greedy_sampler_key(const common_params_sampling & p) {
-    const bool stateless = p.temp <= 0.0f && p.grammar.grammar.empty() && p.grammar_triggers.empty() &&
-        p.logit_bias.empty() && p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f &&
-        p.dry_multiplier == 0.0f && p.mirostat == 0 && p.reasoning_budget_tokens < 0 && !p.reasoning_control &&
-        p.n_probs == 0;
+    bool adaptive = false;
+    for (const auto s : p.samplers) {
+        adaptive |= s == COMMON_SAMPLER_TYPE_ADAPTIVE_P;
+    }
+    const bool greedy_end = !p.samplers.empty() &&
+        ((p.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && p.temp == 0.0f && p.dynatemp_range == 0.0f) ||
+         (p.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && p.top_k == 1));
+    const bool stateless = greedy_end && !adaptive && p.n_probs == 0 && p.grammar.grammar.empty() &&
+        p.grammar_triggers.empty() && p.logit_bias.empty() && p.logit_bias_eog.empty() && !p.ignore_eos &&
+        p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f && p.dry_multiplier == 0.0f &&
+        p.mirostat == 0 && p.xtc_probability == 0.0f && p.reasoning_budget_tokens < 0 && !p.reasoning_control;
     if (!stateless) {
         return "";
     }
-    std::string key = p.print();
-    key += string_format("|seed %u|min_keep %d|n_prev %d|backend %d|ignore_eos %d|eog %zu|samplers",
-            p.seed, p.min_keep, p.n_prev, (int) p.backend_sampling, (int) p.ignore_eos, p.logit_bias_eog.size());
+    // every parameter that shapes the chain, exactly (%a is the float's hex form): not p.print(), which rounds its
+    // floats and leaves the dynamic-temperature settings out
+    std::string key = string_format(
+            "temp %a|dynatemp %a %a|top_k %d|top_p %a|min_p %a|typ_p %a|top_n_sigma %a|xtc %a %a|min_keep %d|n_prev %d|backend %d|samplers",
+            (double) p.temp, (double) p.dynatemp_range, (double) p.dynatemp_exponent, p.top_k, (double) p.top_p, (double) p.min_p,
+            (double) p.typ_p, (double) p.top_n_sigma, (double) p.xtc_probability, (double) p.xtc_threshold,
+            p.min_keep, p.n_prev, (int) p.backend_sampling);
     for (const auto s : p.samplers) {
         key += string_format(" %d", (int) s);
-    }
-    for (const auto & b : p.logit_bias_eog) {
-        key += string_format("|%d:%g", b.token, b.bias);
     }
     return key;
 }
@@ -513,6 +525,9 @@ struct server_slot {
         if (!server_reuse_sampler() || smpl_greedy_key.empty()) {
             llama_set_sampler(ctx_tgt, id, nullptr);
             smpl_attached = false;
+            // a detached chain is never attached again: the context initialized it for its backend once, and
+            // llama_sampler_chain_backend_init asserts on a second time, so the next task builds a new chain
+            smpl_greedy_key.clear();
         }
 
         // clear alora start

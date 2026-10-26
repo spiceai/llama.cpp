@@ -369,6 +369,8 @@ private:
     ggml_backend_sched_ptr sched_alt;
     int                    sched_slot = 0;
     bool                   sched_slots_on = false; // the graph slots were on for the last ubatch (one decision per ubatch)
+    // whether a backend sampler attached to a sequence binds input tensors to the graph it is built into
+    bool sampling_binds_inputs() const;
 
     bool sched_need_reserve = true;
 

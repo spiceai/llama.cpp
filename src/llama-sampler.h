@@ -38,6 +38,11 @@ struct llama_sampler_chain {
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 
+// whether the sampler, or any sampler of a chain, binds input tensors to the graph it is built into
+// (.backend_set_input, as the dist sampler's uniforms and the penalties' token ids do): such a chain is
+// bound to one graph at a time
+bool llama_sampler_backend_has_inputs(const llama_sampler * sampler);
+
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,
         float   dry_base,

@@ -971,6 +971,22 @@ void llama_sampler_chain_add(struct llama_sampler * chain, struct llama_sampler 
     });
 }
 
+bool llama_sampler_backend_has_inputs(const llama_sampler * sampler) {
+    if (sampler == nullptr) {
+        return false;
+    }
+    if (sampler->iface == &llama_sampler_chain_i) {
+        const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+        for (const auto & s : chain->samplers) {
+            if (llama_sampler_backend_has_inputs(s.ptr)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return sampler->iface->backend_set_input != nullptr;
+}
+
 struct llama_sampler * llama_sampler_chain_get(struct llama_sampler * chain, int32_t i) {
     if (chain == nullptr) {
         return nullptr;
