@@ -6207,6 +6207,69 @@ static void ggml_backend_cuda_nccl_comm_abort(void * comm) {
     }
 }
 
+// A mesh rank's two-rank communicators, one per peer, summed as one all-reduce: every pair of Sparks shares one cable,
+// and NCCL picks one port per channel for every rank, so a single communicator over a triangle of them cannot route to
+// both peers, while a two-rank communicator over the cable the pair shares is what the pairwise path already runs.
+struct ggml_cuda_nccl_group {
+    std::vector<ncclComm_t> comms; // one per peer
+    std::vector<int>        peers; // the peer's rank inside each two-rank communicator (0 or 1)
+};
+
+static void * ggml_backend_cuda_nccl_group_new(void ** comms, const int * peer_ranks, int n) {
+    ggml_cuda_nccl_group * g = new ggml_cuda_nccl_group;
+    for (int i = 0; i < n; i++) {
+        g->comms.push_back((ncclComm_t) comms[i]);
+        g->peers.push_back(peer_ranks[i]);
+    }
+    return g;
+}
+
+static void ggml_backend_cuda_nccl_group_free(void * group) {
+    if (group != nullptr) {
+        ggml_cuda_nccl_group * g = (ggml_cuda_nccl_group *) group;
+        for (ncclComm_t c : g->comms) {
+            ncclCommDestroy(c);
+        }
+        delete g;
+    }
+}
+
+static void ggml_backend_cuda_nccl_group_abort(void * group) {
+    if (group != nullptr) {
+        ggml_cuda_nccl_group * g = (ggml_cuda_nccl_group *) group;
+        for (ncclComm_t c : g->comms) {
+            ncclCommAbort(c);
+        }
+        delete g;
+    }
+}
+
+// every peer receives this rank's partial while this rank receives each peer's, all queued on the backend's stream in
+// one group, and the received partials are then added into the tensor: the sum each rank holds is the same
+static bool ggml_backend_cuda_nccl_group_allreduce(ggml_backend_t backend, void * group, ggml_tensor * t) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    const ggml_cuda_nccl_group * g = (const ggml_cuda_nccl_group *) group;
+    const int64_t ne = ggml_nelements(t);
+    const size_t  n  = g->comms.size();
+    ggml_cuda_pool_alloc<float> tmp(cuda_ctx->pool(), (size_t) ne * n);
+    bool ok = ncclGroupStart() == ncclSuccess;
+    for (size_t i = 0; i < n; i++) {
+        ok = ok && ncclSend(t->data, ne, ncclFloat, g->peers[i], g->comms[i], cuda_ctx->stream()) == ncclSuccess;
+        ok = ok && ncclRecv(tmp.get() + (size_t) i * ne, ne, ncclFloat, g->peers[i], g->comms[i], cuda_ctx->stream()) == ncclSuccess;
+    }
+    ok = ncclGroupEnd() == ncclSuccess && ok;
+    if (!ok) {
+        return false;
+    }
+    const float one = 1.0f;
+    cublasHandle_t cublas = cuda_ctx->cublas_handle();
+    for (size_t i = 0; i < n; i++) {
+        CUBLAS_CHECK(cublasSaxpy(cublas, (int) ne, &one, tmp.get() + (size_t) i * ne, 1, (float *) t->data, 1));
+    }
+    return true;
+}
+
 // sums the tensor in place across the communicator's ranks, queued on the backend's stream
 static bool ggml_backend_cuda_nccl_allreduce(ggml_backend_t backend, void * comm, ggml_tensor * t) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -6328,6 +6391,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_nccl_allreduce") == 0) {
         return (void *)ggml_backend_cuda_nccl_allreduce;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_group_new") == 0) {
+        return (void *)ggml_backend_cuda_nccl_group_new;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_group_free") == 0) {
+        return (void *)ggml_backend_cuda_nccl_group_free;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_group_abort") == 0) {
+        return (void *)ggml_backend_cuda_nccl_group_abort;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_group_allreduce") == 0) {
+        return (void *)ggml_backend_cuda_nccl_group_allreduce;
     }
 #endif // GGML_USE_NCCL
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
