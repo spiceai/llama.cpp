@@ -355,9 +355,12 @@ bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
 
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_backend_dev_t dev) {
     // two contexts of one device can ask for its buffer type at once, as a model and its drafter loading on threads of
-    // their own do; the entries are std::map nodes, stable under insertion, so a returned pointer outlives the lock
-    static std::mutex                                                    mutex;
-    static std::map<ggml_backend_dev_t, struct ggml_backend_buffer_type> meta_bufts;
+    // their own do; the entries are std::map nodes, stable under insertion, so a returned pointer outlives the lock.
+    // The registry owns each buffer type's context, as the meta-device registry owns its device contexts, so they are
+    // freed at exit instead of leaking (LeakSanitizer reports them otherwise).
+    static std::mutex                                                           mutex;
+    static std::vector<std::unique_ptr<ggml_backend_meta_buffer_type_context>> ctxs;
+    static std::map<ggml_backend_dev_t, struct ggml_backend_buffer_type>        meta_bufts;
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     std::lock_guard<std::mutex> lock(mutex);
     {
@@ -373,12 +376,12 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
     for (size_t i = 0; i < n_devs; i++) {
         simple_bufts.push_back(ggml_backend_dev_buffer_type(ggml_backend_meta_dev_simple_dev(dev, i)));
     }
-    ggml_backend_meta_buffer_type_context * buft_ctx = new ggml_backend_meta_buffer_type_context(simple_bufts);
+    ctxs.push_back(std::make_unique<ggml_backend_meta_buffer_type_context>(simple_bufts));
 
     struct ggml_backend_buffer_type meta_buft = {
         /*iface  =*/ ggml_backend_meta_buffer_type_iface,
         /*device =*/ dev,
-        /*ctx    =*/ buft_ctx,
+        /*ctx    =*/ ctxs.back().get(),
     };
     auto result = meta_bufts.emplace(dev, meta_buft);
     return &result.first->second;
