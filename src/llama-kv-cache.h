@@ -10,6 +10,10 @@
 
 struct llama_cparams;
 struct llama_hparams;
+
+// LLAMA_KV_PROMPT_PAD=<power of two of at least 256>: the bucket the visible KV range and the indexer's key-pool count are
+// padded to while a ubatch reads a prompt, so the chunks of one prompt share a graph shape; 0 when unset (off)
+uint32_t llama_kv_prompt_pad();
 struct llama_model;
 struct llama_context;
 
