@@ -571,6 +571,8 @@ public:
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+    void send_async_unpacked(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size,
+                             void * dst, size_t size, size_t n_copies, size_t stride_data);
 
     ggml_backend_event_t event_new(ggml_backend_dev_t dev);
     void event_free(ggml_backend_event_t event);
@@ -595,6 +597,13 @@ private:
         void                        * output;
         size_t                        output_size;
         std::promise<void>            completion;
+        // a strided read: the response lands in packed, and the dispatcher copies it out to unpack_dst row by row
+        // before completing the message
+        std::shared_ptr<std::vector<uint8_t>> packed;
+        void                        * unpack_dst    = nullptr;
+        size_t                        unpack_size   = 0;
+        size_t                        unpack_n      = 0;
+        size_t                        unpack_stride = 0;
     };
     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
     using rpc_msg_queue = message_queue<rpc_msg_ptr>;
@@ -658,6 +667,22 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
     msg->input_size = input_size;
     msg->output = output;
     msg->output_size = output_size;
+    GGML_ASSERT(queue.push(msg));
+}
+
+void rpc_dispatcher::send_async_unpacked(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size,
+        void * dst, size_t size, size_t n_copies, size_t stride_data) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = cmd;
+    msg->input = input;
+    msg->input_size = input_size;
+    msg->packed = std::make_shared<std::vector<uint8_t>>(size*n_copies);
+    msg->output = msg->packed->data();
+    msg->output_size = size*n_copies;
+    msg->unpack_dst = dst;
+    msg->unpack_size = size;
+    msg->unpack_n = n_copies;
+    msg->unpack_stride = stride_data;
     GGML_ASSERT(queue.push(msg));
 }
 
@@ -830,6 +855,12 @@ void rpc_dispatcher::work() {
             if (msg_ptr->output) {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
                 RPC_STATUS_ASSERT(status);
+                if (msg_ptr->packed) {
+                    for (size_t i = 0; i < msg_ptr->unpack_n; i++) {
+                        memcpy((char *) msg_ptr->unpack_dst + i*msg_ptr->unpack_stride, msg_ptr->packed->data() + i*msg_ptr->unpack_size,
+                               msg_ptr->unpack_size);
+                    }
+                }
             } else if (msg_ptr->cmd == RPC_CMD_SET_TENSOR && rpc_set_batch()) {
                 send_set_tensor_batch(msg_ptr);
             } else {
@@ -1469,10 +1500,47 @@ static void ggml_backend_rpc_set_tensor_2d_async(ggml_backend_t backend, ggml_te
     GGML_UNUSED(backend);
 }
 
+// GGML_RPC_GET_ASYNC=1 (or flag:<path>, re-checked at most every 100 ms): a 2D read on a backend's queue is queued like
+// a 1D one and completes by the backend's synchronize, instead of a round trip of its own. A tensor split across
+// ranks is read with one 2D read per rank, so the ranks' reads overlap instead of following one another.
+static bool rpc_get_async() {
+    static const std::string mode = [] {
+        const char * e = std::getenv("GGML_RPC_GET_ASYNC");
+        return std::string(e != nullptr ? e : "");
+    }();
+    if (mode.rfind("flag:", 0) == 0) {
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(fs::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return mode == "1";
+}
+
 static void ggml_backend_rpc_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
-    ggml_backend_tensor_get_2d(tensor, data, offset, size, n_copies, stride_tensor, stride_data);
-    GGML_UNUSED(backend);
+    if (!rpc_get_async()) {
+        ggml_backend_tensor_get_2d(tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+        return;
+    }
+    ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
+    LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %s, n_copies: %zu, stride: %zu\n", __func__,
+             rpc_log_format_tensor(tensor).c_str(), offset, rpc_log_format_size(size).c_str(), n_copies, stride_tensor);
+    auto request = std::make_shared<rpc_msg_get_tensor_2d_req>();
+    request->tensor   = serialize_tensor(tensor);
+    request->offset   = offset;
+    request->size     = size;
+    request->n_copies = n_copies;
+    request->stride   = stride_tensor;
+    if (stride_data == size || n_copies == 1) {
+        ctx->dispatcher->send_async(RPC_CMD_GET_TENSOR_2D, request, sizeof(*request), data, size*n_copies);
+    } else {
+        ctx->dispatcher->send_async_unpacked(RPC_CMD_GET_TENSOR_2D, request, sizeof(*request), data, size, n_copies, stride_data);
+    }
 }
 
 static ggml_backend_i ggml_backend_rpc_interface = {
