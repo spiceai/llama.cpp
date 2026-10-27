@@ -135,6 +135,8 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
+    LOG("  --rpc <host:port,...>    Split the tensor split (Meta) config across these RPC servers' devices only\n");
+    LOG("  --n-rs-seq <n>           Keep n recurrent-state snapshots per sequence, as speculative decoding does\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -218,6 +220,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_embd = 128;
         n_head = 1;
         n_ff   = 192;
+        if (arch == LLM_ARCH_GLM5_NEXT) {
+            n_head = 6; // whole heads per device when the tensor split runs on 2 or 3 devices
+        }
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
     } else if (arch == LLM_ARCH_CHAMELEON) {
@@ -280,7 +285,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         std::vector<uint32_t> n_head_per_layer;
         n_head_per_layer.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
-            n_head_per_layer.push_back(il == 1 ? 0 : n_head);
+            // GLM5 next MLA layers have one latent KV head, as in GLM-5.3
+            n_head_per_layer.push_back(il == 1 ? 0 : (arch == LLM_ARCH_GLM5_NEXT ? 1 : n_head));
         }
         // GLM5 next KDA heads come from the uniform head count, only head_count_kv is per layer.
         if (arch == LLM_ARCH_GLM5_NEXT) {
@@ -634,6 +640,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     return ret;
 }
 
+// --n-rs-seq: recurrent-state snapshots per sequence, as speculative decoding keeps them, for every context
+static uint32_t n_rs_seq = 0;
+
 static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/) {
     return true;
 }
@@ -656,6 +665,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.n_rs_seq = n_rs_seq;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -1005,6 +1015,40 @@ static std::string get_device_label(ggml_backend_dev_t dev) {
     return std::string(desc) + " (" + name + ")";
 }
 
+// --rpc: the devices of these RPC servers, which then form the tensor split ("Meta") config on their own
+static std::vector<ggml_backend_dev_t> rpc_devices;
+
+static bool add_rpc_servers(const std::string & servers) {
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (rpc_reg == nullptr) {
+        LOG_ERR("%s: this build has no RPC backend\n", __func__);
+        return false;
+    }
+    typedef ggml_backend_reg_t (*add_server_t)(const char * endpoint);
+    auto add_server = (add_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+    size_t start = 0;
+    while (start <= servers.size()) {
+        size_t end = servers.find(',', start);
+        if (end == std::string::npos) {
+            end = servers.size();
+        }
+        const std::string endpoint = servers.substr(start, end - start);
+        start = end + 1;
+        if (endpoint.empty()) {
+            continue;
+        }
+        ggml_backend_reg_t reg = add_server(endpoint.c_str());
+        if (reg == nullptr) {
+            LOG_ERR("%s: no RPC server at %s\n", __func__, endpoint.c_str());
+            return false;
+        }
+        for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+            rpc_devices.push_back(ggml_backend_reg_dev_get(reg, i));
+        }
+    }
+    return !rpc_devices.empty();
+}
+
 static int test_backends(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend) {
     struct user_data_t {
         struct {
@@ -1067,8 +1111,11 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             }
         }
 
+        if (!rpc_devices.empty()) {
+            devices_meta = rpc_devices;
+        }
         if (target_backend == nullptr) {
-            dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+            dev_configs.emplace_back(devices_meta, rpc_devices.empty() ? "Meta" : "Meta (RPC)", LLAMA_SPLIT_MODE_TENSOR);
         }
 
         // the ops that use the experts are offloaded to the first device and the scheduler copies the used experts
@@ -1343,6 +1390,22 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) {
             if (i + 1 < argc) {
                 out = argv[++i];
+            } else {
+                usage(argv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--n-rs-seq") == 0) {
+            if (i + 1 < argc) {
+                n_rs_seq = (uint32_t) std::stoul(argv[++i]);
+            } else {
+                usage(argv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--rpc") == 0) {
+            if (i + 1 < argc) {
+                if (!add_rpc_servers(argv[++i])) {
+                    return 1;
+                }
             } else {
                 usage(argv);
                 return 1;

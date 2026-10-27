@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <atomic>
+#include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -605,6 +607,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            // name the node and how its sources are split, since the abort below says neither
+            GGML_LOG_ERROR("%s: no split state for %s (%s) from its sources:\n", __func__, tensor->name, ggml_op_desc(tensor));
+            for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+                if (tensor->src[i] != nullptr && tensor->src[i] != tensor) {
+                    GGML_LOG_ERROR("  src%zu %s (%s) [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]: %s\n", i, tensor->src[i]->name,
+                        ggml_op_desc(tensor->src[i]), tensor->src[i]->ne[0], tensor->src[i]->ne[1], tensor->src[i]->ne[2],
+                        tensor->src[i]->ne[3], ggml_backend_meta_split_axis_name(src_ss[i].axis));
+                }
+            }
+        }
         GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         return ret;
     };
@@ -740,6 +753,22 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_view = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // A gated delta net's result holds its output and then its states, each [S_v, S_v, H_v] with the heads outermost:
+        // each device's part holds the states of its own heads, so a view of the states is split by heads, along the axis
+        // whose extent completes one state ([S_v, S_v, H_v, n_seqs] or [S_v*S_v*H_v, n_seqs, n_snapshots]). Reshaping the
+        // result's split along its rows does not find it: it lands on S_v, which only divides between some device counts.
+        if (tensor->src[0]->op == GGML_OP_GATED_DELTA_NET && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && tensor->view_offs > 0) {
+            const ggml_tensor * v = tensor->src[0]->src[2];
+            const int64_t state = v->ne[0] * v->ne[0] * v->ne[1];
+            int64_t extent = 1;
+            for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                extent *= tensor->ne[dim];
+                if (extent == state) {
+                    return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
+                }
+            }
+            GGML_ABORT("a view of a gated delta net's states that splits a state: %s", tensor->name);
+        }
         if (ggml_is_contiguous(tensor) && ggml_is_contiguous(tensor->src[0])) {
             return handle_reshape(src_ss);
         }
@@ -1089,9 +1118,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_PAD: {
                 split_state = ggml_backend_meta_is_gather(tensor) ? handle_gather(src_ss) : handle_pad(src_ss);
             } break;
+            case GGML_OP_ARANGE: {
+                // no sources: every device computes the same sequence
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            } break;
             case GGML_OP_PAD_REFLECT_1D:
             case GGML_OP_ROLL:
-            case GGML_OP_ARANGE:
             case GGML_OP_TIMESTEP_EMBEDDING: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -1183,6 +1215,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         split_state.ne[j] *= tensor->ne[split_state.axis];
                         if (split_state.ne[j] != 0 || tensor->src[i]->ne[src_ss[i].axis] != 0) {
                             const int64_t div = tensor->src[i]->ne[src_ss[i].axis] * split_state.nr[0];
+                            if (split_state.ne[j] % div != 0) {
+                                GGML_LOG_ERROR("%s: %s (%s) cannot take device %zu's share of src%zu %s (%s): %" PRId64 " of %" PRId64
+                                    " along axis %d scales to %" PRId64 "/%" PRId64 " along axis %d\n", __func__, tensor->name,
+                                    ggml_op_desc(tensor), j, i, tensor->src[i]->name, ggml_op_desc(tensor->src[i]),
+                                    split_state.ne[j] / tensor->ne[split_state.axis], tensor->src[i]->ne[src_ss[i].axis], (int) src_ss[i].axis,
+                                    split_state.ne[j], div, (int) split_state.axis);
+                            }
                             GGML_ASSERT(split_state.ne[j] % div == 0);
                             split_state.ne[j] /= div;
                         }
@@ -2837,6 +2876,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
 
             if (!backend_allreduce_success) {
+                // GGML_META_LOG_FALLBACK: say why the backend's all-reduce declined, for the first 64 and then every
+                // 10000th, since the fallback copies every partial through this process
+                static const bool log_fallback = getenv("GGML_META_LOG_FALLBACK") != nullptr;
+                static std::atomic<uint64_t> n_fallbacks{0};
+                const uint64_t n = n_fallbacks.fetch_add(1, std::memory_order_relaxed);
+                if (log_fallback && (n < 64 || n % 10000 == 0)) {
+                    std::string why;
+                    for (size_t j = 0; j < n_backends; j++) {
+                        const ggml_cgraph * cg = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
+                        const ggml_tensor * node = cg->nodes[cg->n_nodes - 1];
+                        why += " " + std::to_string(j) + ":" + node->name + "(" + ggml_op_name(node->op) + "," +
+                               ggml_type_name(node->type) + ",ne=" + std::to_string(ggml_nelements(node)) +
+                               (ggml_is_contiguously_allocated(node) ? "" : ",strided") +
+                               ((node->flags & GGML_TENSOR_FLAG_COMPUTE) ? "" : ",disabled") + "," +
+                               (node->buffer ? ggml_backend_buffer_name(node->buffer) : "no buffer") + ")";
+                    }
+                    // stderr, since a host's log callback may drop ggml's messages (llama-server and llama-bench do)
+                    fprintf(stderr, "meta: all-reduce %" PRIu64 " (subgraph %zu of %zu) falls back:%s\n", n, i,
+                            backend_ctx->n_subgraphs, why.c_str());
+                }
                 const ggml_status status = allreduce_fallback(i);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;

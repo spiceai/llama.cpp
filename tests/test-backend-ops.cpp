@@ -25,6 +25,7 @@
 #include <array>
 #include <cfloat>
 #include <cinttypes>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -5756,6 +5757,22 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_W4A4";
+    }
+};
+
+// MUL_MAT_ID whose bandwidth counts only the bytes a decode reads: the experts the ids select (the expected number of
+// distinct experts over n tokens, each picking n_used distinct ones at random), the activations and the output, not all
+// n_mats experts as op_size does by default
+struct test_mul_mat_id_read : public test_mul_mat_id {
+    test_mul_mat_id_read(ggml_type type_a, ggml_type type_b, int n_mats, int n_used, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k) {}
+    size_t op_size(ggml_tensor * t) override {
+        const double experts = n_mats * (1.0 - std::pow(1.0 - (double) n_used / n_mats, (double) n));
+        return (size_t) (experts * t->src[0]->nb[2]) + ggml_nbytes(t->src[1]) + ggml_nbytes(t);
+    }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_READ";
     }
 };
 
@@ -12675,6 +12692,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int bs : {1, 2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
         }
+    }
+
+    // DeepSeek-V4.1 decode, one rank's share under a three-way tensor split: 384 experts, 6 used, gate/up 5120 -> 2304/3
+    // and down 2304/3 -> 5120, at the verify batch sizes of draft lengths 0 to 3 (and 8), in the GGUF's expert types and
+    // the candidates to replace them; the dense Q8_0 attention projections beside them
+    for (int bs : {1, 2, 3, 4, 8}) {
+        for (ggml_type type_a : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_MXFP4,
+                                 GGML_TYPE_IQ2_XS, GGML_TYPE_NVFP4, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
+                                 GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id_read(type_a, GGML_TYPE_F32, 384, 6, 768, bs, 5120));
+            test_cases.emplace_back(new test_mul_mat_id_read(type_a, GGML_TYPE_F32, 384, 6, 5120, bs, 768));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 11008, bs, 1280, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, bs, 2752, {1, 1}, {1, 1}));
     }
 
     // qwen3-30b-a3b

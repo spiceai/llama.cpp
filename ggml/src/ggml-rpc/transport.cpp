@@ -17,7 +17,10 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #  include <poll.h>
+#  include <sys/time.h>
 #endif
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +47,16 @@ typedef SOCKET sockfd_t;
 using ssize_t = __int64;
 #else
 typedef int sockfd_t;
+#endif
+
+// A send on a connection that is shut down (a mesh link that rpc_comm_async::release ends while the exchange thread is
+// sending on it) or that the peer reset fails with EPIPE, and must not raise SIGPIPE, whose default action ends the
+// server. MSG_NOSIGNAL suppresses it per send where it exists (Linux, recent macOS), SO_NOSIGPIPE per socket (macOS and
+// the BSDs, set_no_sigpipe); Windows raises no such signal.
+#ifdef MSG_NOSIGNAL
+static constexpr int RPC_SEND_FLAGS = MSG_NOSIGNAL;
+#else
+static constexpr int RPC_SEND_FLAGS = 0;
 #endif
 
 #ifdef GGML_RPC_RDMA
@@ -75,6 +88,14 @@ struct rdma_conn {
     int             rx_head = 0;
 
     uint32_t        max_inline = 0;
+
+    // sends posted by send_data_deferred and not yet completed, oldest first; completions of one queue pair arrive in
+    // order, so the oldest pending send is the one the next send completion retires
+    static constexpr int MAX_PENDING = 4;      // the queue pair's max_send_wr
+    bool            pend_tx[MAX_PENDING] = {}; // whether that send reads tx_buf
+    int             pend_head  = 0;
+    int             pend_count = 0;
+    bool            tx_busy    = false;        // a pending send still reads tx_buf
 
     uint8_t * rx_slot(int i) const {
         return static_cast<uint8_t *>(rx_buf) + static_cast<size_t>(i) * RDMA_CHUNK;
@@ -131,6 +152,8 @@ struct socket_t::impl {
     impl(sockfd_t fd) : use_rdma(false), fd(fd) {}
     ~impl();
     bool send_data(const void * data, size_t size);
+    bool send_data_deferred(const void * data, size_t size);
+    bool wait_sends();
     bool recv_data(void * data, size_t size);
     bool flush();
     void get_caps(uint8_t * local_caps);
@@ -144,6 +167,8 @@ struct socket_t::impl {
 #  else
     bool rdma_probe();
     bool rdma_send(const void * data, size_t size);
+    bool rdma_send_deferred(const void * data, size_t size);
+    bool rdma_reap_send();
     bool rdma_recv(void * data, size_t size);
     bool tcp_peer_closed();
     bool rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, const uint8_t * remote_gid);
@@ -156,7 +181,22 @@ struct socket_t::impl {
 #endif // GGML_RPC_RDMA
     bool     use_rdma;
     sockfd_t fd;
+    // set_recv_deadline: a TCP receive fails once it passes, however the data arrives
+    bool                                  has_recv_deadline = false;
+    std::chrono::steady_clock::time_point recv_deadline;
 };
+
+// SO_RCVTIMEO: a receive that waits longer than timeout_ms fails (0: no limit)
+static bool set_recv_timeout_ms(sockfd_t sockfd, int64_t timeout_ms) {
+#ifdef _WIN32
+    DWORD tv = (DWORD) timeout_ms;
+#else
+    struct timeval tv = {};
+    tv.tv_sec  = (time_t) (timeout_ms / 1000);
+    tv.tv_usec = (suseconds_t) ((timeout_ms % 1000) * 1000);
+#endif
+    return setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &tv, sizeof(tv)) == 0;
+}
 
 socket_t::impl::~impl() {
 #ifdef GGML_RPC_RDMA
@@ -474,8 +514,63 @@ bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc) {
     }
 }
 
+// retires the oldest deferred send: waits for its completion
+bool socket_t::impl::rdma_reap_send() {
+    rdma_conn * c = rdma.get();
+    struct ibv_wc wc;
+    if (!rdma_poll(c->scq, &wc)) return false;
+    if (c->pend_tx[c->pend_head]) {
+        c->tx_busy = false;
+    }
+    c->pend_head = (c->pend_head + 1) % rdma_conn::MAX_PENDING;
+    c->pend_count--;
+    return true;
+}
+
+// posts one message and returns before it completes; the completion is waited for when the queue or tx_buf is needed
+// again, or by the next blocking send. A failure of the posted send is reported by that later wait.
+bool socket_t::impl::rdma_send_deferred(const void * data, size_t size) {
+    rdma_conn * c = rdma.get();
+    if (size > RDMA_CHUNK) {
+        return rdma_send(data, size);
+    }
+    while (c->pend_count >= rdma_conn::MAX_PENDING) {
+        if (!rdma_reap_send()) return false;
+    }
+    struct ibv_sge sge = {};
+    struct ibv_send_wr wr = {}, * bad = nullptr;
+    wr.opcode  = IBV_WR_SEND;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    const bool inline_send = size <= c->max_inline;
+    if (inline_send) {
+        sge.addr   = (uintptr_t)data;
+        sge.length = size;
+        wr.send_flags |= IBV_SEND_INLINE;
+    } else {
+        while (c->tx_busy) {
+            if (!rdma_reap_send()) return false;
+        }
+        memcpy(c->tx_buf, data, size);
+        sge.addr   = (uintptr_t)c->tx_buf;
+        sge.length = size;
+        sge.lkey   = c->tx_mr->lkey;
+        c->tx_busy = true;
+    }
+    if (ibv_post_send(c->qp, &wr, &bad) != 0) return false;
+    c->last_active = std::chrono::steady_clock::now();
+    c->pend_tx[(c->pend_head + c->pend_count) % rdma_conn::MAX_PENDING] = !inline_send;
+    c->pend_count++;
+    return true;
+}
+
 bool socket_t::impl::rdma_send(const void * data, size_t size) {
     rdma_conn * c = rdma.get();
+    // a deferred send's completion would otherwise be taken for this one's
+    while (c->pend_count > 0) {
+        if (!rdma_reap_send()) return false;
+    }
     const uint8_t * src = (const uint8_t *)data;
     size_t rem = size;
     while (rem > 0) {
@@ -520,6 +615,12 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
 
         int slot = (int)wc.wr_id;
         size_t got = wc.byte_len;
+        // a message is delivered whole, so one longer than what is left of this read belongs to a read of another size:
+        // copying it would write past the caller's buffer
+        if (got > rem) {
+            LOG_ERROR("RDMA received a %zu-byte message for a read with %zu bytes left\n", got, rem);
+            return false;
+        }
         memcpy(dst, c->rx_slot(slot), got);
 
         if (!c->post_rx(slot)) return false;
@@ -533,6 +634,26 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
 #endif // !GGML_RPC_RDMA_APPLE (Linux RC transport)
 
 #endif // GGML_RPC_RDMA
+
+bool socket_t::impl::send_data_deferred(const void * data, size_t size) {
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
+    if (use_rdma) {
+        return rdma_send_deferred(data, size);
+    }
+#endif
+    return send_data(data, size);
+}
+
+bool socket_t::impl::wait_sends() {
+#if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
+    if (use_rdma) {
+        while (rdma->pend_count > 0) {
+            if (!rdma_reap_send()) return false;
+        }
+    }
+#endif
+    return true;
+}
 
 bool socket_t::impl::send_data(const void * data, size_t size) {
     LOG_DBG3("[%s] transport: %s, size: %s\n", __func__, use_rdma ? "RDMA" : "TCP", rpc_log_format_size(size).c_str());
@@ -548,7 +669,7 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
-        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
+        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, RPC_SEND_FLAGS);
         if (n < 0) {
             LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
                            bytes_sent, size_to_send);
@@ -573,6 +694,15 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
     size_t bytes_recv = 0;
     while (bytes_recv < size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
+        if (has_recv_deadline) {
+            // each recv() may wait only for what is left, so data that trickles in cannot carry a read past the deadline
+            const int64_t left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                recv_deadline - std::chrono::steady_clock::now()).count();
+            if (left <= 0 || !set_recv_timeout_ms(fd, left)) {
+                LOG_ERROR("recv failed: past its deadline (bytes_recv=%zu, size=%zu)\n", bytes_recv, size);
+                return false;
+            }
+        }
         ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, 0);
         if (n < 0) {
             LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
@@ -670,12 +800,29 @@ bool socket_t::send_data(const void * data, size_t size) {
     return pimpl->send_data(data, size);
 }
 
+bool socket_t::send_data_deferred(const void * data, size_t size) {
+    return pimpl->send_data_deferred(data, size);
+}
+
+bool socket_t::wait_sends() {
+    return pimpl->wait_sends();
+}
+
 bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
 }
 
 bool socket_t::flush() {
     return pimpl->flush();
+}
+
+// an RDMA receive notices too: it watches the TCP socket for a hang-up while it waits for a completion
+void socket_t::shutdown() {
+#ifdef _WIN32
+    if (pimpl->fd != INVALID_SOCKET) ::shutdown(pimpl->fd, SD_BOTH);
+#else
+    if (pimpl->fd >= 0) ::shutdown(pimpl->fd, SHUT_RDWR);
+#endif
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {
@@ -728,6 +875,16 @@ static bool set_no_delay(sockfd_t sockfd) {
     return ret == 0;
 }
 
+static bool set_no_sigpipe(sockfd_t sockfd) {
+#ifdef SO_NOSIGPIPE
+    int flag = 1;
+    return setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, (char *)&flag, sizeof(int)) == 0;
+#else
+    (void) sockfd;
+    return true;
+#endif
+}
+
 static bool set_reuse_addr(sockfd_t sockfd) {
     int flag = 1;
     int ret = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(int));
@@ -739,19 +896,58 @@ socket_ptr socket_t::accept() {
     if (!is_valid_fd(client_socket_fd)) {
         return nullptr;
     }
+    // owns the descriptor from here on, so every failure below closes it
+    auto owner = std::make_unique<impl>(client_socket_fd);
     if (!set_no_delay(client_socket_fd)) {
         LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
     }
+    if (!set_no_sigpipe(client_socket_fd)) {
+        LOG_ERROR("Failed to set SO_NOSIGPIPE\n");
+        return nullptr;
+    }
     LOG_DBG("[%s] accepted client connection\n", __func__);
-    return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
+    return socket_ptr(new socket_t(std::move(owner)));
 }
 
-socket_ptr socket_t::create_server(const char * host, int port) {
+socket_ptr socket_t::accept(int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (true) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+#ifdef _WIN32
+        WSAPOLLFD pfd = { pimpl->fd, POLLRDNORM, 0 };
+        const int r = WSAPoll(&pfd, 1, (int) std::max<int64_t>(0, left.count()));
+#else
+        struct pollfd pfd = { pimpl->fd, POLLIN, 0 };
+        const int r = poll(&pfd, 1, (int) std::max<int64_t>(0, left.count()));
+        if (r < 0 && errno == EINTR && left.count() > 0) {
+            continue;
+        }
+#endif
+        if (r <= 0) {
+            return nullptr;
+        }
+        return accept();
+    }
+}
+
+void socket_t::set_recv_deadline(std::chrono::steady_clock::time_point deadline) {
+    pimpl->has_recv_deadline = true;
+    pimpl->recv_deadline     = deadline;
+}
+
+bool socket_t::clear_recv_deadline() {
+    pimpl->has_recv_deadline = false;
+    return set_recv_timeout_ms(pimpl->fd, 0);
+}
+
+socket_ptr socket_t::create_server(const char * host, int port, int backlog) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (!is_valid_fd(sockfd)) {
         return nullptr;
     }
+    // owns the descriptor from here on, so every failure below closes it
+    auto owner = std::make_unique<impl>(sockfd);
     if (!set_reuse_addr(sockfd)) {
         LOG_ERROR("Failed to set SO_REUSEADDR\n");
         return nullptr;
@@ -768,11 +964,11 @@ socket_ptr socket_t::create_server(const char * host, int port) {
     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
         return nullptr;
     }
-    if (listen(sockfd, 1) < 0) {
+    if (listen(sockfd, backlog) < 0) {
         return nullptr;
     }
     LOG_DBG("[%s] listening on %s:%d\n", __func__, host, port);
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+    return socket_ptr(new socket_t(std::move(owner)));
 }
 
 socket_ptr socket_t::connect(const char * host, int port) {
@@ -780,8 +976,14 @@ socket_ptr socket_t::connect(const char * host, int port) {
     if (!is_valid_fd(sockfd)) {
         return nullptr;
     }
+    // owns the descriptor from here on, so a failed attempt (callers retry) does not leak it
+    auto owner = std::make_unique<impl>(sockfd);
     if (!set_no_delay(sockfd)) {
         LOG_ERROR("Failed to set TCP_NODELAY\n");
+        return nullptr;
+    }
+    if (!set_no_sigpipe(sockfd)) {
+        LOG_ERROR("Failed to set SO_NOSIGPIPE\n");
         return nullptr;
     }
     struct sockaddr_in addr;
@@ -797,7 +999,7 @@ socket_ptr socket_t::connect(const char * host, int port) {
         return nullptr;
     }
     LOG_DBG("[%s] connected to %s:%d\n", __func__, host, port);
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+    return socket_ptr(new socket_t(std::move(owner)));
 }
 
 #ifdef _WIN32

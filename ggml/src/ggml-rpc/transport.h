@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -14,13 +15,29 @@ struct socket_t {
     ~socket_t();
 
     bool send_data(const void * data, size_t size);
+    // Like send_data, but over RDMA it returns once the message is posted: its completion is waited for when this
+    // connection next needs the send queue or buffer, or by its next send_data or wait_sends, which also report a
+    // failure of it. The data may change as soon as it returns. Elsewhere it is send_data.
+    bool send_data_deferred(const void * data, size_t size);
+    // Waits until every send_data_deferred of this connection has completed; false when one of them failed. A no-op
+    // where send_data_deferred is send_data.
+    bool wait_sends();
     bool recv_data(void * data, size_t size);
     // Must be called at every message boundary: the RDMA transport coalesces
     // writes into fixed-size frames and posts the trailing partial frame only
     // here. No-op on TCP.
     bool flush();
+    // Ends the connection in both directions, so that a send or receive another thread is blocked in returns false.
+    // The socket stays open until it is destroyed.
+    void shutdown();
 
     socket_ptr accept();
+    // accept(), waiting at most timeout_ms for a connection; nullptr when none arrived in time
+    socket_ptr accept(int timeout_ms);
+    // From now on a receive fails once `deadline` has passed, however its data arrives, until clear_recv_deadline. TCP
+    // only; an RDMA receive ignores it.
+    void set_recv_deadline(std::chrono::steady_clock::time_point deadline);
+    bool clear_recv_deadline();
 
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
@@ -30,7 +47,8 @@ struct socket_t {
     bool wait_peer_closed(int timeout_ms);
     static bool detects_peer_close();
 
-    static socket_ptr create_server(const char * host, int port);
+    // backlog: how many connections may wait for accept()
+    static socket_ptr create_server(const char * host, int port, int backlog = 1);
     static socket_ptr connect(const char * host, int port);
 
 private:
