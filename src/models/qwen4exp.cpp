@@ -691,6 +691,13 @@ public:
         res &= n_kv              == idx->get_n_kv();
         res &= n_new             == mctx->get_n_kpool_new();
 
+        // DIAG (not for merge): with LLAMA_DEBUG_REUSE=1, name the comparison that refused, as llm_graph_result does
+        static const bool dbg = [] { const char * v = getenv("LLAMA_DEBUG_REUSE"); return v != nullptr && atoi(v) != 0; }();
+        if (dbg && !res) {
+            fprintf(stderr, "DBGREUSE kpool tok %u: n_pool %lld/%u n_kv %u/%u n_new %u/%u\n", params.ubatch.n_tokens,
+                    (long long) pool_cells->ne[0], mctx->get_n_kpool(), n_kv, idx->get_n_kv(), n_new, mctx->get_n_kpool_new());
+        }
+
         return res;
     }
 

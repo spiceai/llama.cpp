@@ -255,6 +255,10 @@ struct rpc_msg_get_tensor_2d_req {
 static constexpr uint32_t RPC_COMM_FLAG_NCCL     = 1u; // through NCCL when both servers can (GGML_RPC_COMM_NCCL=1)
 static constexpr uint32_t RPC_COMM_FLAG_WIRE_F32 = 2u; // host path: every partial as F32 (GGML_RPC_COMM_WIRE_F32=1)
 
+// the byte the two servers of a pair exchange once each has tried to initialize its NCCL communicator
+static constexpr uint8_t RPC_NCCL_INITED    = 1u; // this rank has a communicator
+static constexpr uint8_t RPC_NCCL_WIRE_BF16 = 2u; // and asks for the BF16 wire (GGML_NCCL_WIRE_BF16); a server that predates the wish sends 0 or 1
+
 struct rpc_msg_comm_init_req {
     uint32_t device;
     uint32_t rank;
@@ -1667,6 +1671,7 @@ private:
         void                  (*nccl_free)(void *) = nullptr;   // COMM_FREE: both ranks free the communicator together
         void                  (*nccl_abort)(void *) = nullptr;  // disconnect without COMM_FREE: the peer may not take part
         bool                    nccl_aborted = false;          // the communicator was aborted: all-reduces fail from now on
+        bool                    nccl_wire_bf16 = false;        // both ranks asked for the BF16 wire (GGML_NCCL_WIRE_BF16)
     };
 
     // guards nccl and nccl_aborted in comm_states, which abort_comms changes from the client watchdog thread
@@ -2486,6 +2491,8 @@ typedef void * (*rpc_nccl_comm_init_rank_t)(ggml_backend_t backend, const void *
 typedef void   (*rpc_nccl_comm_free_t)(void * comm);
 typedef void   (*rpc_nccl_comm_abort_t)(void * comm);
 typedef bool   (*rpc_nccl_allreduce_t)(ggml_backend_t backend, void * comm, ggml_tensor * t);
+typedef bool   (*rpc_nccl_wire_bf16_wanted_t)(void);
+typedef void   (*rpc_nccl_comm_set_wire_bf16_t)(void * comm, bool on);
 
 static void * rpc_backend_proc(ggml_backend_t backend, const char * name) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -2586,12 +2593,20 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
                 state.nccl = nccl;
             }
             // ncclCommInitRank can succeed on one rank and fail on the other, so the ranks agree on its result as
-            // well: unless both have a communicator, neither keeps one, and both copy through the host
-            uint8_t inited = nccl != nullptr;
-            uint8_t peer_inited = 0;
+            // well: unless both have a communicator, neither keeps one, and both copy through the host. The same byte
+            // carries this rank's wish for the BF16 wire (GGML_NCCL_WIRE_BF16, read by the backend): NCCL sums one
+            // datatype per collective, so the wire is BF16 only when both ranks asked for it, and a server that
+            // predates the wish never sets its bit, so a pair with one keeps the F32 wire with no further exchange
+            auto wanted   = (rpc_nccl_wire_bf16_wanted_t)   rpc_backend_proc(backend, "ggml_backend_cuda_nccl_wire_bf16_wanted");
+            auto set_wire = (rpc_nccl_comm_set_wire_bf16_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_set_wire_bf16");
+            const bool    inited      = nccl != nullptr;
+            const bool    wire_wanted = inited && wanted != nullptr && set_wire != nullptr && wanted();
+            const uint8_t word        = (inited ? RPC_NCCL_INITED : 0) | (wire_wanted ? RPC_NCCL_WIRE_BF16 : 0);
+            uint8_t peer_word = 0;
             const bool agreed = request.rank == 0 ?
-                state.peer->send_data(&inited, 1) && state.peer->flush() && state.peer->recv_data(&peer_inited, 1) :
-                state.peer->recv_data(&peer_inited, 1) && state.peer->send_data(&inited, 1) && state.peer->flush();
+                state.peer->send_data(&word, 1) && state.peer->flush() && state.peer->recv_data(&peer_word, 1) :
+                state.peer->recv_data(&peer_word, 1) && state.peer->send_data(&word, 1) && state.peer->flush();
+            const bool peer_inited = (peer_word & RPC_NCCL_INITED) != 0;
             if (!agreed || !peer_inited) {
                 std::lock_guard<std::mutex> lock(comm_mutex);
                 if (state.nccl != nullptr) {
@@ -2603,14 +2618,29 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
                 state.peer = nullptr;
                 return true;
             }
+            if (inited && peer_inited) {
+                const bool peer_wire = (peer_word & RPC_NCCL_WIRE_BF16) != 0;
+                if (wire_wanted != peer_wire) {
+                    LOG_WARN("[%s] device %u GGML_NCCL_WIRE_BF16 is set on %s rank of this pair, so the all-reduce wire stays F32 on both ranks; set it on every rank, or on none\n",
+                             __func__, request.device, wire_wanted ? "this rank but not the peer" : "the peer but not this");
+                }
+                std::lock_guard<std::mutex> lock(comm_mutex);
+                state.nccl_wire_bf16 = wire_wanted && peer_wire;
+                if (set_wire != nullptr) {
+                    set_wire(state.nccl, state.nccl_wire_bf16);
+                }
+            }
         }
         bool nccl_on;
+        bool nccl_wire_bf16;
         {
             // the client watchdog may abort the communicator at any time from here on
             std::lock_guard<std::mutex> lock(comm_mutex);
-            nccl_on = state.nccl != nullptr;
+            nccl_on        = state.nccl != nullptr;
+            nccl_wire_bf16 = state.nccl_wire_bf16;
         }
-        LOG_INFO("[%s] device %u NCCL all-reduce %s\n", __func__, request.device, nccl_on ? "on" : "unavailable, copying through the host");
+        LOG_INFO("[%s] device %u NCCL all-reduce %s\n", __func__, request.device,
+                 !nccl_on ? "unavailable, copying through the host" : nccl_wire_bf16 ? "on, BF16 wire for large F32 reductions" : "on");
     }
     LOG_INFO("[%s] device %u joined pairwise comm as rank %u\n", __func__, request.device, request.rank);
     response.ok = 1;
