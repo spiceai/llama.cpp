@@ -363,9 +363,11 @@ struct llama_memory_hybrid_idx_context::kpool_state {
 
 namespace {
 
-// The last padded pool is always unused.
+// The last padded pool is always unused. Pools are padded in step with the cells: 64 for every 256, see
+// llama_kv_pad_cells.
 uint32_t kpool_pad(uint32_t n_pool) {
-    return std::max<uint32_t>(64u, GGML_PAD(n_pool + 1, 64u));
+    const uint32_t step = 64u * (llama_kv_pad_cells() / 256u);
+    return std::max<uint32_t>(step, GGML_PAD(n_pool + 1, step));
 }
 
 // Rank of (pos, cell) in a sequence's cells sorted by position then cell, or -1 when absent.
