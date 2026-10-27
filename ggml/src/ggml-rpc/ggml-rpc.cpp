@@ -1772,6 +1772,65 @@ struct rpc_comm_async_deleter {
     void operator()(rpc_comm_async * async) const;
 };
 
+// The tensors of a graph being deserialized: an open-addressing index from a tensor's id to its position in the
+// request, and the tensor made for each position so far. Kept by the server across graphs, so deserializing one
+// allocates nothing here: std::unordered_map allocates a node per insert, and graph_compute filled two per graph, one
+// entry per tensor, for every graph the server had not stored.
+class rpc_graph_tensors {
+public:
+    // Indexes `n` tensors. Of several tensors with one id, the first is the one found.
+    void reset(const rpc_tensor * tensors, uint32_t n) {
+        size_t capacity = 64;
+        while (capacity < 2 * (size_t) n) {
+            capacity *= 2;
+        }
+        if (ids.size() < capacity) {
+            ids.resize(capacity);
+        }
+        slots.assign(capacity, 0);
+        made.assign(n, nullptr);
+        this->tensors = tensors;
+        for (uint32_t i = 0; i < n; i++) {
+            const uint64_t id = tensors[i].id;
+            size_t k = probe_start(id);
+            while (slots[k] != 0 && ids[k] != id) {
+                k = (k + 1) & (slots.size() - 1);
+            }
+            if (slots[k] == 0) {
+                ids[k]   = id;
+                slots[k] = i + 1;
+            }
+        }
+    }
+
+    // The position of the tensor with `id`, or -1 when the request has none.
+    int64_t find(uint64_t id) const {
+        for (size_t k = probe_start(id);; k = (k + 1) & (slots.size() - 1)) {
+            if (slots[k] == 0) {
+                return -1;
+            }
+            if (ids[k] == id) {
+                return (int64_t) slots[k] - 1;
+            }
+        }
+    }
+
+    const rpc_tensor * tensors = nullptr;
+    // the tensor made for each position, nullptr until it is made
+    std::vector<ggml_tensor *> made;
+
+private:
+    // a power of two in size, at most half full, so a probe always reaches an empty slot
+    std::vector<uint64_t> ids;
+    // a slot's position + 1, 0 for an empty slot
+    std::vector<uint32_t> slots;
+
+    size_t probe_start(uint64_t id) const {
+        // Fibonacci hashing of the id (the client's address of the tensor)
+        return (size_t) ((id * 0x9E3779B97F4A7C15ull) >> 32) & (slots.size() - 1);
+    }
+};
+
 class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
@@ -1818,10 +1877,9 @@ private:
     bool comm_failed(const char * func) const;
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
-    ggml_tensor * create_node(uint64_t id,
-                              struct ggml_context * ctx,
-                              const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
-                              std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map);
+    ggml_tensor * create_node(uint64_t id, struct ggml_context * ctx);
+    // the tensors of the graph graph_compute is deserializing
+    rpc_graph_tensors graph_tensors;
 
 
     // pairwise allreduce over a direct connection to the peer server
@@ -2496,19 +2554,15 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
     return true;
 }
 
-ggml_tensor * rpc_server::create_node(uint64_t id,
-                                      struct ggml_context * ctx,
-                                      const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
-                                      std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map) {
-    if (tensor_map.find(id) != tensor_map.end()) {
-        return tensor_map[id];
-    }
-    // Safely find the tensor pointer
-    auto it_ptr = tensor_ptrs.find(id);
-    if (it_ptr == tensor_ptrs.end()) {
+ggml_tensor * rpc_server::create_node(uint64_t id, struct ggml_context * ctx) {
+    const int64_t pos = graph_tensors.find(id);
+    if (pos < 0) {
         return nullptr;
     }
-    const rpc_tensor * tensor = it_ptr->second;
+    if (graph_tensors.made[pos] != nullptr) {
+        return graph_tensors.made[pos];
+    }
+    const rpc_tensor * tensor = &graph_tensors.tensors[pos];
 
     struct ggml_tensor * result = deserialize_tensor(ctx, tensor);
     if (result == nullptr) {
@@ -2518,13 +2572,13 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         LOG_ERROR("[%s] invalid data ptr\n", __func__);
         return nullptr;
     }
-    tensor_map[id] = result;
+    graph_tensors.made[pos] = result;
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         // Check if the source ID is 0 before calling create_node recursively
         if (tensor->src[i] == 0) {
             result->src[i] = nullptr;
         } else {
-            result->src[i] = create_node(tensor->src[i], ctx, tensor_ptrs, tensor_map);
+            result->src[i] = create_node(tensor->src[i], ctx);
             // If the recursive call failed for a non-zero ID, propagate the error
             if (result->src[i] == nullptr) {
                 LOG_ERROR("[%s] failed to create source node %d (src_id=%" PRIu64 ") for node id %" PRIu64 "\n",
@@ -2539,7 +2593,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
     if (tensor->view_src == 0) {
         result->view_src = nullptr;
     } else {
-        result->view_src = create_node(tensor->view_src, ctx, tensor_ptrs, tensor_map);
+        result->view_src = create_node(tensor->view_src, ctx);
         // If the recursive call failed for a non-zero ID, propagate the error
         if (result->view_src == nullptr) {
             LOG_ERROR("[%s] failed to create view_src node (view_src_id=%" PRIu64 ") for node id %" PRIu64 "\n",
@@ -2608,20 +2662,14 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     ggml_context * ctx = ctx_ptr.get();
     struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_nodes, false);
     graph->n_nodes = n_nodes;
-    std::unordered_map<uint64_t, const rpc_tensor*> tensor_ptrs;
-    tensor_ptrs.reserve(n_tensors);
-    for (uint32_t i = 0; i < n_tensors; i++) {
-        tensor_ptrs.emplace(tensors[i].id, &tensors[i]);
-    }
-    std::unordered_map<uint64_t, ggml_tensor*> tensor_map;
-    tensor_map.reserve(n_nodes);
+    graph_tensors.reset(tensors, n_tensors);
     // the compute itself is asynchronous, so building the graph is the only server-side cost
     // observable here - the round trip is timed on the client
     const auto t_deserialize = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < n_nodes; i++) {
         int64_t id;
         memcpy(&id, &nodes[i], sizeof(id));
-        graph->nodes[i] = create_node(id, ctx, tensor_ptrs, tensor_map);
+        graph->nodes[i] = create_node(id, ctx);
         // Check if create_node failed for a *non-zero* ID.
         // If id was 0, create_node returning nullptr is expected.
         // If id was non-zero and create_node returned nullptr, it indicates a deserialization error.
@@ -2632,7 +2680,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         if (graph->nodes[i] != nullptr) {
             LOG_DBG3("[%s] node %u: id=%" PRId64 ", %s\n", __func__, i, id, rpc_log_format_tensor(graph->nodes[i]).c_str());
             const size_t hash_pos = ggml_hash_insert(&graph->visited_hash_set, graph->nodes[i]);
-            graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
+            graph->use_counts[hash_pos] = graph_tensors.tensors[graph_tensors.find(id)].use_count;
         }
     }
     const std::chrono::duration<double, std::milli> deserialize_ms = std::chrono::steady_clock::now() - t_deserialize;
