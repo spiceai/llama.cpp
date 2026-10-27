@@ -291,8 +291,8 @@ struct rpc_comm_part_hdr {
 };
 static_assert(sizeof(rpc_comm_part_hdr) % sizeof(float) == 0, "the partial after the header must stay F32-aligned");
 
-// world > 2: partials up to this size fit every transport's buffering (TCP's send buffer, RDMA's 6 MiB receive ring), so
-// a rank sends to every peer before receiving; larger ones go pair by pair
+// world > 2: when every link is RDMA, partials up to this size fit each peer's receive ring, so a rank sends to every peer
+// before receiving; larger ones, and every partial of a mesh with a TCP link, go pair by pair (rpc_comm_mesh_eager)
 static constexpr size_t RPC_COMM_MESH_EAGER_BYTES = 1024 * 1024;
 
 struct rpc_msg_comm_init_rsp {
@@ -1799,6 +1799,7 @@ private:
         std::vector<std::vector<uint8_t>> parts;
         std::vector<float>                sum;
         uint64_t                          seq = 0;
+        bool                              mesh_eager = false; // every link is RDMA: small partials go to all peers at once
         // GGML_RPC_COMM_ASYNC: the all-reduces queued on the backend's stream, exchanged by a thread of their own
         std::unique_ptr<struct rpc_comm_async, rpc_comm_async_deleter> async;
     };
@@ -3004,6 +3005,18 @@ static std::string rpc_comm_best_link(const std::vector<rpc_comm_link> & ours, c
     return best;
 }
 
+// Whether a mesh may send small partials to every peer before receiving any: only when every link is RDMA, whose
+// receive ring takes a whole RPC_COMM_MESH_EAGER_BYTES partial without the peer reading. A TCP link buffers only its two
+// sockets' buffers, so ranks all sending first would each block on a peer that is sending too.
+static bool rpc_comm_mesh_eager(const std::vector<socket_ptr> & peers) {
+    for (const auto & peer : peers) {
+        if (peer != nullptr && strcmp(peer->transport_name(), "RDMA") != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Sends this rank's partial (`nbytes` at `own`) to every peer and receives theirs into `parts`, then sums all of them
 // in rank order into `sum`, so every rank holds the same bits. Each partial goes behind its rpc_comm_part_hdr, as a
 // separate message: the RDMA transport delivers messages whole, so a read must take exactly what one send wrote.
@@ -3028,8 +3041,11 @@ static bool rpc_comm_send_defer() {
     return mode == "1";
 }
 
+// `eager`: every link is RDMA (rpc_comm_mesh_eager), so a partial up to RPC_COMM_MESH_EAGER_BYTES may be sent to every
+// peer before any is received
 static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32_t rank, uint32_t world, uint64_t seq,
-                                   size_t nbytes, const uint8_t * own, std::vector<std::vector<uint8_t>> & parts, float * sum) {
+                                   size_t nbytes, const uint8_t * own, std::vector<std::vector<uint8_t>> & parts, float * sum,
+                                   bool eager) {
     const rpc_comm_part_hdr hdr = { seq, (uint64_t) nbytes };
     for (auto & part : parts) {
         if (part.size() < nbytes) {
@@ -3060,7 +3076,7 @@ static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32
         LOG_ERROR("[%s] rank %u lost rank %u during all-reduce %" PRIu64 "\n", __func__, rank, j, hdr.seq);
         return false;
     };
-    if (nbytes <= RPC_COMM_MESH_EAGER_BYTES) {
+    if (eager && nbytes <= RPC_COMM_MESH_EAGER_BYTES) {
         const bool defer = rpc_comm_send_defer();
         for (uint32_t j = 0; j < world; j++) {
             if (j != rank && !(defer ? send_part_deferred(j) : send_part(j))) {
@@ -3156,6 +3172,7 @@ struct rpc_comm_async {
     const std::vector<socket_ptr> * peers = nullptr;
     std::vector<std::vector<uint8_t>> * parts = nullptr;
     uint32_t rank = 0, world = 0;
+    bool     eager = false;
 
     ~rpc_comm_async() {
         release();
@@ -3243,7 +3260,7 @@ struct rpc_comm_async {
                 memset(out, 0, j.nbytes);
             }
             if (broken.load(std::memory_order_relaxed) ||
-                !rpc_comm_mesh_exchange(*peers, rank, world, j.seq, j.nbytes, out, *parts, in)) {
+                !rpc_comm_mesh_exchange(*peers, rank, world, j.seq, j.nbytes, out, *parts, in, eager)) {
                 // the stream is released either way, so it drains; what it copies back is NaN rather than an older
                 // sum, and the server drops the client before it returns any result
                 broken.store(true, std::memory_order_release);
@@ -3407,6 +3424,7 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
     state.wire_f32 = true;
     state.seq      = 0;
     state.parts.assign(world, {});
+    state.mesh_eager = rpc_comm_mesh_eager(state.peers);
     LOG_INFO("[%s] device %u joined a %u-rank mesh comm as rank %u\n", __func__, request.device, world, rank);
     return true;
 }
@@ -3449,7 +3467,7 @@ bool rpc_server::comm_allreduce_mesh(comm_state & state, ggml_backend_t backend,
         ggml_backend_tensor_get(t_dst, own.data(), 0, nbytes);
     }
     if (!rpc_comm_mesh_exchange(state.peers, state.rank, state.world, state.seq, nbytes, own.data(), state.parts,
-                                state.sum.data())) {
+                                state.sum.data(), state.mesh_eager)) {
         return false;
     }
     ggml_backend_tensor_set(t_dst, state.sum.data(), 0, nbytes);
@@ -3488,6 +3506,7 @@ bool rpc_server::comm_allreduce_mesh_async(comm_state & state, ggml_backend_t ba
         async->parts = &state.parts;
         async->rank  = state.rank;
         async->world = state.world;
+        async->eager = state.mesh_eager;
         async->start();
         state.async = std::move(async);
         LOG_INFO("[%s] rank %u queues its all-reduces on the device's stream\n", __func__, state.rank);
