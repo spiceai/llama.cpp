@@ -2225,6 +2225,15 @@ static void ggml_backend_meta_buffer_remake_simple_tensors(ggml_tensor * tensor)
     }
 }
 
+// GGML_META_GRAPH_SLOTS_KEEP=1: once graphs have come from more than one compute buffer, every split is built from
+// clones and stays parked under its buffer however long another buffer is used alone, for a context that keeps more
+// graph slots than two (LLAMA_GRAPH_SLOTS=N): its slots return after many computes of another, and a parked split lets
+// a graph the context reused skip the rebuild here too.
+static bool ggml_backend_meta_keep_slots() {
+    static const bool keep = getenv("GGML_META_GRAPH_SLOTS_KEEP") != nullptr;
+    return keep;
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -2241,7 +2250,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         } else {
             backend_ctx->active_buf = compute_buf;
         }
-    } else if (backend_ctx->computes_since_switch < ggml_backend_meta_context::GRAPH_SLOTS_IDLE &&
+    } else if (!ggml_backend_meta_keep_slots() &&
+            backend_ctx->computes_since_switch < ggml_backend_meta_context::GRAPH_SLOTS_IDLE &&
             ++backend_ctx->computes_since_switch == ggml_backend_meta_context::GRAPH_SLOTS_IDLE) {
         backend_ctx->parked.clear();
     }

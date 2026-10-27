@@ -369,6 +369,22 @@ private:
     ggml_backend_sched_ptr sched_alt;
     int                    sched_slot = 0;
     bool                   sched_slots_on = false; // the graph slots were on for the last ubatch (one decision per ubatch)
+    // LLAMA_GRAPH_SLOTS=N with N >= 3: N graph slots, each a scheduler holding the graph it last allocated. A ubatch
+    // whose graph a slot holds reuses it; any other is built in the least recently used slot. The active slot's
+    // scheduler is `sched` and its graph result gf_res_prev_active; the other slots are parked here.
+    struct graph_lru_slot {
+        ggml_backend_sched_ptr sched;                 // null while the slot is the active one
+        llm_graph_result_ptr   res;
+        llm_graph_result *     res_active = nullptr; // the result whose graph this slot's scheduler holds, while parked
+        uint64_t               last_used  = 0;
+    };
+    std::vector<graph_lru_slot> graph_lru;
+    int                         graph_lru_cur   = 0;
+    uint64_t                    graph_lru_clock = 0;
+    // the slot whose graph `ubatch` can reuse, else the least recently used one
+    int graph_lru_pick(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, llm_graph_type gtype);
+    // forgets every slot's graph, which none may reuse once the scheduler or the memory was reset
+    void graph_lru_forget();
     // whether a backend sampler attached to a sequence binds input tensors to the graph it is built into
     bool sampling_binds_inputs() const;
 

@@ -752,6 +752,16 @@ static bool llama_graph_slots_on() {
     return atoi(mode.c_str()) >= 2;
 }
 
+// LLAMA_GRAPH_SLOTS=N with N >= 3: the number of least-recently-used graph slots, else 0
+static int llama_graph_slots_lru() {
+    const std::string & mode = llama_graph_slots_mode();
+    if (mode.rfind("flag:", 0) == 0) {
+        return 0;
+    }
+    const int n = atoi(mode.c_str());
+    return n >= 3 ? std::min(n, 16) : 0;
+}
+
 static bool llama_graph_slots_all_outputs() {
     static const std::string mode = [] {
         const char * v = getenv("LLAMA_GRAPH_SLOTS_ALL_OUTPUTS");
@@ -782,7 +792,19 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     sched_alt.reset();
     sched_slot = 0;
     gf_res_prev_active_alt = nullptr;
-    if (graph_slots) {
+    graph_lru.clear();
+    graph_lru_cur   = 0;
+    graph_lru_clock = 0;
+    if (const int n_lru = llama_graph_slots_lru(); n_lru >= 3) {
+        // slot 0 starts active, with `sched`
+        graph_lru.resize(n_lru);
+        for (int i = 1; i < n_lru; i++) {
+            graph_lru[i].sched.reset(ggml_backend_sched_new(
+                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+            ggml_backend_sched_set_copy_callback(graph_lru[i].sched.get(), sched_copy_experts, this);
+            ggml_backend_sched_set_realloc_callback(graph_lru[i].sched.get(), sched_graph_realloc, this);
+        }
+    } else if (graph_slots) {
         sched_alt.reset(ggml_backend_sched_new(
                 backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
         ggml_backend_sched_set_copy_callback(sched_alt.get(), sched_copy_experts, this);
@@ -816,6 +838,7 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
     gf_res_prev_active_alt = nullptr;
+    graph_lru_forget();
 
     sched_new(max_nodes, cparams.pipeline_parallel);
 
@@ -1074,6 +1097,7 @@ bool llama_context::memory_update(bool optimize) {
         }
         gf_res_prev_active = nullptr;
         gf_res_prev_active_alt = nullptr;
+        graph_lru_forget();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1629,6 +1653,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const int64_t t_dt0 = g_decode_timing.on ? ggml_time_us() : 0;
 
+    if (!graph_lru.empty()) {
+        // a backend sampler that binds input tensors keeps one graph slot, as with LLAMA_GRAPH_SLOTS=2 below
+        sched_slots_on = !sampling_binds_inputs();
+        if (sched_slots_on) {
+            const int slot = graph_lru_pick(ubatch, mctx, gtype);
+            if (slot != graph_lru_cur) {
+                auto & cur  = graph_lru[graph_lru_cur];
+                auto & next = graph_lru[slot];
+                cur.sched          = std::move(sched);
+                cur.res_active     = gf_res_prev_active;
+                sched              = std::move(next.sched);
+                gf_res_prev_active = next.res_active;
+                next.res_active    = nullptr;
+                graph_lru_cur      = slot;
+                sched_slot         = slot;
+            }
+            graph_lru[graph_lru_cur].last_used = ++graph_lru_clock;
+        }
+    } else
     // with LLAMA_GRAPH_SLOTS=2 each graph slot has its own scheduler: switch to this ubatch's
     if (sched_alt) {
         // LLAMA_GRAPH_SLOTS_ALL_OUTPUTS=1 (or flag:<path>): the second slot holds only ubatches whose every token is an
@@ -2741,7 +2784,37 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
+int llama_context::graph_lru_pick(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, llm_graph_type gtype) {
+    int victim = -1;
+    for (int i = 0; i < (int) graph_lru.size(); i++) {
+        llm_graph_result * res = i == graph_lru_cur ? gf_res_prev_active : graph_lru[i].res_active;
+        if (res != nullptr && !graph_reuse_disable && res->can_reuse(graph_params(res, ubatch, mctx, gtype))) {
+            return i;
+        }
+        if (victim < 0 || graph_lru[i].last_used < graph_lru[victim].last_used) {
+            victim = i;
+        }
+    }
+    return victim;
+}
+
+void llama_context::graph_lru_forget() {
+    for (auto & slot : graph_lru) {
+        if (slot.res) {
+            slot.res->reset();
+        }
+        slot.res_active = nullptr;
+    }
+}
+
 llm_graph_result * llama_context::get_gf_res_prev() {
+    if (!graph_lru.empty()) {
+        auto & res = graph_lru[graph_lru_cur].res;
+        if (!res) {
+            res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+        }
+        return res.get();
+    }
     // with the graph slots on, one result per scheduler slot: a prompt's last chunk outputs a token but runs in the
     // first slot (LLAMA_GRAPH_SLOTS_ALL_OUTPUTS=1), and must not overwrite the verify graph the second slot holds
     auto & res = gf_res_prev[sched_alt && sched_slots_on ? sched_slot : (n_outputs > 0)];
@@ -2828,6 +2901,7 @@ ggml_cgraph * llama_context::graph_reserve(
     }
     gf_res_prev_active = nullptr;
     gf_res_prev_active_alt = nullptr;
+    graph_lru_forget();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -4071,6 +4145,7 @@ void llama_context::opt_epoch_iter(
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
             gf_res_prev_active = nullptr;
             gf_res_prev_active_alt = nullptr;
+            graph_lru_forget();
             res->reset();
 
             auto * gf = model.build_graph(gparams);
