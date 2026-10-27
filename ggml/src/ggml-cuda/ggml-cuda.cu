@@ -6307,10 +6307,12 @@ static bool ggml_backend_cuda_comm_can_stage(ggml_backend_t backend, std::atomic
     done->store(1u, std::memory_order_release);
     ready->store(0u, std::memory_order_release);
     CUstream stream = (CUstream) cuda_ctx->stream();
-    const bool queued =
-        cuStreamWaitValue32(stream, (CUdeviceptr) done_dev, 1, CU_STREAM_WAIT_VALUE_GEQ) == CUDA_SUCCESS &&
-        cuStreamWriteValue32(stream, (CUdeviceptr) ready_dev, 7, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS;
-    const bool ran = queued && cudaStreamSynchronize(cuda_ctx->stream()) == cudaSuccess;
+    const bool waits  = cuStreamWaitValue32(stream, (CUdeviceptr) done_dev, 1, CU_STREAM_WAIT_VALUE_GEQ) == CUDA_SUCCESS;
+    const bool writes = waits && cuStreamWriteValue32(stream, (CUdeviceptr) ready_dev, 7, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS;
+    // a queued wait reads `done` until the stream reaches it, so the stream drains before `done` is lowered below or the
+    // caller frees the flags, whether or not the write behind it was queued
+    const bool synced = waits && cudaStreamSynchronize(cuda_ctx->stream()) == cudaSuccess;
+    const bool ran    = writes && synced;
     (void) cudaGetLastError();
     const bool ok = ran && ready->load(std::memory_order_acquire) == 7u;
     done->store(0u, std::memory_order_release);

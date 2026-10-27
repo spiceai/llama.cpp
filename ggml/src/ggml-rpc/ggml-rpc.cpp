@@ -3614,7 +3614,23 @@ bool rpc_server::comm_free(const rpc_msg_comm_free_req & request) {
         return false;
     }
     comm_state & state = comm_states[request.device];
-    // the stream drains, and the exchange stops, before the connections they use close
+    // The all-reduces the client queued before COMM_FREE complete before the comm goes: the exchange thread keeps
+    // running while the stream drains, so their sums land. A comm with a failed all-reduce fails COMM_FREE, which drops
+    // the client, since resetting the state below would forget that this rank's results are not valid.
+    if (state.async != nullptr) {
+        if (state.async->flags != nullptr) {
+            ggml_backend_synchronize(backends[request.device]);
+            while (!state.async->idle()) {
+                std::this_thread::yield();
+            }
+        }
+        if (rpc_comm_async_broken(*state.async)) {
+            LOG_ERROR("[%s] device %u: an all-reduce failed, so this rank's results are not valid; dropping the client\n",
+                      __func__, request.device);
+            return false;
+        }
+    }
+    // nothing is queued any more; the exchange stops before the connections it uses close
     state.async.reset();
     if (!state.peers.empty()) {
         LOG_INFO("[%s] device %u: rank %u of the %u-rank mesh ran %" PRIu64 " all-reduces\n", __func__, request.device,
