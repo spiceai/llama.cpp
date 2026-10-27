@@ -3044,16 +3044,26 @@ static std::string rpc_comm_best_link(const std::vector<rpc_comm_link> & ours, c
     return best;
 }
 
-// Whether a mesh may send small partials to every peer before receiving any: only when every link is RDMA, whose
-// receive ring takes a whole RPC_COMM_MESH_EAGER_BYTES partial without the peer reading. A TCP link buffers only its two
-// sockets' buffers, so ranks all sending first would each block on a peer that is sending too.
+// Whether a mesh may send small partials to every peer before receiving any: only when every link is Linux RDMA, whose
+// 24-slot receive ring takes two exchanges of a RPC_COMM_MESH_EAGER_BYTES partial without the peer reading (and whose
+// reliable connection retries a send the ring cannot take yet). A TCP link buffers only its two sockets' buffers, so
+// ranks all sending first would each block on a peer that is sending too.
 static bool rpc_comm_mesh_eager(const std::vector<socket_ptr> & peers) {
+#ifdef GGML_RPC_RDMA_APPLE
+    // Apple's RDMA (transport-apple.cpp) posts 16 receive frames of a 128 KiB stride per connection and has no
+    // retransmission (UC). A rank can start the next exchange while a peer has not yet read its last partial, and two
+    // eager 1 MiB partials with their headers need about 20 frames, more than the peer has posted. The pair-by-pair
+    // exchange never sends a peer a partial before it has read the previous one.
+    GGML_UNUSED(peers);
+    return false;
+#else
     for (const auto & peer : peers) {
         if (peer != nullptr && strcmp(peer->transport_name(), "RDMA") != 0) {
             return false;
         }
     }
     return true;
+#endif
 }
 
 // Sends this rank's partial (`nbytes` at `own`) to every peer and receives theirs into `parts`, then sums all of them
