@@ -3321,9 +3321,20 @@ static bool rpc_comm_async_enabled() {
     return std::atoi(env) != 0;
 }
 
+// How long one rank may take to join the mesh. The client sends every rank its COMM_INIT before it reads any reply and
+// waits for all of them, so a rank that never joins (it could not bind its comm port, or its host is unreachable) must
+// make the others fail their COMM_INIT within this time, instead of waiting in accept() or in a handshake forever.
+static constexpr int RPC_COMM_MESH_INIT_TIMEOUT_MS = 30000;
+
 bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_state & state) {
     const uint32_t rank  = request.rank;
     const uint32_t world = request.world;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(RPC_COMM_MESH_INIT_TIMEOUT_MS);
+    // the milliseconds left before the deadline, at least 1 while any are, so a receive timeout never reads as "none"
+    auto left_ms = [&]() {
+        const int64_t left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        return left <= 0 ? 0 : (int) std::max<int64_t>(1, left);
+    };
     std::vector<socket_ptr> peers(world);
     socket_ptr srv;
     if (rank + 1 < world) {
@@ -3345,12 +3356,14 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
         bool chosen = false;
         // the lower rank may not be listening yet, or may drop a connection before the handshake ends: the whole
         // handshake is retried for a few seconds, and a rank that reconnects replaces its first connection there
-        for (int i = 0; i < 100 && peer == nullptr; i++) {
+        for (int i = 0; i < 100 && peer == nullptr && left_ms() > 0; i++) {
             if (i > 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
             socket_ptr attempt = socket_t::connect(host.c_str(), (int) (request.port + j));
-            if (attempt == nullptr) {
+            // the handshake's receives end at the deadline: whatever answers at that port may not be a rank of this
+            // mesh, or may stop answering
+            if (attempt == nullptr || !attempt->set_recv_timeout(left_ms())) {
                 continue;
             }
             const uint32_t word = rank | (chosen ? RPC_COMM_CHOSEN_LINK : 0u);
@@ -3386,6 +3399,9 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
                 continue;
             }
             attempt->update_caps(remote_caps);
+            if (!attempt->set_recv_timeout(0)) {
+                continue;
+            }
             peer = attempt;
         }
         if (peer == nullptr) {
@@ -3398,10 +3414,15 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
         peers[j] = peer;
     }
     for (uint32_t joined = 0; joined < world - 1 - rank; ) {
-        socket_ptr peer = srv->accept();
+        const int wait_ms = left_ms();
+        socket_ptr peer = wait_ms > 0 ? srv->accept(wait_ms) : nullptr;
         if (peer == nullptr) {
-            LOG_ERROR("[%s] rank %u failed to accept a higher rank\n", __func__, rank);
+            LOG_ERROR("[%s] rank %u: %u of the %u higher ranks joined within %d s, so the mesh comm is not initialized\n",
+                      __func__, rank, joined, world - 1 - rank, RPC_COMM_MESH_INIT_TIMEOUT_MS / 1000);
             return false;
+        }
+        if (!peer->set_recv_timeout(std::max(1, left_ms()))) {
+            continue;
         }
         uint32_t word = 0;
         if (!peer->recv_data(&word, sizeof(word))) {
@@ -3437,6 +3458,9 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
             continue;
         }
         peer->update_caps(remote_caps);
+        if (!peer->set_recv_timeout(0)) {
+            continue;
+        }
         LOG_INFO("[%s] device %u: rank %u accepted rank %u over %s\n", __func__, request.device, rank, peer_rank,
                  peer->transport_name());
         if (peers[peer_rank] == nullptr) {

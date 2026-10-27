@@ -17,7 +17,10 @@
 #  include <netdb.h>
 #  include <unistd.h>
 #  include <poll.h>
+#  include <sys/time.h>
 #endif
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +47,16 @@ typedef SOCKET sockfd_t;
 using ssize_t = __int64;
 #else
 typedef int sockfd_t;
+#endif
+
+// A send on a connection that is shut down (a mesh link that rpc_comm_async::release ends while the exchange thread is
+// sending on it) or that the peer reset fails with EPIPE, and must not raise SIGPIPE, whose default action ends the
+// server. MSG_NOSIGNAL suppresses it per send where it exists (Linux, recent macOS), SO_NOSIGPIPE per socket (macOS and
+// the BSDs, set_no_sigpipe); Windows raises no such signal.
+#ifdef MSG_NOSIGNAL
+static constexpr int RPC_SEND_FLAGS = MSG_NOSIGNAL;
+#else
+static constexpr int RPC_SEND_FLAGS = 0;
 #endif
 
 #ifdef GGML_RPC_RDMA
@@ -641,7 +654,7 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
-        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
+        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, RPC_SEND_FLAGS);
         if (n < 0) {
             LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
                            bytes_sent, size_to_send);
@@ -838,6 +851,16 @@ static bool set_no_delay(sockfd_t sockfd) {
     return ret == 0;
 }
 
+static bool set_no_sigpipe(sockfd_t sockfd) {
+#ifdef SO_NOSIGPIPE
+    int flag = 1;
+    return setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, (char *)&flag, sizeof(int)) == 0;
+#else
+    (void) sockfd;
+    return true;
+#endif
+}
+
 static bool set_reuse_addr(sockfd_t sockfd) {
     int flag = 1;
     int ret = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(int));
@@ -849,12 +872,50 @@ socket_ptr socket_t::accept() {
     if (!is_valid_fd(client_socket_fd)) {
         return nullptr;
     }
+    // owns the descriptor from here on, so every failure below closes it
+    auto owner = std::make_unique<impl>(client_socket_fd);
     if (!set_no_delay(client_socket_fd)) {
         LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
     }
+    if (!set_no_sigpipe(client_socket_fd)) {
+        LOG_ERROR("Failed to set SO_NOSIGPIPE\n");
+        return nullptr;
+    }
     LOG_DBG("[%s] accepted client connection\n", __func__);
-    return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
+    return socket_ptr(new socket_t(std::move(owner)));
+}
+
+socket_ptr socket_t::accept(int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (true) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+#ifdef _WIN32
+        WSAPOLLFD pfd = { pimpl->fd, POLLRDNORM, 0 };
+        const int r = WSAPoll(&pfd, 1, (int) std::max<int64_t>(0, left.count()));
+#else
+        struct pollfd pfd = { pimpl->fd, POLLIN, 0 };
+        const int r = poll(&pfd, 1, (int) std::max<int64_t>(0, left.count()));
+        if (r < 0 && errno == EINTR && left.count() > 0) {
+            continue;
+        }
+#endif
+        if (r <= 0) {
+            return nullptr;
+        }
+        return accept();
+    }
+}
+
+bool socket_t::set_recv_timeout(int timeout_ms) {
+#ifdef _WIN32
+    DWORD tv = (DWORD) timeout_ms;
+#else
+    struct timeval tv = {};
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+#endif
+    return setsockopt(pimpl->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &tv, sizeof(tv)) == 0;
 }
 
 socket_ptr socket_t::create_server(const char * host, int port, int backlog) {
@@ -896,6 +957,10 @@ socket_ptr socket_t::connect(const char * host, int port) {
     auto owner = std::make_unique<impl>(sockfd);
     if (!set_no_delay(sockfd)) {
         LOG_ERROR("Failed to set TCP_NODELAY\n");
+        return nullptr;
+    }
+    if (!set_no_sigpipe(sockfd)) {
+        LOG_ERROR("Failed to set SO_NOSIGPIPE\n");
         return nullptr;
     }
     struct sockaddr_in addr;

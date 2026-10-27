@@ -31,6 +31,10 @@ struct socket_t {
     void shutdown();
 
     socket_ptr accept();
+    // accept(), waiting at most timeout_ms for a connection; nullptr when none arrived in time
+    socket_ptr accept(int timeout_ms);
+    // A receive that waits longer than timeout_ms fails (0: no limit). TCP only; an RDMA receive ignores it.
+    bool set_recv_timeout(int timeout_ms);
 
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);

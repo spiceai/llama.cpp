@@ -22,6 +22,12 @@ if (LLAMA_BUILD_TESTS AND UNIX AND NOT GGML_BACKEND_DL)
             $<TARGET_FILE:ggml-rpc-server>
             $<TARGET_FILE:test-rpc-comm-mesh>)
     set_property(TEST test-rpc-comm-mesh PROPERTY LABELS main)
+
+    add_executable(test-rpc-transport ${PROJECT_SOURCE_DIR}/tests/test-rpc-transport.cpp)
+    target_link_libraries(test-rpc-transport PRIVATE ggml-rpc)
+    target_include_directories(test-rpc-transport PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    add_test(NAME test-rpc-transport COMMAND $<TARGET_FILE:test-rpc-transport>)
+    set_property(TEST test-rpc-transport PROPERTY LABELS main)
 endif()
 
 if(LLAMA_TOOLS_INSTALL)
