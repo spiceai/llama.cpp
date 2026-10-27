@@ -13,6 +13,11 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+// The cells n_kv is padded to: 256, or LLAMA_KV_PAD rounded up to a power of two. A graph is built for one n_kv, so a
+// context that grows past a padding boundary rebuilds every graph it holds; a larger pad crosses one less often, at
+// the cost of attending over up to pad - 1 masked cells.
+uint32_t llama_kv_pad_cells();
+
 //
 // llama_kv_cache
 //
