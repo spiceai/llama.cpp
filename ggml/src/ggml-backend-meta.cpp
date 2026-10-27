@@ -2183,17 +2183,56 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     }
 }
 
+// Reads what ggml_backend_meta_buffer_get_tensor reads, with each device's part queued on that device's backend.
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(split_state.n_segments == 1);
-    GGML_ASSERT(split_state.nr[0]      == 1);
     if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && ggml_backend_meta_is_gather(tensor)) {
         // a gather is all-reduced in place after the graph computing it, whole on every device
         split_state.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    }
+    GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        GGML_ASSERT(split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1);
+        GGML_ASSERT(split_state.nr[0] != 0);
+        GGML_ASSERT(tensor->ne[3] == 1);
+        GGML_ASSERT(split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 || tensor->ne[2] == 1);
+
+        // rows are the next dimension up from the split axis
+        const int     row_dim    = split_state.axis + 1;
+        const size_t  row_stride = tensor->nb[row_dim];
+        GGML_ASSERT(offset % row_stride == 0);
+        GGML_ASSERT(size   % row_stride == 0);
+        const int64_t row_start = offset / row_stride;
+        const int64_t row_count = size   / row_stride;
+        GGML_ASSERT(row_start + row_count <= tensor->ne[row_dim]);
+        const int64_t blck_size = ggml_blck_size(tensor->type);
+
+        size_t offset_data = 0;
+        std::vector<size_t> simple_offsets(n_backends, 0);
+        for (size_t s = 0; s < split_state.n_segments; s++) {
+            for (size_t r = 0; r < split_state.nr[s]; r++) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                    size_t nbytes;
+                    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+                        GGML_ASSERT(split_state.ne[s*n_backends + j] % blck_size == 0);
+                        nbytes = split_state.ne[s*n_backends + j]/blck_size * tensor->nb[0];
+                    } else {
+                        nbytes = split_state.ne[s*n_backends + j] * tensor->nb[1];
+                    }
+                    ggml_backend_tensor_get_2d_async(ggml_backend_meta_simple_backend(backend, j), simple_tensor,
+                        (char *) data + offset_data, simple_offsets[j] + row_start * simple_tensor->nb[row_dim], nbytes,
+                        row_count, simple_tensor->nb[row_dim], tensor->nb[row_dim]);
+                    offset_data       += nbytes;
+                    simple_offsets[j] += nbytes;
+                }
+            }
+        }
+        GGML_ASSERT(offset_data*row_count == size);
+        return;
     }
 
     switch (split_state.axis) {
@@ -2214,8 +2253,8 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
                 if (chunk_size_j == 0) {
                     continue;
                 }
-                ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_j, offset, chunk_size_j,
-                    i_stop - i_start, chunk_size_j, chunk_size_full);
+                ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_j, i_start * chunk_size_j,
+                    chunk_size_j, i_stop - i_start, chunk_size_j, chunk_size_full);
                 offset_j += chunk_size_j;
             }
             GGML_ASSERT(offset_j == chunk_size_full);
