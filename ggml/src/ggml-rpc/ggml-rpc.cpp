@@ -2975,6 +2975,10 @@ struct rpc_comm_link {
 // the first word a connecting rank sends: its rank, with this bit when it connects over a link already chosen
 static constexpr uint32_t RPC_COMM_CHOSEN_LINK = 0x80000000u;
 
+// the most links a rank sends, and the most a connecting rank reads: a host with more (many VLANs or address aliases)
+// sends its fastest ones
+static constexpr uint32_t RPC_COMM_MAX_LINKS = 64;
+
 static std::vector<rpc_comm_link> rpc_comm_local_links() {
     std::vector<rpc_comm_link> links;
 #if !defined(_WIN32)
@@ -3002,6 +3006,11 @@ static std::vector<rpc_comm_link> rpc_comm_local_links() {
     }
     freeifaddrs(ifs);
 #endif
+    if (links.size() > RPC_COMM_MAX_LINKS) {
+        std::stable_sort(links.begin(), links.end(),
+                         [](const rpc_comm_link & a, const rpc_comm_link & b) { return a.speed > b.speed; });
+        links.resize(RPC_COMM_MAX_LINKS);
+    }
     return links;
 }
 
@@ -3372,7 +3381,7 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
             }
             if (!chosen) {
                 uint32_t n_links = 0;
-                if (!attempt->recv_data(&n_links, sizeof(n_links)) || n_links > 64) {
+                if (!attempt->recv_data(&n_links, sizeof(n_links)) || n_links > RPC_COMM_MAX_LINKS) {
                     continue;
                 }
                 std::vector<rpc_comm_link> their_links(n_links);
