@@ -19,6 +19,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <mutex>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -219,7 +220,9 @@ static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t me
 ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) {
     GGML_ASSERT(n_devs <= GGML_BACKEND_META_MAX_DEVICES);
-    // TODO: this is not thread-safe - needs to be fixed
+    // models load on threads of their own, so two can ask for a meta device at once; the registry's entries are
+    // std::map nodes, stable under insertion, so a returned pointer stays valid after the lock is released
+    static std::mutex                                                             mutex;
     static std::vector<std::unique_ptr<ggml_backend_meta_device_context>>         ctxs;
     static std::map<ggml_backend_meta_device_context, struct ggml_backend_device> meta_devs;
 
@@ -230,6 +233,7 @@ ggml_backend_dev_t ggml_backend_meta_device(
     }
     ggml_backend_meta_device_context ctx(simple_devs, get_split_state, get_split_state_ud);
 
+    std::lock_guard<std::mutex> lock(mutex);
     {
         auto it = meta_devs.find(ctx);
         if (it != meta_devs.end()) {
@@ -352,8 +356,15 @@ bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
 }
 
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_backend_dev_t dev) {
-    static std::map<ggml_backend_dev_t, struct ggml_backend_buffer_type> meta_bufts;
+    // two contexts of one device can ask for its buffer type at once, as a model and its drafter loading on threads of
+    // their own do; the entries are std::map nodes, stable under insertion, so a returned pointer outlives the lock.
+    // The registry owns each buffer type's context, as the meta-device registry owns its device contexts, so they are
+    // freed at exit instead of leaking (LeakSanitizer reports them otherwise).
+    static std::mutex                                                           mutex;
+    static std::vector<std::unique_ptr<ggml_backend_meta_buffer_type_context>> ctxs;
+    static std::map<ggml_backend_dev_t, struct ggml_backend_buffer_type>        meta_bufts;
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    std::lock_guard<std::mutex> lock(mutex);
     {
         auto it = meta_bufts.find(dev);
         if (it != meta_bufts.end()) {
@@ -367,12 +378,12 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
     for (size_t i = 0; i < n_devs; i++) {
         simple_bufts.push_back(ggml_backend_dev_buffer_type(ggml_backend_meta_dev_simple_dev(dev, i)));
     }
-    ggml_backend_meta_buffer_type_context * buft_ctx = new ggml_backend_meta_buffer_type_context(simple_bufts);
+    ctxs.push_back(std::make_unique<ggml_backend_meta_buffer_type_context>(simple_bufts));
 
     struct ggml_backend_buffer_type meta_buft = {
         /*iface  =*/ ggml_backend_meta_buffer_type_iface,
         /*device =*/ dev,
-        /*ctx    =*/ buft_ctx,
+        /*ctx    =*/ ctxs.back().get(),
     };
     auto result = meta_bufts.emplace(dev, meta_buft);
     return &result.first->second;
@@ -492,8 +503,13 @@ struct ggml_backend_meta_buffer_context {
     }
 };
 
+// a meta backend keeps one graph split per compute buffer (graph slots, below); a buffer that is freed, as when
+// a scheduler is recreated, takes its split with it
+static void ggml_backend_meta_forget_buffer(ggml_backend_buffer_t buffer);
+
 static void ggml_backend_meta_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
+    ggml_backend_meta_forget_buffer(buffer);
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     delete buf_ctx;
 }
@@ -1994,6 +2010,9 @@ struct ggml_backend_meta_context {
     ggml_backend_buffer_t                                 active_buf = nullptr;
     std::unordered_map<ggml_backend_buffer_t, graph_slot> parked;
     int                                                   computes_since_switch = GRAPH_SLOTS_IDLE;
+    // guards active_buf, parked and computes_since_switch: the compute path selects the slot on this context's own
+    // thread, while forget_buffer runs on the thread freeing a buffer, which can be another context's compute thread
+    std::mutex                                            slots_mutex;
 
     void swap_with(graph_slot & s) {
         s.cgraphs.resize(backend_configs.size());
@@ -2013,7 +2032,19 @@ struct ggml_backend_meta_context {
         std::swap(cloned,        s.cloned);
     }
 
-    // makes the split kept for compute buffer buf the active one, parking the active split under its own buffer
+    // drops what is kept for a compute buffer that is being freed: its parked split, or the active split's claim
+    // on it, so a recreated scheduler's buffers never find a stale split under a reused address and the parked
+    // splits never outlive their buffers
+    void forget_buffer(ggml_backend_buffer_t buf) {
+        std::lock_guard<std::mutex> lock(slots_mutex);
+        parked.erase(buf);
+        if (active_buf == buf) {
+            active_buf = nullptr;
+        }
+    }
+
+    // makes the split kept for compute buffer buf the active one, parking the active split under its own buffer;
+    // called with slots_mutex held
     void select_slot(ggml_backend_buffer_t buf) {
         if (buf == active_buf) {
             return;
@@ -2029,7 +2060,15 @@ struct ggml_backend_meta_context {
         active_buf = buf;
     }
 
+    // every live meta backend, so a buffer being freed can drop the split kept for it (ggml_backend_meta_forget_buffer)
+    static std::mutex & live_mutex() { static std::mutex m; return m; }
+    static std::unordered_set<ggml_backend_meta_context *> & live() { static std::unordered_set<ggml_backend_meta_context *> s; return s; }
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
+        {
+            std::lock_guard<std::mutex> lock(live_mutex());
+            live().insert(this);
+        }
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
         name = "Meta(";
@@ -2063,6 +2102,10 @@ struct ggml_backend_meta_context {
     }
 
     ~ggml_backend_meta_context() {
+        {
+            std::lock_guard<std::mutex> lock(live_mutex());
+            live().erase(this);
+        }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2079,6 +2122,13 @@ static const char * ggml_backend_meta_get_name(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_meta(backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) backend->context;
     return backend_ctx->name.c_str();
+}
+
+static void ggml_backend_meta_forget_buffer(ggml_backend_buffer_t buffer) {
+    std::lock_guard<std::mutex> lock(ggml_backend_meta_context::live_mutex());
+    for (ggml_backend_meta_context * backend_ctx : ggml_backend_meta_context::live()) {
+        backend_ctx->forget_buffer(buffer);
+    }
 }
 
 static void ggml_backend_meta_free(ggml_backend_t backend) {
@@ -2234,18 +2284,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // park the active split under its buffer and activate that buffer's. Either it is the split of this graph, which its
     // scheduler reused, or that scheduler allocated this graph since, and the split gets rebuilt.
     ggml_backend_buffer_t compute_buf = ggml_backend_meta_graph_compute_buffer(cgraph);
-    if (compute_buf != nullptr && compute_buf != backend_ctx->active_buf) {
-        if (backend_ctx->active_buf != nullptr) {
-            backend_ctx->select_slot(compute_buf);
-            backend_ctx->computes_since_switch = 0;
-        } else {
-            backend_ctx->active_buf = compute_buf;
+    bool graph_slots;
+    {
+        std::lock_guard<std::mutex> lock(backend_ctx->slots_mutex);
+        if (compute_buf != nullptr && compute_buf != backend_ctx->active_buf) {
+            if (backend_ctx->active_buf != nullptr) {
+                backend_ctx->select_slot(compute_buf);
+                backend_ctx->computes_since_switch = 0;
+            } else {
+                backend_ctx->active_buf = compute_buf;
+            }
+        } else if (backend_ctx->computes_since_switch < ggml_backend_meta_context::GRAPH_SLOTS_IDLE &&
+                ++backend_ctx->computes_since_switch == ggml_backend_meta_context::GRAPH_SLOTS_IDLE) {
+            backend_ctx->parked.clear();
         }
-    } else if (backend_ctx->computes_since_switch < ggml_backend_meta_context::GRAPH_SLOTS_IDLE &&
-            ++backend_ctx->computes_since_switch == ggml_backend_meta_context::GRAPH_SLOTS_IDLE) {
-        backend_ctx->parked.clear();
+        graph_slots = backend_ctx->computes_since_switch < ggml_backend_meta_context::GRAPH_SLOTS_IDLE;
     }
-    const bool graph_slots = backend_ctx->computes_since_switch < ggml_backend_meta_context::GRAPH_SLOTS_IDLE;
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     // A split built before graphs came from several buffers points into the rotating compute containers, so while they

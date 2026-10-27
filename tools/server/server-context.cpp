@@ -2135,6 +2135,10 @@ private:
             }
             slot.smpl_greedy_key = greedy_key;
 
+            // common_sampler_init turns backend sampling off for a chain it builds with a grammar or a reasoning
+            // budget, which the backend cannot sample, so the decision made before it is checked again here
+            use_backend_sampling &= task.params.sampling.backend_sampling;
+
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
                 // a kept chain that is still attached stays as it is: setting it again would make the context reserve
