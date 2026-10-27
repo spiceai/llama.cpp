@@ -334,6 +334,9 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-conv-1d.cpp LINK ggml)
     llama_build_and_test(test-gelu-quick.cpp LINK ggml)
     llama_build_and_test(test-dsv4-hc-weights.cpp LINK ggml)
+    # drives the meta backend's graph slots from two backends on two threads; a race detector is its real judge
+    llama_build_and_test(test-meta-graph-slots.cpp LINK ggml)
+    target_include_directories(test-meta-graph-slots PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 endif()
 
 # libmtmd
