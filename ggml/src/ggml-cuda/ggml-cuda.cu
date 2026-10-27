@@ -6220,6 +6220,14 @@ static bool ggml_backend_cuda_nccl_allreduce(ggml_backend_t backend, void * comm
 // from `in`. A thread of the RPC server exchanges the partials between the two signals, so the stream never drains and
 // the next subgraph is already queued behind the wait. `out`, `in`, `ready` and `done` are host memory from
 // ggml_backend_cuda_comm_host_alloc; ggml_backend_cuda_comm_can_stage says once whether the device can do this.
+// The stream signals and waits through the CUDA driver API (cuStreamWriteValue32, cuStreamWaitValue32), which the HIP
+// and MUSA builds do not map and a GGML_CUDA_NO_VMM build does not link; there the backend does not export these, and
+// the RPC server waits for the stream instead.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
+#define GGML_CUDA_COMM_STAGE
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
+
+#ifdef GGML_CUDA_COMM_STAGE
 static void * ggml_backend_cuda_comm_host_alloc(size_t size) {
     void * ptr = nullptr;
     if (cudaHostAlloc(&ptr, size, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
@@ -6236,27 +6244,33 @@ static void ggml_backend_cuda_comm_host_free(void * ptr) {
     }
 }
 
-// whether the stream can signal and wait on host memory: waits on a flag already set, signals another, and checks it
-static bool ggml_backend_cuda_comm_can_stage(ggml_backend_t backend, uint32_t * ready, uint32_t * done) {
+// whether the stream can signal and wait on host memory: waits on a flag already set, signals another, and checks it.
+// The flags are std::atomic objects in host memory from ggml_backend_cuda_comm_host_alloc, which the stream writes and
+// waits on as plain 32-bit words.
+static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) && std::atomic<uint32_t>::is_always_lock_free,
+              "the stream writes and waits on each flag as a plain 32-bit word");
+
+static bool ggml_backend_cuda_comm_can_stage(ggml_backend_t backend, std::atomic<uint32_t> * ready, std::atomic<uint32_t> * done) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
     void * ready_dev = nullptr;
     void * done_dev  = nullptr;
-    if (cudaHostGetDevicePointer(&ready_dev, ready, 0) != cudaSuccess || cudaHostGetDevicePointer(&done_dev, done, 0) != cudaSuccess) {
+    if (cudaHostGetDevicePointer(&ready_dev, (void *) ready, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer(&done_dev, (void *) done, 0) != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
     }
-    __atomic_store_n(done, 1u, __ATOMIC_RELEASE);
-    __atomic_store_n(ready, 0u, __ATOMIC_RELEASE);
+    done->store(1u, std::memory_order_release);
+    ready->store(0u, std::memory_order_release);
     CUstream stream = (CUstream) cuda_ctx->stream();
     const bool queued =
         cuStreamWaitValue32(stream, (CUdeviceptr) done_dev, 1, CU_STREAM_WAIT_VALUE_GEQ) == CUDA_SUCCESS &&
         cuStreamWriteValue32(stream, (CUdeviceptr) ready_dev, 7, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS;
     const bool ran = queued && cudaStreamSynchronize(cuda_ctx->stream()) == cudaSuccess;
     (void) cudaGetLastError();
-    const bool ok = ran && __atomic_load_n(ready, __ATOMIC_ACQUIRE) == 7u;
-    __atomic_store_n(done, 0u, __ATOMIC_RELEASE);
-    __atomic_store_n(ready, 0u, __ATOMIC_RELEASE);
+    const bool ok = ran && ready->load(std::memory_order_acquire) == 7u;
+    done->store(0u, std::memory_order_release);
+    ready->store(0u, std::memory_order_release);
     return ok;
 }
 
@@ -6280,12 +6294,13 @@ static unsigned int ggml_backend_cuda_comm_wait_flags(int device) {
 }
 
 static bool ggml_backend_cuda_comm_stage(ggml_backend_t backend, ggml_tensor * t, void * out, const void * in,
-                                         uint32_t * ready, uint32_t * done, uint32_t seq) {
+                                         std::atomic<uint32_t> * ready, std::atomic<uint32_t> * done, uint32_t seq) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
     void * ready_dev = nullptr;
     void * done_dev  = nullptr;
-    if (cudaHostGetDevicePointer(&ready_dev, ready, 0) != cudaSuccess || cudaHostGetDevicePointer(&done_dev, done, 0) != cudaSuccess) {
+    if (cudaHostGetDevicePointer(&ready_dev, (void *) ready, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer(&done_dev, (void *) done, 0) != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
     }
@@ -6298,9 +6313,11 @@ static bool ggml_backend_cuda_comm_stage(ggml_backend_t backend, ggml_tensor * t
     CUDA_CHECK(cudaMemcpyAsync(t->data, in, nbytes, cudaMemcpyHostToDevice, stream));
     return true;
 }
+#endif // GGML_CUDA_COMM_STAGE
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#ifdef GGML_CUDA_COMM_STAGE
     if (strcmp(name, "ggml_backend_cuda_comm_host_alloc") == 0) {
         return (void *)ggml_backend_cuda_comm_host_alloc;
     }
@@ -6313,6 +6330,7 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_comm_stage") == 0) {
         return (void *)ggml_backend_cuda_comm_stage;
     }
+#endif // GGML_CUDA_COMM_STAGE
 #ifdef GGML_USE_NCCL
     if (strcmp(name, "ggml_backend_cuda_nccl_unique_id") == 0) {
         return (void *)ggml_backend_cuda_nccl_unique_id;

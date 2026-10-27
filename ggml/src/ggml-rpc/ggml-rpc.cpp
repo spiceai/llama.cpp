@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <limits>
 #include <atomic>
+#include <new>
 #if !defined(_WIN32)
 #  include <arpa/inet.h>
 #  include <ifaddrs.h>
@@ -3090,11 +3091,25 @@ static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32
 // memory, signals `ready` and waits on `done`; this thread exchanges and sums the partials and signals `done`, so the
 // server thread never waits for the stream and the next subgraph is already queued behind the wait. Only for a backend
 // that exports ggml_backend_cuda_comm_stage (CUDA) and whose device can wait on host memory.
+// The flags are std::atomic objects in that host memory, so that the host reads and writes them the same way on every
+// compiler; the stream writes and waits on them as plain 32-bit words.
 typedef void * (*rpc_comm_host_alloc_t)(size_t size);
 typedef void   (*rpc_comm_host_free_t)(void * ptr);
-typedef bool   (*rpc_comm_can_stage_t)(ggml_backend_t backend, uint32_t * ready, uint32_t * done);
+typedef bool   (*rpc_comm_can_stage_t)(ggml_backend_t backend, std::atomic<uint32_t> * ready, std::atomic<uint32_t> * done);
 typedef bool   (*rpc_comm_stage_t)(ggml_backend_t backend, ggml_tensor * t, void * out, const void * in,
-                                   uint32_t * ready, uint32_t * done, uint32_t seq);
+                                   std::atomic<uint32_t> * ready, std::atomic<uint32_t> * done, uint32_t seq);
+static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) && std::atomic<uint32_t>::is_always_lock_free,
+              "the stream writes and waits on each flag as a plain 32-bit word");
+
+// starts the lifetime of the two flags in host memory of 2 * sizeof(std::atomic<uint32_t>) bytes, both 0
+static std::atomic<uint32_t> * rpc_comm_flags_create(void * mem) {
+    if (mem == nullptr) {
+        return nullptr;
+    }
+    std::atomic<uint32_t> * flags = new (mem) std::atomic<uint32_t>(0u);
+    new (static_cast<char *>(mem) + sizeof(std::atomic<uint32_t>)) std::atomic<uint32_t>(0u);
+    return flags;
+}
 
 struct rpc_comm_async {
     static constexpr uint32_t RING = 256;         // all-reduces that may be queued ahead of the exchange
@@ -3102,7 +3117,7 @@ struct rpc_comm_async {
     rpc_comm_host_free_t host_free = nullptr;
     rpc_comm_stage_t     stage     = nullptr;
     ggml_backend_t       backend   = nullptr;
-    uint32_t * flags    = nullptr;                // [0] ready, [1] done: host memory the stream writes and waits on
+    std::atomic<uint32_t> * flags = nullptr;      // [0] ready, [1] done: host memory the stream writes and waits on
     uint8_t  * out      = nullptr;                // this rank's partial, copied out by the stream
     float    * in       = nullptr;                // the sum, copied back by the stream
     size_t     capacity = 0;
@@ -3159,8 +3174,11 @@ struct rpc_comm_async {
             thread.join();
         }
         if (flags != nullptr) {
-            // the thread has stopped, so nothing lowers `done` again
-            __atomic_store_n(&flags[1], 0xffffffffu, __ATOMIC_RELEASE);
+            // the thread has stopped, so nothing changes `done` again. The stream compares cyclically
+            // ((int32_t) (done - flag) >= 0, CU_STREAM_WAIT_VALUE_GEQ), so the value that satisfies every wait still
+            // queued is the last flag handed out: each of them is at most RING below it. A larger one, such as
+            // 0xffffffff, would read as below a small flag and leave its wait, and the synchronize below, blocked.
+            flags[1].store(next_flag, std::memory_order_release);
             if (backend != nullptr) {
                 ggml_backend_synchronize(backend);
             }
@@ -3174,8 +3192,8 @@ struct rpc_comm_async {
         if (thread.joinable()) {
             thread.join();
         }
-        __atomic_store_n(&flags[0], 0u, __ATOMIC_RELEASE);
-        __atomic_store_n(&flags[1], 0u, __ATOMIC_RELEASE);
+        flags[0].store(0u, std::memory_order_release);
+        flags[1].store(0u, std::memory_order_release);
         next_flag = 0;
         queued.store(0, std::memory_order_release);
         processed.store(0, std::memory_order_release);
@@ -3196,7 +3214,7 @@ struct rpc_comm_async {
             spins = 0;
             const job & j = jobs[(last + 1) % RING];
             // wait for the stream to copy the partial out
-            while (__atomic_load_n(&flags[0], __ATOMIC_ACQUIRE) < j.flag) {
+            while (flags[0].load(std::memory_order_acquire) < j.flag) {
                 if (stop.load(std::memory_order_acquire)) {
                     return;
                 }
@@ -3212,7 +3230,7 @@ struct rpc_comm_async {
                 broken.store(true, std::memory_order_release);
                 std::fill(in, in + j.nbytes / sizeof(float), std::numeric_limits<float>::quiet_NaN());
             }
-            __atomic_store_n(&flags[1], j.flag, __ATOMIC_RELEASE);
+            flags[1].store(j.flag, std::memory_order_release);
             processed.store(j.flag, std::memory_order_release);
         }
     }
@@ -3437,7 +3455,7 @@ bool rpc_server::comm_allreduce_mesh_async(comm_state & state, ggml_backend_t ba
         async->host_free  = host_free;
         async->stage      = stage;
         async->backend    = backend;
-        async->flags      = (uint32_t *) host_alloc(2 * sizeof(uint32_t));
+        async->flags      = rpc_comm_flags_create(host_alloc(2 * sizeof(std::atomic<uint32_t>)));
         if (async->flags == nullptr || !can_stage(backend, &async->flags[0], &async->flags[1])) {
             LOG_WARN("[%s] the device cannot queue all-reduces on its stream; they wait for it instead\n", __func__);
             host_free(async->flags);
