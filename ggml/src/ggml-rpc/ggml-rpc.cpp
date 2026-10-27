@@ -303,9 +303,15 @@ struct rpc_msg_comm_allreduce_req {
     uint32_t   device;
     rpc_tensor tensor;
     // this rank's share of the work was empty (the meta backend disabled its node), so its partial is garbage: the rank
-    // contributes zeros. Only the mesh comm takes it.
+    // contributes zeros. Only the mesh comm takes it, and only a request with it set carries it.
     uint32_t   zero;
 };
+
+// a COMM_ALLREDUCE whose `zero` is not set is sent without it, as upstream's request, so that a client and a server of
+// which only one has the field still agree on its size
+static constexpr size_t RPC_COMM_ALLREDUCE_REQ_SIZE_NO_ZERO = offsetof(rpc_msg_comm_allreduce_req, zero);
+static_assert(RPC_COMM_ALLREDUCE_REQ_SIZE_NO_ZERO == sizeof(uint32_t) + sizeof(rpc_tensor),
+              "COMM_ALLREDUCE without zero must stay upstream's device and tensor");
 
 struct rpc_msg_comm_free_req {
     uint32_t device;
@@ -390,6 +396,19 @@ static bool recv_comm_init_req(socket_ptr sock, rpc_msg_comm_init_req & request)
         return false;
     }
     if (size != sizeof(request) && size != RPC_COMM_INIT_REQ_SIZE_PAIR && size != RPC_COMM_INIT_REQ_SIZE_NO_FLAGS) {
+        return false;
+    }
+    request = {};
+    return sock->recv_data(&request, size);
+}
+
+// COMM_ALLREDUCE comes in two sizes: with `zero`, or upstream's request without it (read as zero = 0)
+static bool recv_comm_allreduce_req(socket_ptr sock, rpc_msg_comm_allreduce_req & request) {
+    uint64_t size;
+    if (!sock->recv_data(&size, sizeof(size))) {
+        return false;
+    }
+    if (size != sizeof(request) && size != RPC_COMM_ALLREDUCE_REQ_SIZE_NO_ZERO) {
         return false;
     }
     request = {};
@@ -3918,7 +3937,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_COMM_ALLREDUCE: {
                 rpc_msg_comm_allreduce_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_comm_allreduce_req(sock, request)) {
                     return;
                 }
                 if (!server.comm_allreduce(request)) {
@@ -4382,7 +4401,9 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tenso
         request->device = comm_ctx->ranks[i].device;
         request->tensor = serialize_tensor(tensors[i]);
         request->zero   = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ? 1 : 0;
-        comm_ctx->ranks[i].dispatcher->send_async(RPC_CMD_COMM_ALLREDUCE, request, sizeof(*request));
+        // only a zero partial, which only the mesh sends, needs the field; every other request keeps upstream's size
+        const size_t request_size = request->zero != 0 ? sizeof(*request) : RPC_COMM_ALLREDUCE_REQ_SIZE_NO_ZERO;
+        comm_ctx->ranks[i].dispatcher->send_async(RPC_CMD_COMM_ALLREDUCE, request, request_size);
     }
     return true;
 }
