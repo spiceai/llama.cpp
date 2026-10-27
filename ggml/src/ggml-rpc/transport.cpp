@@ -181,7 +181,22 @@ struct socket_t::impl {
 #endif // GGML_RPC_RDMA
     bool     use_rdma;
     sockfd_t fd;
+    // set_recv_deadline: a TCP receive fails once it passes, however the data arrives
+    bool                                  has_recv_deadline = false;
+    std::chrono::steady_clock::time_point recv_deadline;
 };
+
+// SO_RCVTIMEO: a receive that waits longer than timeout_ms fails (0: no limit)
+static bool set_recv_timeout_ms(sockfd_t sockfd, int64_t timeout_ms) {
+#ifdef _WIN32
+    DWORD tv = (DWORD) timeout_ms;
+#else
+    struct timeval tv = {};
+    tv.tv_sec  = (time_t) (timeout_ms / 1000);
+    tv.tv_usec = (suseconds_t) ((timeout_ms % 1000) * 1000);
+#endif
+    return setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &tv, sizeof(tv)) == 0;
+}
 
 socket_t::impl::~impl() {
 #ifdef GGML_RPC_RDMA
@@ -679,6 +694,15 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
     size_t bytes_recv = 0;
     while (bytes_recv < size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
+        if (has_recv_deadline) {
+            // each recv() may wait only for what is left, so data that trickles in cannot carry a read past the deadline
+            const int64_t left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                recv_deadline - std::chrono::steady_clock::now()).count();
+            if (left <= 0 || !set_recv_timeout_ms(fd, left)) {
+                LOG_ERROR("recv failed: past its deadline (bytes_recv=%zu, size=%zu)\n", bytes_recv, size);
+                return false;
+            }
+        }
         ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, 0);
         if (n < 0) {
             LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
@@ -907,15 +931,14 @@ socket_ptr socket_t::accept(int timeout_ms) {
     }
 }
 
-bool socket_t::set_recv_timeout(int timeout_ms) {
-#ifdef _WIN32
-    DWORD tv = (DWORD) timeout_ms;
-#else
-    struct timeval tv = {};
-    tv.tv_sec  = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-#endif
-    return setsockopt(pimpl->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &tv, sizeof(tv)) == 0;
+void socket_t::set_recv_deadline(std::chrono::steady_clock::time_point deadline) {
+    pimpl->has_recv_deadline = true;
+    pimpl->recv_deadline     = deadline;
+}
+
+bool socket_t::clear_recv_deadline() {
+    pimpl->has_recv_deadline = false;
+    return set_recv_timeout_ms(pimpl->fd, 0);
 }
 
 socket_ptr socket_t::create_server(const char * host, int port, int backlog) {

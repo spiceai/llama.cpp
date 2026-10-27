@@ -3349,7 +3349,7 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
     const uint32_t rank  = request.rank;
     const uint32_t world = request.world;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(RPC_COMM_MESH_INIT_TIMEOUT_MS);
-    // the milliseconds left before the deadline, at least 1 while any are, so a receive timeout never reads as "none"
+    // the milliseconds left before the deadline, at least 1 while any are
     auto left_ms = [&]() {
         const int64_t left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
         return left <= 0 ? 0 : (int) std::max<int64_t>(1, left);
@@ -3380,11 +3380,12 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
             socket_ptr attempt = socket_t::connect(host.c_str(), (int) (request.port + j));
-            // the handshake's receives end at the deadline: whatever answers at that port may not be a rank of this
-            // mesh, or may stop answering
-            if (attempt == nullptr || !attempt->set_recv_timeout(left_ms())) {
+            if (attempt == nullptr) {
                 continue;
             }
+            // the handshake's receives end at the deadline, however slowly their data arrives: whatever answers at
+            // that port may not be a rank of this mesh, or may stop answering
+            attempt->set_recv_deadline(deadline);
             const uint32_t word = rank | (chosen ? RPC_COMM_CHOSEN_LINK : 0u);
             if (!attempt->send_data(&word, sizeof(word))) {
                 continue;
@@ -3418,7 +3419,7 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
                 continue;
             }
             attempt->update_caps(remote_caps);
-            if (!attempt->set_recv_timeout(0)) {
+            if (!attempt->clear_recv_deadline()) {
                 continue;
             }
             peer = attempt;
@@ -3440,9 +3441,7 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
                       __func__, rank, joined, world - 1 - rank, RPC_COMM_MESH_INIT_TIMEOUT_MS / 1000);
             return false;
         }
-        if (!peer->set_recv_timeout(std::max(1, left_ms()))) {
-            continue;
-        }
+        peer->set_recv_deadline(deadline);
         uint32_t word = 0;
         if (!peer->recv_data(&word, sizeof(word))) {
             LOG_DBG("[%s] rank %u: a connection closed before naming its rank\n", __func__, rank);
@@ -3477,7 +3476,7 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
             continue;
         }
         peer->update_caps(remote_caps);
-        if (!peer->set_recv_timeout(0)) {
+        if (!peer->clear_recv_deadline()) {
             continue;
         }
         LOG_INFO("[%s] device %u: rank %u accepted rank %u over %s\n", __func__, request.device, rank, peer_rank,

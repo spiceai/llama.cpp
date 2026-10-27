@@ -1,7 +1,8 @@
 // The TCP transport under the conditions the mesh comm puts it in:
 // - a connection shut down while another thread is blocked sending on it (rpc_comm_async::release ends a mesh link the
 //   exchange thread may be sending on) makes the send fail, and must not end the process with SIGPIPE;
-// - accept(timeout) and set_recv_timeout bound the waits of the mesh's initialization.
+// - accept(timeout) and set_recv_deadline bound the waits of the mesh's initialization, a receive's deadline holding
+//   however slowly its data arrives.
 
 #include "ggml-rpc/transport.h"
 
@@ -60,16 +61,38 @@ int main() {
         return 2;
     }
 
-    // the peer sends nothing: a receive with a 200 ms timeout fails once the time is up
+    // the peer sends nothing: a receive with a deadline 200 ms out fails once it passes
     {
         uint32_t word = 0;
         const auto t0 = std::chrono::steady_clock::now();
-        const bool set = a->set_recv_timeout(200);
-        const bool got = set && a->recv_data(&word, sizeof(word));
+        a->set_recv_deadline(t0 + std::chrono::milliseconds(200));
+        const bool got = a->recv_data(&word, sizeof(word));
         const double ms = elapsed_ms(t0);
-        const bool ok = set && !got && ms >= 150 && ms < 5000 && a->set_recv_timeout(0);
-        printf("recv with a 200 ms timeout and nothing sent: %s after %.0f ms: %s\n", got ? "returned data" : "failed", ms,
+        const bool ok = !got && ms >= 150 && ms < 5000 && a->clear_recv_deadline();
+        printf("recv with a 200 ms deadline and nothing sent: %s after %.0f ms: %s\n", got ? "returned data" : "failed", ms,
                ok ? "ok" : "FAILED");
+        failures += ok ? 0 : 1;
+    }
+
+    // the peer sends the 4 bytes one at a time, 150 ms apart, so each recv() gets data before a per-receive timeout of
+    // 300 ms would end it: the read must still fail at its deadline, 300 ms out, not finish at about 600 ms
+    {
+        uint32_t word = 0;
+        std::thread trickle([&] {
+            const char bytes[4] = { 1, 2, 3, 4 };
+            for (char c : bytes) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                b->send_data(&c, 1);
+            }
+        });
+        const auto t0 = std::chrono::steady_clock::now();
+        a->set_recv_deadline(t0 + std::chrono::milliseconds(300));
+        const bool got = a->recv_data(&word, sizeof(word));
+        const double ms = elapsed_ms(t0);
+        trickle.join();
+        const bool ok = !got && ms >= 250 && ms < 550 && a->clear_recv_deadline();
+        printf("recv with a 300 ms deadline while the peer sends a byte every 150 ms: %s after %.0f ms: %s\n",
+               got ? "returned data" : "failed", ms, ok ? "ok" : "FAILED");
         failures += ok ? 0 : 1;
     }
 

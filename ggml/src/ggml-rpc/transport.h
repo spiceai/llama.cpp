@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -33,8 +34,10 @@ struct socket_t {
     socket_ptr accept();
     // accept(), waiting at most timeout_ms for a connection; nullptr when none arrived in time
     socket_ptr accept(int timeout_ms);
-    // A receive that waits longer than timeout_ms fails (0: no limit). TCP only; an RDMA receive ignores it.
-    bool set_recv_timeout(int timeout_ms);
+    // From now on a receive fails once `deadline` has passed, however its data arrives, until clear_recv_deadline. TCP
+    // only; an RDMA receive ignores it.
+    void set_recv_deadline(std::chrono::steady_clock::time_point deadline);
+    bool clear_recv_deadline();
 
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
