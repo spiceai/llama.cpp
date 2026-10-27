@@ -1066,11 +1066,13 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor, const rpc_dispatc
     result.view_src = reinterpret_cast<uint64_t>(tensor->view_src);
     result.view_offs = tensor->view_offs;
 
-    // Avoid sending uninitialized data over the wire
-    memset(result.name, 0, sizeof(result.name));
+    // The name up to its terminator, then zeros: the bytes after a name's terminator can be left over from an older
+    // name, and uninitialized data must not go over the wire. A bounded copy rather than snprintf, which is called for
+    // every tensor of every graph serialized.
+    const size_t name_len = strnlen(tensor->name, sizeof(result.name) - 1);
+    memcpy(result.name, tensor->name, name_len);
+    memset(result.name + name_len, 0, sizeof(result.name) - name_len);
     result.use_count = 0;
-
-    snprintf(result.name, GGML_MAX_NAME, "%s", tensor->name);
     return result;
 }
 
@@ -1485,14 +1487,74 @@ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
     rpc_ctx->dispatcher->synchronize();
 }
 
-static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, const rpc_dispatcher * dispatcher, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
+// The tensors serialize_graph has added, an open-addressing set reused for every graph serialized on a thread:
+// std::unordered_set allocates a node per insert, and building one per graph was a large part of serializing a graph
+// the server has not stored yet.
+class rpc_visited_set {
+public:
+    // Empties the set, with room for `expected` tensors before it grows.
+    void clear(size_t expected) {
+        size_t capacity = 64;
+        while (capacity < 2 * expected) {
+            capacity *= 2;
+        }
+        if (slots.size() < capacity) {
+            slots.assign(capacity, nullptr);
+        } else {
+            std::fill(slots.begin(), slots.end(), nullptr);
+        }
+        count = 0;
+    }
+
+    // Adds `tensor`; false when it is already in the set.
+    bool insert(const ggml_tensor * tensor) {
+        if (2 * (count + 1) > slots.size()) {
+            grow();
+        }
+        if (!place(tensor)) {
+            return false;
+        }
+        count++;
+        return true;
+    }
+
+private:
+    // a power of two in size, at most half full, so a probe always reaches an empty slot
+    std::vector<const ggml_tensor *> slots;
+    size_t count = 0;
+
+    bool place(const ggml_tensor * tensor) {
+        const size_t mask = slots.size() - 1;
+        // Fibonacci hashing of the address
+        for (size_t i = (size_t) (((uint64_t) (uintptr_t) tensor * 0x9E3779B97F4A7C15ull) >> 32) & mask;; i = (i + 1) & mask) {
+            if (slots[i] == tensor) {
+                return false;
+            }
+            if (slots[i] == nullptr) {
+                slots[i] = tensor;
+                return true;
+            }
+        }
+    }
+
+    void grow() {
+        std::vector<const ggml_tensor *> old = std::move(slots);
+        slots.assign(std::max<size_t>(64, 2 * old.size()), nullptr);
+        for (const ggml_tensor * tensor : old) {
+            if (tensor != nullptr) {
+                place(tensor);
+            }
+        }
+    }
+};
+
+static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, const rpc_dispatcher * dispatcher, std::vector<rpc_tensor> & tensors, rpc_visited_set & visited) {
     if (tensor == nullptr) {
         return;
     }
-    if (visited.find(tensor) != visited.end()) {
+    if (!visited.insert(tensor)) {
         return;
     }
-    visited.insert(tensor);
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         add_tensor(tensor->src[i], cgraph, dispatcher, tensors, visited);
     }
@@ -1507,8 +1569,11 @@ static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, const r
 
 static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, const rpc_dispatcher * dispatcher, size_t * output_size) {
     uint32_t n_nodes = cgraph->n_nodes;
-    std::vector<rpc_tensor> tensors;
-    std::unordered_set<ggml_tensor*> visited;
+    // kept across graphs on this thread, so serializing one allocates only its output
+    static thread_local std::vector<rpc_tensor> tensors;
+    static thread_local rpc_visited_set visited;
+    tensors.clear();
+    visited.clear(4 * (size_t) n_nodes);
     for (uint32_t i = 0; i < n_nodes; i++) {
         add_tensor(cgraph->nodes[i], cgraph, dispatcher, tensors, visited);
     }
@@ -1516,7 +1581,8 @@ static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, co
     // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     uint32_t n_tensors = tensors.size();
     *output_size = 2*sizeof(uint32_t) + sizeof(uint64_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
-    uint8_t * output = new uint8_t[*output_size]();
+    // not zeroed: every byte is written below, the packed tensors included
+    uint8_t * output = new uint8_t[*output_size];
     uint8_t * dest = output;
     memcpy(dest, &device, sizeof(device));
     dest += sizeof(device);
