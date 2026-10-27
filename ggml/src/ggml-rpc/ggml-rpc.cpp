@@ -4448,6 +4448,17 @@ static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_bac
         }
     }
     if (!ok) {
+        // A rank that initialized keeps its links until a COMM_FREE, and would answer the next COMM_INIT on this
+        // connection as already initialized without listening again, so a retry could never form the comm (in a mesh,
+        // rank 0 joins every other rank even when two of them cannot reach each other). Every rank that initialized
+        // frees its part now.
+        for (size_t i = 0; i < n_backends; i++) {
+            if (responses[i].ok) {
+                auto request = std::make_shared<rpc_msg_comm_free_req>();
+                request->device = ranks[i].device;
+                ranks[i].dispatcher->send(RPC_CMD_COMM_FREE, request, sizeof(*request));
+            }
+        }
         for (const auto & rank : ranks) {
             rank.dispatcher->busy_spin_release();
         }
