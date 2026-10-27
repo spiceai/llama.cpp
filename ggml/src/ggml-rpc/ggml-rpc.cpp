@@ -3222,6 +3222,7 @@ struct rpc_comm_async {
     std::vector<std::vector<uint8_t>> * parts = nullptr;
     uint32_t rank = 0, world = 0;
     bool     eager = false;
+    bool     links_cut = false;                   // the exchange thread shut the links down after a failure
 
     ~rpc_comm_async() {
         release();
@@ -3314,6 +3315,18 @@ struct rpc_comm_async {
                 // sum, and the server drops the client before it returns any result
                 broken.store(true, std::memory_order_release);
                 std::fill(in, in + j.nbytes / sizeof(float), std::numeric_limits<float>::quiet_NaN());
+                // This rank sends no partial from now on, so a peer waiting for one of this or a later all-reduce
+                // would wait forever on a link that stays open (this server drops its client only at the next read).
+                // Ending every link makes the peers' exchanges fail too, as a server on the synchronous path does
+                // when it drops its client and closes them.
+                if (!links_cut) {
+                    links_cut = true;
+                    for (const auto & peer : *peers) {
+                        if (peer != nullptr) {
+                            peer->shutdown();
+                        }
+                    }
+                }
             }
             flags[1].store(j.flag, std::memory_order_release);
             processed.store(j.flag, std::memory_order_release);
