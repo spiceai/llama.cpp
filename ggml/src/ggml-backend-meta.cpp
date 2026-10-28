@@ -2223,6 +2223,11 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
                     } else {
                         nbytes = split_state.ne[s*n_backends + j] * tensor->nb[1];
                     }
+                    if (nbytes == 0) {
+                        // an empty slice: a device whose slices in this buffer are all empty holds them in a dummy
+                        // buffer with no data, which the async getters reject even for zero bytes
+                        continue;
+                    }
                     ggml_backend_tensor_get_2d_async(ggml_backend_meta_simple_backend(backend, j), simple_tensor,
                         (char *) data + offset_data, simple_offsets[j] + row_start * simple_tensor->nb[row_dim], nbytes,
                         row_count, simple_tensor->nb[row_dim], tensor->nb[row_dim]);
