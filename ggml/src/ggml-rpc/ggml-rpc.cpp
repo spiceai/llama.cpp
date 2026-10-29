@@ -19,6 +19,8 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <map>
+#include <ctime>
 #include <unordered_set>
 #include <cstring>
 #include <fstream>
@@ -626,6 +628,51 @@ static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
     dispatcher->work();
 }
 
+// TEMP diagnostic (GGML_RPC_LOG_GRAPHS): how long callers block on a dispatcher, per command, every 5 s
+static void rpc_wait_note(rpc_cmd cmd, int64_t us) {
+    static const bool on = std::getenv("GGML_RPC_LOG_GRAPHS") != nullptr;
+    if (!on) {
+        return;
+    }
+    struct acc { uint64_t n = 0, sum = 0, max = 0; uint64_t b[16] = {}; };
+    static std::mutex mu;
+    static std::map<int, acc> a;
+    static int64_t last = ggml_time_us();
+    std::lock_guard<std::mutex> lock(mu);
+    acc & x = a[(int) cmd];
+    x.n++;
+    x.sum += (uint64_t) us;
+    x.max = std::max<uint64_t>(x.max, (uint64_t) us);
+    int k = 0;
+    while (k < 15 && (16ll << k) <= us) {
+        k++;
+    }
+    x.b[k]++;
+    const int64_t now = ggml_time_us();
+    if (now - last >= 5000000) {
+        std::string line;
+        for (auto & [c, v] : a) {
+            uint64_t cum = 0;
+            long long p50 = -1, p99 = -1;
+            for (int i = 0; i < 16; i++) {
+                cum += v.b[i];
+                if (p50 < 0 && cum*2 >= v.n) { p50 = 16ll << i; }
+                if (p99 < 0 && cum*100 >= v.n*99) { p99 = 16ll << i; }
+            }
+            char buf[192];
+            snprintf(buf, sizeof(buf), " %s n=%llu mean=%lluus p50<%lld p99<%lld max=%llu;", rpc_cmd_name((rpc_cmd) c),
+                     (unsigned long long) v.n, (unsigned long long) (v.sum / v.n), p50, p99, (unsigned long long) v.max);
+            line += buf;
+        }
+        const time_t wall = time(nullptr);
+        char hms[16];
+        strftime(hms, sizeof(hms), "%H:%M:%S", gmtime(&wall));
+        fprintf(stderr, "[rpc waits %s %.1fs]%s\n", hms, (now - last) / 1e6, line.c_str());
+        a.clear();
+        last = now;
+    }
+}
+
 void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = cmd;
@@ -633,9 +680,11 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->input_size = input_size;
     msg->output = nullptr;
     msg->output_size = 0;
+    const int64_t t0 = ggml_time_us();
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
     future.wait();
+    rpc_wait_note(cmd, ggml_time_us() - t0);
 }
 
 void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size) {
@@ -655,9 +704,11 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->input_size = input_size;
     msg->output = output;
     msg->output_size = output_size;
+    const int64_t t0 = ggml_time_us();
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
     future.wait();
+    rpc_wait_note(cmd, ggml_time_us() - t0);
 }
 
 void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
@@ -720,8 +771,10 @@ void rpc_dispatcher::synchronize() {
     // to ensure all messages are processed, submit dummy message and wait for it to complete
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = RPC_CMD_NONE;
+    const int64_t t0 = ggml_time_us();
     GGML_ASSERT(queue.push(msg));
     msg->completion.get_future().wait();
+    rpc_wait_note(RPC_CMD_NONE, ggml_time_us() - t0);
 }
 
 void rpc_dispatcher::busy_spin_acquire() {
@@ -1448,6 +1501,17 @@ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) 
     GGML_ASSERT(cgraph->n_nodes > 0);
     auto & device_graph_uids = graph_uids[device];
     bool reuse = cgraph->uid != 0 && device_graph_uids.count(cgraph->uid) > 0;
+    { // TEMP diagnostic
+        static const bool on = std::getenv("GGML_RPC_LOG_GRAPHS") != nullptr;
+        static uint64_t n_reuse = 0, n_ser = 0, n_nodes_ser = 0, n_uid0 = 0;
+        if (on) {
+            if (reuse) { n_reuse++; } else { n_ser++; n_nodes_ser += cgraph->n_nodes; if (cgraph->uid == 0) n_uid0++; }
+            if ((n_reuse + n_ser) % 500 == 0) {
+                fprintf(stderr, "[rpc graphs] %" PRIu64 " reused, %" PRIu64 " serialized (%" PRIu64 " uid 0, avg %" PRIu64 " nodes)\n",
+                        n_reuse, n_ser, n_uid0, n_ser ? n_nodes_ser / n_ser : 0);
+            }
+        }
+    }
     LOG_DBG("[%s] device: %u, uid: %" PRIu64 ", n_nodes: %u, reuse: %s\n", __func__, device, cgraph->uid, cgraph->n_nodes, reuse ? "yes" : "no");
     if (reuse) {
         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
@@ -2912,7 +2976,8 @@ static bool rpc_comm_send_defer() {
 }
 
 static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32_t rank, uint32_t world, uint64_t seq,
-                                   size_t nbytes, const uint8_t * own, std::vector<std::vector<uint8_t>> & parts, float * sum) {
+                                   size_t nbytes, const uint8_t * own, std::vector<std::vector<uint8_t>> & parts, float * sum,
+                                   int64_t * t_sent = nullptr, int64_t * t_recv = nullptr) {
     const rpc_comm_part_hdr hdr = { seq, (uint64_t) nbytes };
     for (auto & part : parts) {
         if (part.size() < nbytes) {
@@ -2950,10 +3015,16 @@ static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32
                 return lost(j);
             }
         }
+        if (t_sent != nullptr) {
+            *t_sent = ggml_time_us();
+        }
         for (uint32_t j = 0; j < world; j++) {
             if (j != rank && !recv_part(j)) {
                 return lost(j);
             }
+        }
+        if (t_recv != nullptr) {
+            *t_recv = ggml_time_us();
         }
         // the exchange has succeeded only once every peer has this rank's partial: a deferred send that failed fails
         // this all-reduce, not a later send that may never come
@@ -3104,12 +3175,14 @@ struct rpc_comm_async {
                     return;
                 }
             }
+            const int64_t t_ready = ggml_time_us();
+            int64_t t_sent = 0, t_recv = 0;
             if (j.zero) {
                 // the stream copied a disabled node's garbage out; this rank's share is zero
                 memset(out, 0, j.nbytes);
             }
             if (broken.load(std::memory_order_relaxed) ||
-                !rpc_comm_mesh_exchange(*peers, rank, world, j.seq, j.nbytes, out, *parts, in)) {
+                !rpc_comm_mesh_exchange(*peers, rank, world, j.seq, j.nbytes, out, *parts, in, &t_sent, &t_recv)) {
                 // the stream is released either way, so it drains; what it copies back is NaN rather than an older
                 // sum, and the server drops the client before it returns any result
                 broken.store(true, std::memory_order_release);
@@ -3117,6 +3190,71 @@ struct rpc_comm_async {
             }
             __atomic_store_n(&flags[1], j.flag, __ATOMIC_RELEASE);
             processed.store(j.flag, std::memory_order_release);
+            if (t_recv != 0) {
+                note(j.nbytes, t_ready, t_sent, t_recv, ggml_time_us());
+            }
+        }
+    }
+
+    // TEMP diagnostic (GGML_RPC_LOG_COMM): per 5 s, this rank's exchanges split into ready -> sent (sending its partial),
+    // sent -> received (waiting for the peers' partials: their lateness plus the wire), received -> done (the sum)
+    struct span_acc {
+        uint64_t n = 0, sum = 0, b[16] = {};
+        void add(int64_t us) {
+            n++;
+            sum += (uint64_t) std::max<int64_t>(us, 0);
+            int k = 0;
+            while (k < 15 && (4ll << k) <= us) {
+                k++;
+            }
+            b[k]++;
+        }
+        std::string fmt(const char * name) const {
+            uint64_t cum = 0;
+            long long p50 = -1, p90 = -1, p99 = -1;
+            for (int i = 0; i < 16; i++) {
+                cum += b[i];
+                if (p50 < 0 && cum*2 >= n) { p50 = 4ll << i; }
+                if (p90 < 0 && cum*10 >= n*9) { p90 = 4ll << i; }
+                if (p99 < 0 && cum*100 >= n*99) { p99 = 4ll << i; }
+            }
+            char buf[128];
+            snprintf(buf, sizeof(buf), " %s mean %llu p50<%lld p90<%lld p99<%lld;", name,
+                     (unsigned long long) (n ? sum / n : 0), p50, p90, p99);
+            return buf;
+        }
+    };
+    span_acc a_send, a_wait, a_sum, a_total, a_gpu;
+    int64_t  log_last = 0;
+    int64_t  prev_done = 0;                       // when the previous exchange signalled done
+    void note(size_t nbytes, int64_t t_ready, int64_t t_sent, int64_t t_recv, int64_t t_done) {
+        static const bool on = std::getenv("GGML_RPC_LOG_COMM") != nullptr;
+        if (!on) {
+            return;
+        }
+        GGML_UNUSED(nbytes);
+        // this rank's stream between two all-reduces: seeing `done`, copying the sum in, the next subgraph, copying the
+        // next partial out and raising `ready`; a gap of 5 ms or more is a call boundary, not a subgraph
+        if (prev_done != 0 && t_ready - prev_done < 5000) {
+            a_gpu.add(t_ready - prev_done);
+        }
+        prev_done = t_done;
+        a_send.add(t_sent - t_ready);
+        a_wait.add(t_recv - t_sent);
+        a_sum.add(t_done - t_recv);
+        a_total.add(t_done - t_ready);
+        if (log_last == 0) {
+            log_last = t_done;
+        }
+        if (t_done - log_last >= 5000000) {
+            const time_t wall = time(nullptr);
+            char hms[16];
+            strftime(hms, sizeof(hms), "%H:%M:%S", gmtime(&wall));
+            fprintf(stderr, "[comm rank %u %s] n=%llu%s%s%s%s\n", rank, hms, (unsigned long long) a_total.n,
+                    a_send.fmt("send").c_str(), a_wait.fmt("wait-peers").c_str(), a_sum.fmt("sum").c_str(),
+                    (a_total.fmt("total") + a_gpu.fmt("gpu-between")).c_str());
+            a_send = a_wait = a_sum = a_total = a_gpu = span_acc();
+            log_last = t_done;
         }
     }
 };

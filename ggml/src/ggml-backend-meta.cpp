@@ -2204,6 +2204,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid) ||
                                (graph_slots && !backend_ctx->cloned);
 
+    { // TEMP diagnostic
+        static const bool on = std::getenv("GGML_RPC_LOG_GRAPHS") != nullptr;
+        static uint64_t n_keep = 0, n_uid0 = 0, n_uidchg = 0, n_clone = 0;
+        if (on) {
+            if (!needs_rebuild) n_keep++; else if (cgraph->uid == 0) n_uid0++; else if (cgraph->uid != backend_ctx->uid) n_uidchg++; else n_clone++;
+            if ((n_keep + n_uid0 + n_uidchg + n_clone) % 50 == 0) {
+                fprintf(stderr, "[meta graphs] kept %llu, rebuilt: uid 0 %llu, uid changed %llu, slots uncloned %llu (slots %d)\n",
+                        (unsigned long long) n_keep, (unsigned long long) n_uid0, (unsigned long long) n_uidchg, (unsigned long long) n_clone, (int) graph_slots);
+            }
+        }
+    }
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
         for (size_t j = 0; j < n_backends; j++) {

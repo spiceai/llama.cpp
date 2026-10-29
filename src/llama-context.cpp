@@ -1,5 +1,8 @@
 #include "llama-context.h"
 
+#include <map>
+#include <mutex>
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -1595,6 +1598,11 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// TEMP diagnostic state for GGML_RPC_LOG_GRAPHS (one decode thread per context)
+static thread_local std::string   diag_key;
+static thread_local int64_t       diag_t0   = 0;
+static thread_local const void *  diag_this = nullptr;
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1623,6 +1631,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+
+    { // TEMP diagnostic: graph reuse per context, rebuilds by (n_tokens, n_outputs, slot, why)
+        static const bool on = getenv("GGML_RPC_LOG_GRAPHS") != nullptr;
+        if (on) {
+            static std::mutex mu;
+            static std::map<const void *, std::map<std::string, uint64_t>> counts;
+            const bool same = gf_res_prev_active == res;
+            const bool reuse = !graph_reuse_disable && same && res->can_reuse(gparams);
+            char key[96];
+            snprintf(key, sizeof(key), "%s t%u o%d s%d%s", reuse ? "reuse" : "BUILD", ubatch.n_tokens, (int) n_outputs, (int) sched_slot,
+                     reuse ? "" : (same ? " params" : " other-graph"));
+            diag_key  = key;
+            diag_t0   = ggml_time_us();
+            diag_this = this;
+        }
+    }
 
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1679,6 +1703,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (diag_this == this && !diag_key.empty()) { // TEMP diagnostic: CPU time of the call by shape, every 200 calls
+        static std::mutex mu;
+        static std::map<const void *, std::map<std::string, std::pair<uint64_t, uint64_t>>> acc;
+        const int64_t dt = ggml_time_us() - diag_t0;
+        std::lock_guard<std::mutex> lock(mu);
+        auto & c = acc[this];
+        auto & e = c[diag_key];
+        e.first++;
+        e.second += (uint64_t) dt;
+        uint64_t total = 0;
+        for (auto & kv : c) { total += kv.second.first; }
+        if (total % 100 == 0) {
+            std::string line;
+            for (auto & kv : c) {
+                line += " [" + kv.first + "]=" + std::to_string(kv.second.first) + "x" + std::to_string(kv.second.second / kv.second.first) + "us";
+            }
+            fprintf(stderr, "[llama graphs %p]%s\n", (const void *) this, line.c_str());
+        }
+        diag_key.clear();
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
