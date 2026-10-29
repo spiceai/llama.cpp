@@ -205,6 +205,8 @@ private:
     // 1. Separable filtering: horizontal pass followed by vertical pass
     // 2. Pre-computes normalized filter coefficients for each output pixel
     // 3. Fixed-point integer arithmetic (22 fractional bits) for speed and determinism
+    //
+    // RESIZE_ALGO_FLAG_TORCH is the same, except for the int16 weights of torchvision (aten/src/ATen/native/cpu/UpSampleKernel.cpp)
     static bool resize_pillow(
             const clip_image_u8 & img,
             clip_image_u8 & dst,
@@ -215,6 +217,13 @@ private:
         // This allows encoding fractional weights as integers: weight * 2^22
         const int PRECISION_BITS = 32 - 8 - 2;
 
+        const bool int16_weights = algo & RESIZE_ALGO_FLAG_TORCH;
+        algo = static_cast<resize_algo>(algo & ~RESIZE_ALGO_FLAG_TORCH);
+
+        if (int16_weights && algo == RESIZE_ALGO_LANCZOS) {
+            GGML_ABORT("unsupported resize algo: torchvision has no lanczos");
+        }
+
         // Filter support radius
         double filter_support;
         switch (algo) {
@@ -222,11 +231,11 @@ private:
             case RESIZE_ALGO_BICUBIC:  filter_support = 2.0; break;
             case RESIZE_ALGO_LANCZOS:  filter_support = 3.0; break;
             default:
-                throw std::runtime_error("Unsupported resize algorithm");
+                GGML_ABORT("unsupported resize algo: %d", (int) algo);
         }
 
         // Returns filter weight for distance x from pixel center
-        // Note: for bicubic, Pillow uses a = -0.5 while GGML/PyTorch use a = -0.75
+        // Note: for bicubic, Pillow (and PyTorch with antialias) uses a = -0.5 while GGML (and PyTorch without antialias) uses a = -0.75
         auto resample_filter = [algo](double x) -> double {
             if (algo == RESIZE_ALGO_LANCZOS) {
                 if (-3.0 <= x && x < 3.0) {
@@ -351,12 +360,24 @@ private:
             // Formula: int32 = round(float * 2^PRECISION_BITS)
             weights.resize((size_t) outSize * ksize);
 
-            const double fxp_scale = std::ldexp(1.0, PRECISION_BITS); // 1.0 * 2^PRECISION_BITS
+            // torchvision rounds the weights to int16, with as many fractional bits as the largest weight allows;
+            // scaled back to PRECISION_BITS, they give the same output in the passes below
+            int precision = PRECISION_BITS;
+            if (int16_weights) {
+                const double weight_max = *std::max_element(pre_weights.begin(), pre_weights.end());
+                for (precision = 0; precision < PRECISION_BITS; precision++) {
+                    if (static_cast<int>(0.5 + weight_max * (1 << (precision + 1))) >= (1 << 15)) {
+                        break;
+                    }
+                }
+            }
+
+            const double fxp_scale = std::ldexp(1.0, precision); // 1.0 * 2^precision
 
             for (size_t i = 0; i < (size_t) outSize * ksize; i++) {
                 // Pillow adds +/- 0.5 then truncates toward zero; std::round would round twice
                 const double rounded = pre_weights[i] * fxp_scale + (pre_weights[i] < 0 ? -0.5 : 0.5);
-                weights[i] = static_cast<int32_t>(rounded);
+                weights[i] = static_cast<int32_t>(rounded) * (1 << (PRECISION_BITS - precision));
             }
 
             return ksize;
@@ -788,8 +809,70 @@ clip_image_size mtmd_image_preprocessor_dyn_size::get_target_size(const clip_hpa
 
 mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_image_u8 & img) const {
     clip_image_u8 resized_image;
-    const clip_image_size target_size = get_target_size(hparams, img.get_size());
-    img_tool::resize(img, resized_image, target_size,
+    img_tool::resize(img, resized_image, target_size(img.get_size()),
+                        hparams.image_resize_algo,
+                        hparams.image_resize_pad,
+                        hparams.image_pad_color);
+    mtmd_image_preproc_out output;
+    output.append(hparams, resized_image, true);
+    return output;
+}
+
+//
+// mtmd_image_preprocessor_lfm3vl
+//
+
+// rounds before the pixel checks (an edge may round to 0) and computes in double, as transformers does
+clip_image_size mtmd_image_preprocessor_lfm3vl::smart_resize(int width, int height, int factor, int64_t min_pixels, int64_t max_pixels,
+                                                             int n_frames, int temporal_factor) {
+    double h = height;
+    double w = width;
+    // the video variant first upscales edges below factor
+    if (temporal_factor > 1 && (h < factor || w < factor)) {
+        const double scale = std::max(factor / h, factor / w);
+        h = static_cast<int>(h * scale);
+        w = static_cast<int>(w * scale);
+    }
+
+    const int64_t t_bar = static_cast<int64_t>(std::nearbyint(static_cast<double>(n_frames) / temporal_factor)) * temporal_factor;
+    int h_bar = static_cast<int>(std::nearbyint(h / factor)) * factor;
+    int w_bar = static_cast<int>(std::nearbyint(w / factor)) * factor;
+    if (t_bar * h_bar * w_bar > max_pixels) {
+        const double beta = std::sqrt(n_frames * h * w / max_pixels);
+        h_bar = static_cast<int>(std::floor(h / beta / factor)) * factor;
+        w_bar = static_cast<int>(std::floor(w / beta / factor)) * factor;
+    } else if (t_bar * h_bar * w_bar < min_pixels) {
+        const double beta = std::sqrt(min_pixels / (n_frames * h * w));
+        h_bar = static_cast<int>(std::ceil(h * beta / factor)) * factor;
+        w_bar = static_cast<int>(std::ceil(w * beta / factor)) * factor;
+    }
+
+    return {std::max(factor, w_bar), std::max(factor, h_bar)};
+}
+
+clip_image_size mtmd_image_preprocessor_lfm3vl::target_size(const clip_image_size & original_size) const {
+    return smart_resize(original_size.width, original_size.height, hparams.patch_size * hparams.n_merge,
+                        hparams.image_min_pixels, hparams.image_max_pixels);
+}
+
+bool mtmd_image_preprocessor_lfm3vl::get_video_frame_size(int n_frames, int width, int height, clip_image_size & out) const {
+    // Lfm3VlVideoProcessor size: shortest_edge 4096, longest_edge 25165824, temporal_patch_size 2
+    out = smart_resize(width, height, hparams.patch_size * hparams.n_merge, 4096, 25165824, n_frames, 2);
+    return true;
+}
+
+mtmd_image_preproc_out mtmd_image_preprocessor_lfm3vl::preprocess_video_frame(const clip_image_u8 & img) const {
+    const int f = hparams.patch_size * hparams.n_merge;
+    const auto size = img.get_size();
+    return resize_to(img, {
+        std::max(f, static_cast<int>(std::nearbyint(static_cast<double>(size.width)  / f)) * f),
+        std::max(f, static_cast<int>(std::nearbyint(static_cast<double>(size.height) / f)) * f),
+    });
+}
+
+mtmd_image_preproc_out mtmd_image_preprocessor_lfm3vl::resize_to(const clip_image_u8 & img, const clip_image_size & size) const {
+    clip_image_u8 resized_image;
+    img_tool::resize(img, resized_image, size,
                         hparams.image_resize_algo,
                         hparams.image_resize_pad,
                         hparams.image_pad_color);

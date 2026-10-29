@@ -1351,6 +1351,9 @@ class GGUFWriter:
     def add_remove_extra_whitespaces(self, value: bool) -> None:
         self.add_bool(Keys.Tokenizer.REMOVE_EXTRA_WS, value)
 
+    def add_clean_spaces(self, value: bool) -> None:
+        self.add_bool(Keys.Tokenizer.CLEAN_SPACES, value)
+
     def add_precompiled_charsmap(self, charsmap: bytes) -> None:
         self.add_array(Keys.Tokenizer.PRECOMPILED_CHARSMAP, charsmap)
 
@@ -1398,6 +1401,9 @@ class GGUFWriter:
 
     def add_normalizer_strip_accents(self, value: bool) -> None:
         self.add_bool(Keys.Tokenizer.NORMALIZER_STRIP_ACCENTS, value)
+
+    def add_metaspace_prepend_scheme(self, value: str) -> None:
+        self.add_string(Keys.Tokenizer.METASPACE_PREPEND_SCHEME, value)
 
     def add_eot_token_id(self, id: int) -> None:
         self.add_uint32(Keys.Tokenizer.EOT_ID, id)
@@ -1622,6 +1628,9 @@ class GGUFWriter:
     def add_audio_head_count(self, value: int) -> None:
         self.add_uint32(Keys.ClipAudio.Attention.HEAD_COUNT, value)
 
+    def add_audio_head_count_kv(self, value: int) -> None:
+        self.add_uint32(Keys.ClipAudio.Attention.HEAD_COUNT_KV, value)
+
     def add_audio_head_dim(self, value: int) -> None:
         self.add_uint32(Keys.ClipAudio.Attention.HEAD_DIM, value)
 
@@ -1701,6 +1710,18 @@ class GGUFWriter:
 
     def add_gen_audio_block_count(self, value: int) -> None:
         self.add_uint32(Keys.ClipGenAudio.BLOCK_COUNT, value)
+
+    def add_gen_audio_sampling_temp(self, value: float) -> None:
+        self.add_float32(Keys.ClipGenAudio.SAMPLING_TEMP, value)
+
+    def add_gen_audio_sampling_top_k(self, value: int) -> None:
+        self.add_int32(Keys.ClipGenAudio.SAMPLING_TOP_K, value)
+
+    def add_gen_audio_sampling_penalty_repeat(self, value: float) -> None:
+        self.add_float32(Keys.ClipGenAudio.SAMPLING_PENALTY_REPEAT, value)
+
+    def add_gen_audio_sampling_penalty_last_n(self, value: int) -> None:
+        self.add_int32(Keys.ClipGenAudio.SAMPLING_PENALTY_LAST_N, value)
 
     def add_gen_audio_head_count(self, value: int) -> None:
         self.add_uint32(Keys.ClipGenAudio.Attention.HEAD_COUNT, value)

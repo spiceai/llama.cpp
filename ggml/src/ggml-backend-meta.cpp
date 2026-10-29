@@ -1107,13 +1107,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_CONV_3D:
             case GGML_OP_CONV_2D_DW:
             case GGML_OP_CONV_TRANSPOSE_2D:
+            case GGML_OP_POOL_1D:
             case GGML_OP_POOL_2D:
             case GGML_OP_POOL_2D_BACK:
             case GGML_OP_UPSCALE: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
-            } break;
-            case GGML_OP_POOL_1D: {
-                split_state = handle_pool_1d(src_ss);
             } break;
             case GGML_OP_PAD: {
                 split_state = ggml_backend_meta_is_gather(tensor) ? handle_gather(src_ss) : handle_pad(src_ss);
