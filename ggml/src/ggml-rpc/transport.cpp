@@ -411,6 +411,12 @@ bool socket_t::impl::rdma_probe() {
     }
     ibv_free_device_list(devs);
     if (!ibctx) return false;
+    // A connection to this host shares RDMA only over RoCE v2: its two ends compare GID bytes alone (update_caps), and
+    // a RoCE v1 entry has the same bytes as the v2 one, so an end that chose v1 advertises nothing and both stay on TCP
+    if (rdma_local.self && gid_version != IBV_GID_TYPE_ROCE_V2) {
+        ibv_close_device(ibctx);
+        return false;
+    }
 
     rdma_local.ib_port = ib_port;
     rdma_local.gid_idx = gid_idx;
@@ -853,7 +859,9 @@ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
     rdma_caps rc = {};
     memcpy(&rc, remote_caps, sizeof(rc));
     // The two ends of a connection to this host each choose their port, from their own GGML_RDMA_DEV and GGML_RDMA_GID,
-    // and two ports need not reach each other: they share RDMA only when they chose the same GID, which both ends see
+    // and two ports need not reach each other: they share RDMA only when they chose the same GID, which both ends see.
+    // A peer from a build without this check activates whenever both ends advertise RDMA, so a connection to this host
+    // needs both ends from this build, or the same GGML_RDMA_DEV and GGML_RDMA_GID on both
     if (rdma_local.self && memcmp(rc.gid, rdma_local.gid, RDMA_GID_SIZE) != 0) {
         LOG_WARN("[%s] the two ends of a connection to this host chose different RDMA ports, continuing with TCP\n",
                  __func__);
