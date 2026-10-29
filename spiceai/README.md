@@ -47,7 +47,7 @@ It also carries these source patches, which each Spice branch must keep until up
   upstream's. Drop each once upstream has an equivalent.
 
 Each Spice branch is `spiceai-<release>`: the upstream release tag with the Spice commits on top, made by
-merging the tag into the previous Spice branch (`spiceai-b11984` is `spiceai-b11803` with `b11984` merged in). Its tip is tagged `<release>-spiceai.<n>`, a name apart from the
+merging the tag into the previous Spice branch (`spiceai-b11999` is `spiceai-b11803` with `b11984`, then `b11999`, merged in). Its tip is tagged `<release>-spiceai.<n>`, a name apart from the
 branch's so neither is ambiguous, with `<n>` counting re-packagings of one release. To move
 to a new release:
 
