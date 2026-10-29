@@ -314,6 +314,8 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
+# bit-identity check of the CUDA mat-vec block shapes selected by GGML_CUDA_MMVQ_VARIANT
+llama_build(test-mmvq-variants.cpp LINK ggml)
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

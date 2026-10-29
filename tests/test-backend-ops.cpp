@@ -52,6 +52,14 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+// --perf-arms VAR=v1,v2,...: perf mode times each case once per value, in the order given, with the environment variable VAR
+// set to that value and on a fresh instance of the backend's device, so that a CUDA graph captured under another value cannot
+// replay. The result carries ",VAR=value" after the case's params. Arms of one case share its tensors and their data, which
+// keeps a slow initialization (the IQ quantizers) to once per case, and run back to back, which keeps clock drift out of
+// the comparison.
+static std::string              g_perf_arm_var;
+static std::vector<std::string> g_perf_arm_values;
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     if (ggml_is_empty(tensor)) {
         return;
@@ -1682,39 +1690,72 @@ struct test_case {
             mem += tensor_op_size(ggml_graph_node(gf, i));
         }
 
-        // run
-        int64_t total_time_us = 0;
-        int64_t total_mem = 0;
-        int total_runs = 0;
-        do {
-            int64_t start_time = ggml_time_us();
-            ggml_status status = ggml_backend_graph_compute(backend, gf);
-            if (status != GGML_STATUS_SUCCESS) {
-                fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
-                return false;
+        // run, once on the given backend, or once per --perf-arms value
+        const size_t n_arms = g_perf_arm_values.empty() ? 1 : g_perf_arm_values.size();
+        for (size_t arm = 0; arm < n_arms; ++arm) {
+            ggml_backend_ptr backend_arm(nullptr);
+            ggml_backend_t   be = backend;
+            std::string      arm_params;
+            if (!g_perf_arm_values.empty()) {
+                const std::string & value = g_perf_arm_values[arm];
+#ifdef _WIN32
+                _putenv_s(g_perf_arm_var.c_str(), value.c_str());
+#else
+                setenv(g_perf_arm_var.c_str(), value.c_str(), 1);
+#endif
+                backend_arm.reset(ggml_backend_dev_init(ggml_backend_get_device(backend), nullptr));
+                if (!backend_arm) {
+                    fprintf(stderr, "%s: failed to create a backend instance for %s=%s\n", __func__, g_perf_arm_var.c_str(), value.c_str());
+                    return false;
+                }
+                be         = backend_arm.get();
+                arm_params = "," + g_perf_arm_var + "=" + value;
+
+                // warm the new instance up outside the timed region: the first call runs the graph directly and loads the
+                // kernels, the second captures and instantiates the CUDA graph the timed calls replay
+                for (int w = 0; w < 2; ++w) {
+                    status = ggml_backend_graph_compute(be, gf);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+                        return false;
+                    }
+                    reinit_perf_iter(ctx.get());
+                }
             }
-            int64_t end_time = ggml_time_us();
 
-            total_time_us += end_time - start_time;
-            total_mem += mem;
-            total_runs += n_runs;
+            int64_t total_time_us = 0;
+            int64_t total_mem = 0;
+            int total_runs = 0;
+            do {
+                int64_t start_time = ggml_time_us();
+                status = ggml_backend_graph_compute(be, gf);
+                if (status != GGML_STATUS_SUCCESS) {
+                    fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+                    return false;
+                }
+                int64_t end_time = ggml_time_us();
 
-            // re-draw any data-dependent inputs (expert ids) outside the timed region
-            reinit_perf_iter(ctx.get());
-        } while (total_time_us < 1000*1000); // run for at least 1 second
+                total_time_us += end_time - start_time;
+                total_mem += mem;
+                total_runs += n_runs;
 
-        // Create test result
-        double avg_time_us      = (double) total_time_us / total_runs;
-        double calculated_flops = (op_flops(out) > 0) ? (op_flops(out) * total_runs) / (total_time_us / 1e6) : 0.0;
-        double calculated_bandwidth =
-            (op_flops(out) == 0) ? total_mem / (total_time_us / 1e6) / 1024.0 / 1024.0 / 1024.0 : 0.0;
-        size_t calculated_memory_kb = op_size(out) / 1024;
+                // re-draw any data-dependent inputs (expert ids) outside the timed region
+                reinit_perf_iter(ctx.get());
+            } while (total_time_us < 1000*1000); // run for at least 1 second
 
-        test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", true, true, "", avg_time_us,
-                           calculated_flops, calculated_bandwidth, calculated_memory_kb, total_runs);
+            // Create test result
+            double avg_time_us      = (double) total_time_us / total_runs;
+            double calculated_flops = (op_flops(out) > 0) ? (op_flops(out) * total_runs) / (total_time_us / 1e6) : 0.0;
+            double calculated_bandwidth =
+                (op_flops(out) == 0) ? total_mem / (total_time_us / 1e6) / 1024.0 / 1024.0 / 1024.0 : 0.0;
+            size_t calculated_memory_kb = op_size(out) / 1024;
 
-        if (output_printer) {
-            output_printer->print_test_result(result);
+            test_result result(ggml_backend_name(backend), current_op_name, vars() + arm_params, "perf", true, true, "", avg_time_us,
+                               calculated_flops, calculated_bandwidth, calculated_memory_kb, total_runs);
+
+            if (output_printer) {
+                output_printer->print_test_result(result);
+            }
         }
 
         return true;
@@ -5773,6 +5814,58 @@ struct test_mul_mat_id_read : public test_mul_mat_id {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_READ";
+    }
+    // Perf only. Quantizing all n_mats experts from random floats takes minutes per case for the IQ types, so one expert is
+    // quantized and copied into every expert's slot: each selected expert is still read from its own memory, so the kernels
+    // move the same bytes in the same pattern as with distinct experts.
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                continue;
+            }
+            if (strcmp(t->name, "as") != 0 || !ggml_is_quantized(t->type) || !ggml_is_contiguous(t)) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            const int64_t n_per_row = t->ne[0];
+            const int64_t nrows     = t->ne[1];
+            std::vector<float> data(n_per_row * nrows);
+            std::default_random_engine gen(std::random_device{}());
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            for (float & v : data) {
+                v = dist(gen);
+            }
+            std::vector<float>   imatrix(n_per_row, 1.0f);
+            std::vector<uint8_t> q(t->nb[2]);
+            const int64_t n_threads = std::max<int64_t>(1, std::min<int64_t>(nrows, N_THREADS));
+            std::vector<std::future<void>> tasks;
+            for (int64_t i = 0; i < n_threads; ++i) {
+                const int64_t r0 = nrows * i / n_threads;
+                const int64_t r1 = nrows * (i + 1) / n_threads;
+                tasks.push_back(std::async(std::launch::async, [&, r0, r1] {
+                    ggml_quantize_chunk(t->type, data.data(), q.data(), r0 * n_per_row, r1 - r0, n_per_row, imatrix.data());
+                }));
+            }
+            for (auto & task : tasks) {
+                task.get();
+            }
+            for (int64_t e = 0; e < t->ne[2]; ++e) {
+                ggml_backend_tensor_set(t, q.data(), e * t->nb[2], q.size());
+            }
+        }
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// MUL_MAT_ID of one token whose expert rows are not a multiple of 4 at a K the CUDA mat-vec small-K path covers in one
+// trip: that path computes 4 rows per block and guards its writes with the column stride, which on MUL_MAT_ID spans all
+// experts' rows, so the last block's surplus rows would land in the next expert's output (and past the last one). Its own
+// op name keeps it out of -o MUL_MAT_ID runs.
+struct test_mul_mat_id_tail : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_TAIL";
     }
 };
 
@@ -11433,6 +11526,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // The K values DeepSeek-V4.1 decodes at under a three-way tensor split (expert up/gate 5120, expert down 768, dense Q8_0
+    // attention 1280 and 2752), over every mat-vec batch size, in the types it decodes with, so the CUDA mat-vec block shapes
+    // (GGML_CUDA_MMVQ_VARIANT) are checked on the K they are tuned for. m = 64 takes every shape, 68 only the 4-row ones and
+    // 66 none of them: a shape whose rows per block do not divide m falls back to the base one. MUL_MAT_ID leaves out m = 66
+    // at K = 768, where one token takes the 4-row small-K path whose row guard does not hold for MUL_MAT_ID (see
+    // test_mul_mat_id_tail).
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_IQ2_XXS,
+                             GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
+        for (int64_t k : {768, 1280, 2752, 5120}) {
+            if (k % ggml_blck_size(type_a) != 0) {
+                continue;
+            }
+            for (int64_t m : {64, 66, 68}) {
+                for (int n = 1; n <= 8; ++n) {
+                    test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                    if (k == 5120 || (k == 768 && m != 66)) {
+                        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 6, false, m, n, k));
+                    }
+                }
+            }
+            if (k == 768 || k == 5120) {
+                // the fused gate/up + SwiGLU expert path, one token (mul_mat_vec_q) and several (mul_mat_vec_q_moe)
+                for (int64_t n_tokens : {1, 2, 4, 8}) {
+                    test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, n_tokens, 64, k,
+                        true, 8, 6, false, false, true, false));
+                }
+                // and the dense one-token path the shared experts take
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type_a, GGML_GLU_OP_SWIGLU, 1, 64, k,
+                    false, 8, 6, false, false, true, false, {1, 1}));
+            }
+        }
+    }
+
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_IQ2_XXS}) {
+        test_cases.emplace_back(new test_mul_mat_id_tail(type_a, GGML_TYPE_F32, 8, 6, false, 66, 1, 768));
+    }
+
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     // more than 256 experts (hoisted row-id path): 512 as in Qwen3.8-Flash-Next,
@@ -12700,6 +12830,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 11008, bs, 1280, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, bs, 2752, {1, 1}, {1, 1}));
+        // the Q6_K output head, which every rank holds whole (129280 vocab rows of the 5120 embedding)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 129280, bs, 5120, {1, 1}, {1, 1}));
     }
 
     // qwen3-30b-a3b
@@ -13465,7 +13597,9 @@ static void usage(char ** argv) {
     printf("  --list-ops                  list all available GGML operations\n");
     printf("  --show-coverage             show test coverage\n");
     printf("  --test-file <path>          read test operators from a test file generated by test-export-graph-ops\n");
-    printf("  -j <n>                      run tests using <n> parallel worker threads (default: 1, test mode only)\n\n");
+    printf("  -j <n>                      run tests using <n> parallel worker threads (default: 1, test mode only)\n");
+    printf("  --perf-arms <VAR=v1,v2,..>  perf mode: time each case once per value, with the environment variable VAR set to\n");
+    printf("                              it, on a fresh backend instance, in the given order (sets VAR_DYNAMIC=1 if unset)\n\n");
     printf("Examples:\n");
     printf("  %s -j 8\n", argv[0]);
     printf("  %s -o ADD,MUL_MAT\n", argv[0]);
@@ -13514,6 +13648,28 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--perf-arms") == 0) {
+            const char * arg = i + 1 < argc ? argv[++i] : nullptr;
+            const char * eq  = arg ? strchr(arg, '=') : nullptr;
+            if (!eq || eq == arg || eq[1] == '\0') {
+                usage(argv);
+                return 1;
+            }
+            g_perf_arm_var.assign(arg, eq - arg);
+            std::stringstream values(eq + 1);
+            for (std::string v; std::getline(values, v, ',');) {
+                g_perf_arm_values.push_back(v);
+            }
+            // a backend that reads VAR once (GGML_CUDA_MMVQ_VARIANT) re-reads it per launch when VAR_DYNAMIC=1, which it
+            // must be before the backend first reads VAR, else every arm would run the first arm's value
+            const std::string dynamic = g_perf_arm_var + "_DYNAMIC";
+#ifdef _WIN32
+            if (getenv(dynamic.c_str()) == nullptr) {
+                _putenv_s(dynamic.c_str(), "1");
+            }
+#else
+            setenv(dynamic.c_str(), "1", 0);
+#endif
         } else if (strcmp(argv[i], "--output") == 0) {
             if (i + 1 < argc) {
                 if (!output_format_from_str(argv[++i], output_format)) {
