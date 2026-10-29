@@ -3105,7 +3105,9 @@ public:
         // over RPC a hybrid model's recurrent state is dozens of tensors, each read from every rank.
         std::vector<ggml_backend_t> queued;
         for (const auto & winfo : winfos) {
-            ggml_backend_t backend = backend_of(winfo.tensor);
+            // a quantized tensor is read synchronously, as before: a backend may hold one in a layout of its own that
+            // only its synchronous getter reads back (CANN's async getter rejects quantized tensors)
+            ggml_backend_t backend = ggml_is_quantized(winfo.tensor->type) ? nullptr : backend_of(winfo.tensor);
             if (backend == nullptr) {
                 ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
                 continue;
