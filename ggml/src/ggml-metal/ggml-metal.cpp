@@ -12,6 +12,8 @@
 #include <mutex>
 #include <string>
 
+#include <unistd.h>
+
 #define GGML_METAL_NAME "MTL"
 #define GGML_METAL_MAX_DEVICES 16
 
@@ -526,6 +528,15 @@ static void ggml_backend_metal_set_tensor_async(ggml_backend_t backend, ggml_ten
 
 static void ggml_backend_metal_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    // the async read wraps `data` with newBufferWithBytesNoCopy, which Metal documents for page-aligned memory only;
+    // any other destination (a field of a serialized state, a vector's storage) is read once the queue is done
+    static const uintptr_t page_size = (uintptr_t) sysconf(_SC_PAGESIZE);
+    if ((uintptr_t) data % page_size != 0) {
+        ggml_metal_synchronize(ctx);
+        ggml_backend_tensor_get(tensor, data, offset, size);
+        return;
+    }
 
     ggml_metal_get_tensor_async(ctx, tensor, data, offset, size);
 }
