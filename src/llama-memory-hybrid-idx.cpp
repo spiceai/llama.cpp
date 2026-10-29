@@ -373,6 +373,13 @@ uint32_t kpool_pad(uint32_t n_pool, uint32_t n_pool_max) {
     return std::max<uint32_t>(std::min(padded, full), GGML_PAD(n_pool + 1, 64u));
 }
 
+// The new-pool list keeps the 64-pool step whatever LLAMA_KV_PAD is: each padded entry re-pools a cell of its own, and
+// a wider step could ask for more cells than a small cache has (a 256-cell cache whose ubatch holds one token of each
+// of 256 sequences). It changes size only while a prompt is read; a decode step's list is its bound, 1 or 2 entries.
+uint32_t kpool_new_pad(uint32_t n_pool) {
+    return std::max<uint32_t>(64u, GGML_PAD(n_pool + 1, 64u));
+}
+
 // The most pools the cache can hold: each sequence's cells, kpool to a pool.
 uint32_t kpool_n_max(const llama_memory_hybrid_idx * mem) {
     const auto * idx = mem->get_mem_idx();
@@ -726,7 +733,7 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     // as the count moves; reserve sizes the list for every pool the cache can hold, so never pad past n_pool_max
     const uint32_t n_pool_max = kv_size / kpool * idx->get_n_seq_max();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
-    st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real, n_pool_max) - 1, n_pool_max})});
+    st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_new_pad(st.n_pool_real) - 1, n_pool_max})});
 
     // while a prompt is read, size the pool list for the whole LLAMA_KV_PROMPT_PAD bucket, as the visible KV range is,
     // so the chunks of one prompt share a graph shape (the padded pools point at the sentinel row, like the one pool
