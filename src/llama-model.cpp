@@ -425,7 +425,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
     const bool is_glm5_next = ud->model->arch == LLM_ARCH_GLM5_NEXT;
-    const bool is_mistral_large4 = ud->model->arch == LLM_ARCH_MISTRAL_LARGE4;
+    // Mistral Large 4 and its DSpark drafter, whose dense MLA stages (kv_lora_rank) split as the target's attention does
+    const bool is_mistral_large4 = ud->model->arch == LLM_ARCH_MISTRAL_LARGE4 ||
+        (ud->model->arch == LLM_ARCH_DFLASH && hparams.n_lora_kv > 0);
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");

@@ -1842,17 +1842,26 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llama_model
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
+    const llama_model * output_model = &model;
     auto * output   = model.output;
     auto * output_s = model.output_s;
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->output != nullptr && "DSpark decoder requires the target model's output projection");
+        output_model = model_other;
         output   = model_other->output;
         output_s = model_other->output_s;
     }
 
     ggml_tensor * logits = build_lora_mm(output, cur, output_s);
+    if (cparams.logits_gather) {
+        logits = build_logits_gather(logits);
+    } else if (model.dspark_markov_w1 && output_model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        // a tensor split divides the output head by vocabulary rows, and the Markov head below adds its bias to whole
+        // rows and takes their argmax
+        logits = ggml_backend_meta_gather(ctx0, logits);
+    }
 
     // softcap does not apply to the markov bias
     if (hparams.f_final_logit_softcapping) {
