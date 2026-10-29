@@ -14,6 +14,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cinttypes>
 #include <cmath>
@@ -3099,13 +3100,30 @@ private:
 
 class llama_io_write_host : public llama_io_write_i {
 public:
+    // `backends`: the context's backends; a tensor one of them holds is read through it asynchronously, see below
     llama_io_write_host(
-            uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+            uint8_t * p, size_t len, const std::vector<ggml_backend_ptr> * backends = nullptr) : ptr(p), buf_size(len), backends(backends) {}
 
     ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
+        // A read from a buffer a non-host backend uses is queued on that backend, and each backend is synchronized once
+        // at the end, so the reads of one state overlap instead of each waiting for its own round trip: on a tensor split
+        // over RPC a hybrid model's recurrent state is dozens of tensors, each read from every rank.
+        std::vector<ggml_backend_t> queued;
         for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            // a quantized tensor is read synchronously, as before: a backend may hold one in a layout of its own that
+            // only its synchronous getter reads back (CANN's async getter rejects quantized tensors)
+            ggml_backend_t backend = ggml_is_quantized(winfo.tensor->type) ? nullptr : backend_of(winfo.tensor);
+            if (backend == nullptr) {
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+                continue;
+            }
+            ggml_backend_tensor_get_async(backend, winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            if (std::find(queued.begin(), queued.end(), backend) == queued.end()) {
+                queued.push_back(backend);
+            }
+        }
+        for (ggml_backend_t backend : queued) {
+            ggml_backend_synchronize(backend);
         }
     }
 
@@ -3148,6 +3166,22 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
+
+    const std::vector<ggml_backend_ptr> * backends;
+
+    // the backend that uses the buffer holding `tensor`, when it is not a host buffer, or nullptr
+    ggml_backend_t backend_of(const ggml_tensor * tensor) const {
+        if (backends == nullptr || tensor->buffer == nullptr || ggml_backend_buffer_is_host(tensor->buffer)) {
+            return nullptr;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+        for (const auto & backend : *backends) {
+            if (ggml_backend_supports_buft(backend.get(), buft)) {
+                return backend.get();
+            }
+        }
+        return nullptr;
+    }
 };
 
 class llama_io_read_host : public llama_io_read_i {
@@ -3574,7 +3608,7 @@ size_t llama_context::state_get_size() {
 }
 
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
-    llama_io_write_host io(dst, size);
+    llama_io_write_host io(dst, size, &backends);
     try {
         return state_write_data(io);
     } catch (const std::exception & err) {
@@ -3614,7 +3648,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
     } else {
-        io = std::make_unique<llama_io_write_host>(dst, size);
+        io = std::make_unique<llama_io_write_host>(dst, size, &backends);
     }
 
     try {

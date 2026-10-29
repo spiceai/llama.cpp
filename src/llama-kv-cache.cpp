@@ -1285,18 +1285,31 @@ uint32_t llama_kv_prompt_tokens(const llama_ubatch & ubatch) {
     return res;
 }
 
+uint32_t llama_kv_pad_cells() {
+    static const uint32_t pad = [] {
+        const char * v = getenv("LLAMA_KV_PAD");
+        const long   n = v != nullptr ? atol(v) : 0;
+        uint32_t pad = 256;
+        while (pad < (uint32_t) std::min<long>(std::max<long>(n, 0), 1L << 20)) {
+            pad *= 2;
+        }
+        return pad;
+    }();
+    return pad;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    uint32_t n_pad_cur = 256;
+    uint32_t n_pad_cur = std::max(256u, llama_kv_pad_cells());
 
     // while a ubatch reads a prompt (a sequence contributing more than one token), pad the visible range to the
     // LLAMA_KV_PROMPT_PAD bucket instead, so the chunks of one prompt share a graph shape and the split graph is reused
     // across them (a tensor-parallel head otherwise rebuilds and re-sends the graph for every 512-token chunk, since
-    // each chunk moves n_kv past a 256-cell boundary). Decode steps, batched ones included, keep the 256 padding.
-    // Off unless set.
+    // each chunk moves n_kv past a 256-cell boundary). Decode steps, batched ones included, keep the LLAMA_KV_PAD padding
+    // (256 cells unless set). LLAMA_KV_PROMPT_PAD is off unless set.
     const uint32_t prompt_pad = llama_kv_prompt_pad();
     if (prompt_pad > 0 && sinfo.n_seq_tokens_max > 1) {
         n_pad_cur = std::max(n_pad_cur, prompt_pad);
