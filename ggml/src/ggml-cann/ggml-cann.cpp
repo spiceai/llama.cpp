@@ -2115,14 +2115,7 @@ static void ggml_backend_cann_get_tensor_async(ggml_backend_t      backend,
     ggml_backend_buffer_t       buf      = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cann_buffer_type(cann_ctx->device) && "unsupported buffer type");
-
-    if (ggml_is_quantized(tensor->type)) {
-        // a quantized tensor may be held in CANN's own layout, which only the synchronous getter transforms back:
-        // read it once the stream is done (a saved state reads a quantized KV cache this way)
-        ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
-        ggml_backend_tensor_get(tensor, data, offset, size);
-        return;
-    }
+    GGML_ASSERT(!ggml_is_quantized(tensor->type));
 
     ACL_CHECK(aclrtMemcpyAsync(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST,
                                cann_ctx->stream()));
