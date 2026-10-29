@@ -13562,6 +13562,18 @@ int main(int argc, char ** argv) {
 
     // load and enumerate backends
     ggml_backend_load_all();
+    // LOCAL ONLY (not committed): TBO_RPC_SERVER=host:port adds that rpc-server's devices, as common/arg.cpp does
+    if (const char * ep = getenv("TBO_RPC_SERVER")) {
+        typedef ggml_backend_reg_t (*add_server_t)(const char * endpoint);
+        ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+        GGML_ASSERT(rpc_reg != nullptr);
+        add_server_t add_server = (add_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+        GGML_ASSERT(add_server != nullptr);
+        ggml_backend_reg_t reg = add_server(ep);
+        GGML_ASSERT(reg != nullptr);
+        ggml_backend_register(reg);
+        fprintf(stderr, "TBO_RPC_SERVER: added %s (%zu devices)\n", ep, ggml_backend_reg_dev_count(reg));
+    }
 
     // Create printer for output format
     std::unique_ptr<printer> output_printer = create_printer(output_format);
