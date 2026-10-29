@@ -353,16 +353,34 @@ struct llama_memory_hybrid_idx_context::kpool_state {
     uint32_t generation = 0;
 
     uint32_t n_pool_real = 0;
-    uint32_t n_pool_pad  = 64; // graph size of the pool list: kpool_pad(n_pool_real), or the LLAMA_KV_PROMPT_PAD bucket while a prompt is read
+    uint32_t n_pool_pad  = 64; // graph size of the pool list: kpool_pad(n_pool_real, n_pool_max), or the LLAMA_KV_PROMPT_PAD bucket while a prompt is read
     uint32_t n_new       = 0;
     uint32_t n_new_g     = 1; // graph size of the new pool list, stable across decode steps
 };
 
 namespace {
 
-// The last padded pool is always unused.
-uint32_t kpool_pad(uint32_t n_pool) {
+// The last padded pool is always unused. Pools are padded in step with the cells: 64 for every 256, see
+// llama_kv_pad_cells. As the visible cells stop at the cache's size, the padding stops at what the default padding
+// gives a cache of n_pool_max pools, so a large LLAMA_KV_PAD cannot size the pool list past what the cache holds.
+uint32_t kpool_pad(uint32_t n_pool, uint32_t n_pool_max) {
+    const uint32_t step   = 64u * (llama_kv_pad_cells() / 256u);
+    const uint32_t padded = std::max<uint32_t>(step, GGML_PAD(n_pool + 1, step));
+    const uint32_t full   = std::max<uint32_t>(64u, GGML_PAD(n_pool_max + 1, 64u));
+    return std::max<uint32_t>(std::min(padded, full), GGML_PAD(n_pool + 1, 64u));
+}
+
+// The new-pool list keeps the 64-pool step whatever LLAMA_KV_PAD is: each padded entry re-pools a cell of its own, and
+// a wider step could ask for more cells than a small cache has (a 256-cell cache whose ubatch holds one token of each
+// of 256 sequences). It changes size only while a prompt is read; a decode step's list is its bound, 1 or 2 entries.
+uint32_t kpool_new_pad(uint32_t n_pool) {
     return std::max<uint32_t>(64u, GGML_PAD(n_pool + 1, 64u));
+}
+
+// The most pools the cache can hold: each sequence's cells, kpool to a pool.
+uint32_t kpool_n_max(const llama_memory_hybrid_idx * mem) {
+    const auto * idx = mem->get_mem_idx();
+    return idx->get_size() / mem->get_kpool() * idx->get_n_seq_max();
 }
 
 // Rank of (pos, cell) in a sequence's cells sorted by position then cell, or -1 when absent.
@@ -485,7 +503,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
-        st.n_pool_pad  = kpool_pad(st.n_pool_real);
+        st.n_pool_pad  = kpool_pad(st.n_pool_real, uint32_t(n_pool_max));
         st.n_new   = st.n_pool_real;
         st.n_new_g = std::max(st.n_new, 1u);
         kpool_st = std::make_unique<kpool_state>(std::move(st));
@@ -611,7 +629,7 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 
     kpool_state st;
     st.n_pool_real = lay.n_pool_real;
-    st.n_pool_pad  = kpool_pad(st.n_pool_real);
+    st.n_pool_pad  = kpool_pad(st.n_pool_real, kpool_n_max(mem));
 
     return st;
 }
@@ -712,15 +730,15 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     // as the count moves; reserve sizes the list for every pool the cache can hold, so never pad past n_pool_max
     const uint32_t n_pool_max = kv_size / kpool * idx->get_n_seq_max();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
-    st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
+    st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_new_pad(st.n_pool_real) - 1, n_pool_max})});
 
     // while a prompt is read, size the pool list for the whole LLAMA_KV_PROMPT_PAD bucket, as the visible KV range is,
     // so the chunks of one prompt share a graph shape (the padded pools point at the sentinel row, like the one pool
     // kpool_pad always adds); decode steps, batched ones included, keep the tight padding
-    st.n_pool_pad = kpool_pad(st.n_pool_real);
+    st.n_pool_pad = kpool_pad(st.n_pool_real, n_pool_max);
     const uint32_t prompt_pad = llama_kv_prompt_pad();
     if (prompt_pad > 0 && llama_kv_prompt_tokens(ubatch) > 1) {
-        st.n_pool_pad = std::max(st.n_pool_pad, std::min(kpool_pad(prompt_pad / kpool), kpool_pad(n_pool_max)));
+        st.n_pool_pad = std::max(st.n_pool_pad, std::min(kpool_pad(prompt_pad / kpool, n_pool_max), kpool_pad(n_pool_max, n_pool_max)));
     }
 }
 
@@ -762,7 +780,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     const bool by_order = mem->get_kpool_by_order();
 
     GGML_ASSERT(n_pool == st.n_pool_pad);
-    GGML_ASSERT(st.n_pool_pad >= kpool_pad(st.n_pool_real) && "pool list sized below what the cache holds");
+    GGML_ASSERT(st.n_pool_pad >= kpool_pad(st.n_pool_real, kpool_n_max(mem)) && "pool list sized below what the cache holds");
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
