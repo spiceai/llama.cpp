@@ -38,7 +38,7 @@ static ggml_backend_meta_split_state split_of(const ggml_tensor * tensor, void *
 
 // Writes a tensor of shape ne split as `split`, then reads it whole and from each row, with the synchronous read and
 // then the async one, and checks that every read returns the bytes written.
-static bool check(const char * name, const test_split & split, int64_t ne0, int64_t ne1, int64_t ne2) {
+static bool check(const char * name, test_split & split, int64_t ne0, int64_t ne1, int64_t ne2) {
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     ggml_backend_dev_t simple_devs[2] = { cpu_dev, cpu_dev };
     ggml_backend_dev_t meta_dev = ggml_backend_meta_device(simple_devs, 2, split_of, (void *) &split);
@@ -104,12 +104,12 @@ int main() {
     GGML_ASSERT(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) != nullptr);
 
     // rows along dim 1, segments interleaved across the two devices within each row
-    const test_split axis0      = { GGML_BACKEND_SPLIT_AXIS_0, { {3, 1}, {2, 2} } };
+    test_split axis0      = { GGML_BACKEND_SPLIT_AXIS_0, { {3, 1}, {2, 2} } };
     // device 1 holds an empty slice of every tensor in the buffer, so its part is a dummy with no data
-    const test_split axis0_zero = { GGML_BACKEND_SPLIT_AXIS_0, { {4, 0}, {4, 0} } };
+    test_split axis0_zero = { GGML_BACKEND_SPLIT_AXIS_0, { {4, 0}, {4, 0} } };
     // rows along dim 2, segments of whole dim-0 rows
-    const test_split axis1      = { GGML_BACKEND_SPLIT_AXIS_1, { {2, 1}, {1, 2} } };
-    const test_split axis1_zero = { GGML_BACKEND_SPLIT_AXIS_1, { {3, 0}, {3, 0} } };
+    test_split axis1      = { GGML_BACKEND_SPLIT_AXIS_1, { {2, 1}, {1, 2} } };
+    test_split axis1_zero = { GGML_BACKEND_SPLIT_AXIS_1, { {3, 0}, {3, 0} } };
 
     bool ok = true;
     ok = check("axis 0, two segments",                       axis0,      8, 4, 1) && ok;
