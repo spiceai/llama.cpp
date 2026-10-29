@@ -182,10 +182,11 @@ llama_model_mistral_large4::graph::graph(const llama_model & model, const llm_gr
     ggml_tensor * ssmax_pos = ggml_scale_bias(ctx0, build_inp_attn_scale(), 1.0f, -1.0f);
     cb(ssmax_pos, "ssmax_pos", -1);
 
-    // per-head SSMax scale s * log(pos + 1) + b, {1, n_head, n_tokens}
+    // per-head SSMax scale s * log(pos + 1) + b, {1, n_head, n_tokens}; the per-head scale is repeated over the tokens,
+    // not the position over the heads, so under a tensor split a scale split by heads keeps its heads
     auto build_ssmax = [&](ggml_tensor * s, ggml_tensor * b, int64_t n_head_l) {
-        ggml_tensor * pos = ggml_repeat_4d(ctx0, ssmax_pos, 1, n_head_l, n_tokens, 1);
-        ggml_tensor * res = ggml_mul(ctx0, pos, ggml_reshape_3d(ctx0, s, 1, n_head_l, 1));
+        ggml_tensor * res = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, s, 1, n_head_l, 1), 1, n_head_l, n_tokens, 1);
+        res = ggml_mul(ctx0, res, ssmax_pos);
         return ggml_add(ctx0, res, ggml_reshape_3d(ctx0, b, 1, n_head_l, 1));
     };
 
