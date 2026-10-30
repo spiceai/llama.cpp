@@ -58,6 +58,12 @@ git merge <release>
 # resolve the conflicts; where the release now has a patch this branch carries (an upstream PR it picked, or an
 # equivalent), take the release's and keep only what it still lacks, then update the list above
 # set the release in spiceai/release.rs, and the version and description in Cargo.toml
+# fork PRs keep landing on the previous Spice branch while this one is made: merge it again just before tagging,
+# then check that every PR merged into it is in this branch (a PR stacked on another one's branch reaches it through
+# the PR that landed the stack, so it is not listed here)
+git fetch origin spiceai-<previous release> && git merge origin/spiceai-<previous release>
+gh pr list -R spiceai/llama.cpp --state merged --base spiceai-<previous release> --limit 500 --json number,mergeCommit \
+  --jq '.[] | "\(.number) \(.mergeCommit.oid)"' | while read -r n c; do git merge-base --is-ancestor "$c" HEAD || echo "missing #$n"; done
 git tag <release>-spiceai.1
 git push origin spiceai-<release> refs/tags/<release>-spiceai.1
 ```
