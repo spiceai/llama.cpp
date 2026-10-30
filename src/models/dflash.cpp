@@ -1710,6 +1710,10 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llama_model
         res->add_input(std::move(inp));
 
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+        if (cparams.logits_gather && llama_dspark_split()) {
+            // the norm below reads whole rows
+            inp_g = ggml_backend_meta_gather(ctx0, inp_g);
+        }
         inp_g = build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
         cb(inp_g, "main_x", -1);
 
