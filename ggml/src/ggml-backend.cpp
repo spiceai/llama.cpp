@@ -1826,8 +1826,9 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
 // GGML_SCHED_SYNC_INPUTS_ONCE=1 (or flag:<path>, re-checked at most every 100 ms): wait for a split's backend once before
 // copying the split's inputs instead of before each input. The wait makes sure the backend no longer uses the input
 // copies of its previous graph, and only these copies reach it in between, so one wait covers the split. A backend whose
-// synchronize is a round trip, like the meta backend over RPC servers, then pays it once per split.
-static bool ggml_backend_sched_sync_inputs_once() {
+// synchronize is a round trip, like the meta backend over RPC servers, then pays it once per split. Unset, it is on for a
+// split on the meta backend (a tensor split), and "0" turns it off there too.
+static bool ggml_backend_sched_sync_inputs_once(ggml_backend_t backend) {
     static const std::string mode = [] {
         const char * v = getenv("GGML_SCHED_SYNC_INPUTS_ONCE");
         return std::string(v != nullptr ? v : "");
@@ -1842,7 +1843,11 @@ static bool ggml_backend_sched_sync_inputs_once() {
         }
         return on.load(std::memory_order_relaxed);
     }
-    return atoi(mode.c_str()) != 0;
+    if (!mode.empty()) {
+        return atoi(mode.c_str()) != 0;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
 }
 
 // waits until the split backend no longer uses the input copies of its previous graph; split_backend_idle records a wait
@@ -1856,7 +1861,7 @@ static void ggml_backend_sched_wait_split_backend(ggml_backend_sched_t sched, in
     } else {
         ggml_backend_synchronize(sched->backends[split_backend_id]);
     }
-    *split_backend_idle = ggml_backend_sched_sync_inputs_once();
+    *split_backend_idle = ggml_backend_sched_sync_inputs_once(sched->backends[split_backend_id]);
 }
 
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, bool * split_backend_idle) {
