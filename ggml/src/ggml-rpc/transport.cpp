@@ -26,6 +26,7 @@
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 
 #ifdef GGML_RPC_RDMA
@@ -136,6 +137,7 @@ struct rdma_local_info {
     uint8_t  ib_port = 0;
     int      gid_idx = 0;
     enum ibv_mtu path_mtu = IBV_MTU_1024;
+    bool     self    = false; // the connection's two ends are this host
 };
 
 struct rdma_caps {
@@ -243,6 +245,77 @@ std::optional<rdma_gid_t> socket_t::impl::rdma_build_target_gid() {
 
 #ifndef GGML_RPC_RDMA_APPLE
 
+// Whether a connection's two ends are this host: the peer's address is the socket's own, as for a client that reaches a
+// server on this host at any of its addresses.
+static bool rdma_connects_to_self(sockfd_t fd) {
+    sockaddr_storage local = {};
+    sockaddr_storage peer  = {};
+    socklen_t local_len = sizeof(local);
+    socklen_t peer_len  = sizeof(peer);
+    if (getsockname(fd, reinterpret_cast<sockaddr *>(&local), &local_len) != 0 ||
+        getpeername(fd, reinterpret_cast<sockaddr *>(&peer), &peer_len) != 0 || local.ss_family != peer.ss_family) {
+        return false;
+    }
+    if (local.ss_family == AF_INET) {
+        return reinterpret_cast<const sockaddr_in *>(&local)->sin_addr.s_addr ==
+               reinterpret_cast<const sockaddr_in *>(&peer)->sin_addr.s_addr;
+    }
+    if (local.ss_family == AF_INET6) {
+        return memcmp(&reinterpret_cast<const sockaddr_in6 *>(&local)->sin6_addr,
+                      &reinterpret_cast<const sockaddr_in6 *>(&peer)->sin6_addr, sizeof(in6_addr)) == 0;
+    }
+    return false;
+}
+
+// A device's GID, by the device's name and the GID's index on its port.
+struct rdma_gid_ref {
+    std::string dev;
+    int         gid_idx;
+};
+
+// The GID a connection to this host itself goes through when no port has its address, as a /32 on the loopback interface
+// or 127.0.0.1: the IPv4 RoCE v2 GID of the first active port (of dev_env, when set). Both ends choose the same one, so
+// the NIC loops the connection back, which outpaces TCP over the loopback interface. std::nullopt when a port has the
+// address, which then carries the connection as any other, or when no active port has an IPv4 RoCE v2 GID.
+static std::optional<rdma_gid_ref> rdma_loopback_gid(const char * dev_env, const rdma_gid_t & target) {
+    const uint8_t ib_port = 1;
+    int num_devs = 0;
+    ibv_device ** devs = ibv_get_device_list(&num_devs);
+    if (!devs) {
+        return std::nullopt;
+    }
+    std::optional<rdma_gid_ref> loopback;
+    bool address_has_port = false;
+    for (int d = 0; d < num_devs && !address_has_port; d++) {
+        if (dev_env && strcmp(dev_env, ibv_get_device_name(devs[d])) != 0) continue;
+        ibv_context * ctx = ibv_open_device(devs[d]);
+        if (!ctx) continue;
+        ibv_port_attr pa;
+        if (ibv_query_port(ctx, ib_port, &pa) == 0) {
+            for (int i = 0; i < pa.gid_tbl_len; i++) {
+                ibv_gid_entry entry = {};
+                if (ibv_query_gid_ex(ctx, ib_port, i, &entry, 0) != 0) continue;
+                if (memcmp(entry.gid.raw, target.data(), RDMA_GID_SIZE) == 0) {
+                    address_has_port = true;
+                    break;
+                }
+                // ::ffff:a.b.c.d, an IPv4 address's GID
+                static const uint8_t ipv4_prefix[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+                if (!loopback && pa.state == IBV_PORT_ACTIVE && entry.gid_type == IBV_GID_TYPE_ROCE_V2 &&
+                    memcmp(entry.gid.raw, ipv4_prefix, sizeof(ipv4_prefix)) == 0) {
+                    loopback = rdma_gid_ref{ ibv_get_device_name(devs[d]), i };
+                }
+            }
+        }
+        ibv_close_device(ctx);
+    }
+    ibv_free_device_list(devs);
+    if (address_has_port) {
+        return std::nullopt;
+    }
+    return loopback;
+}
+
 bool socket_t::impl::tcp_peer_closed() {
     if (fd < 0) return false;
 #ifndef _WIN32
@@ -262,6 +335,16 @@ bool socket_t::impl::rdma_probe() {
     if (!target_gid) {
         return false;
     }
+    rdma_local.self = rdma_connects_to_self(fd);
+    // a connection to this host at an address no port has takes the port rdma_loopback_gid chose, by name and index
+    std::optional<rdma_gid_ref> loopback;
+    if (!gid_env && rdma_local.self) {
+        loopback = rdma_loopback_gid(dev_env, *target_gid);
+        if (loopback) {
+            dev_env = loopback->dev.c_str();
+        }
+    }
+    const bool to_self = loopback.has_value();
 
     const uint8_t ib_port = 1;
     int num_devs = 0;
@@ -270,7 +353,7 @@ bool socket_t::impl::rdma_probe() {
 
     ibv_context * ibctx = nullptr;
     const char * matched_dev = nullptr;
-    int gid_idx = gid_env ? atoi(gid_env) : -1;
+    int gid_idx = gid_env ? atoi(gid_env) : loopback ? loopback->gid_idx : -1;
     int gid_version = IBV_GID_TYPE_IB;  // 0 = unknown/IB
 
     for (int d = 0; d < num_devs; d++) {
@@ -328,6 +411,12 @@ bool socket_t::impl::rdma_probe() {
     }
     ibv_free_device_list(devs);
     if (!ibctx) return false;
+    // A connection to this host shares RDMA only over RoCE v2: its two ends compare GID bytes alone (update_caps), and
+    // a RoCE v1 entry has the same bytes as the v2 one, so an end that chose v1 advertises nothing and both stay on TCP
+    if (rdma_local.self && gid_version != IBV_GID_TYPE_ROCE_V2) {
+        ibv_close_device(ibctx);
+        return false;
+    }
 
     rdma_local.ib_port = ib_port;
     rdma_local.gid_idx = gid_idx;
@@ -380,8 +469,9 @@ bool socket_t::impl::rdma_probe() {
     } else if (gid_version == IBV_GID_TYPE_ROCE_V1) {
         ver_str = " RoCEv1";
     }
-    LOG_INFO("RDMA probed: dev=%s gid=%d%s qpn=%u inline=%u\n",
-                  matched_dev, gid_idx, ver_str, rdma_local.qpn, rdma->max_inline);
+    LOG_INFO("RDMA probed: dev=%s gid=%d%s qpn=%u inline=%u%s\n",
+                  matched_dev, gid_idx, ver_str, rdma_local.qpn, rdma->max_inline,
+                  to_self ? " (a connection to this host, looped back by the NIC)" : "");
     return true;
 }
 
@@ -768,6 +858,16 @@ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
 #  else
     rdma_caps rc = {};
     memcpy(&rc, remote_caps, sizeof(rc));
+    // The two ends of a connection to this host each choose their port, from their own GGML_RDMA_DEV and GGML_RDMA_GID,
+    // and two ports need not reach each other: they share RDMA only when they chose the same GID, which both ends see.
+    // A peer from a build without this check activates whenever both ends advertise RDMA, so a connection to this host
+    // needs both ends from this build, or the same GGML_RDMA_DEV and GGML_RDMA_GID on both
+    if (rdma_local.self && memcmp(rc.gid, rdma_local.gid, RDMA_GID_SIZE) != 0) {
+        LOG_WARN("[%s] the two ends of a connection to this host chose different RDMA ports, continuing with TCP\n",
+                 __func__);
+        rdma.reset();
+        return;
+    }
     bool activated = rdma_activate(rc.qpn, rc.psn, rc.gid);
 #  endif
     if (activated) {
