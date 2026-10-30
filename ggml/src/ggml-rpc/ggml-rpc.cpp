@@ -18,6 +18,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <list>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
@@ -131,6 +132,74 @@ const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 // Maximum number of graphs cached per device; client and server must use the same value
 // so that both sides clear their caches at the same point in the message stream
 const size_t GRAPH_CACHE_MAX = 1024;
+
+// GGML_RPC_GRAPH_CACHE_MAX overrides GRAPH_CACHE_MAX (for tests); like it, it must be the same on both ends
+static size_t rpc_graph_cache_max() {
+    static const size_t cap = [] {
+        const char * v = std::getenv("GGML_RPC_GRAPH_CACHE_MAX");
+        const long   n = v != nullptr ? std::atol(v) : 0;
+        return n > 0 ? (size_t) n : GRAPH_CACHE_MAX;
+    }();
+    return cap;
+}
+
+// GGML_RPC_GRAPH_LRU=1: a full graph cache evicts its least recently computed graph instead of clearing every graph.
+// Off unless set, and it must be set on the client and on every server alike: both sides evict by the same rule, so a
+// mismatch shows as a server that cannot find a graph the client recomputes, and the connection fails.
+static bool rpc_graph_lru() {
+    static const bool on = [] {
+        const char * v = std::getenv("GGML_RPC_GRAPH_LRU");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+// The uids of the graphs one device holds, the most recently computed first. The client and the server see the same
+// computes and recomputes in the same order, so with the same capacity and rule they keep the same graphs.
+struct graph_cache_order {
+    struct added {
+        bool     cleared = false; // the cache was full and cleared every graph
+        uint64_t evicted = 0;     // the least recently computed graph it dropped instead (GGML_RPC_GRAPH_LRU)
+    };
+
+    bool touch(uint64_t uid) {
+        auto it = pos.find(uid);
+        if (it == pos.end()) {
+            return false;
+        }
+        order.splice(order.begin(), order, it->second);
+        return true;
+    }
+
+    // adds a graph the cache does not hold
+    added add(uint64_t uid) {
+        added result;
+        if (order.size() >= rpc_graph_cache_max()) {
+            if (rpc_graph_lru()) {
+                result.evicted = order.back();
+                pos.erase(result.evicted);
+                order.pop_back();
+            } else {
+                result.cleared = true;
+                clear();
+            }
+        }
+        order.push_front(uid);
+        pos[uid] = order.begin();
+        return result;
+    }
+
+    void clear() {
+        order.clear();
+        pos.clear();
+    }
+
+    size_t size() const { return order.size(); }
+
+  private:
+    std::list<uint64_t> order;
+    std::unordered_map<uint64_t, std::list<uint64_t>::iterator> pos;
+};
 
 struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
@@ -640,7 +709,7 @@ private:
         std::shared_future<void> sf;
     };
     std::mutex graph_mutex;
-    std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
+    std::unordered_map<uint32_t, graph_cache_order> graph_uids;
     rpc_msg_queue    queue;
     socket_ptr       sock;
     std::atomic_uint busy_spin_users = 0;
@@ -1608,7 +1677,7 @@ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) 
     std::lock_guard<std::mutex> lock(graph_mutex);
     GGML_ASSERT(cgraph->n_nodes > 0);
     auto & device_graph_uids = graph_uids[device];
-    bool reuse = cgraph->uid != 0 && device_graph_uids.count(cgraph->uid) > 0;
+    bool reuse = cgraph->uid != 0 && device_graph_uids.touch(cgraph->uid);
     LOG_DBG("[%s] device: %u, uid: %" PRIu64 ", n_nodes: %u, reuse: %s\n", __func__, device, cgraph->uid, cgraph->n_nodes, reuse ? "yes" : "no");
     if (reuse) {
         auto request = std::make_shared<rpc_msg_graph_recompute_req>();
@@ -1617,12 +1686,13 @@ void rpc_dispatcher::graph_compute(uint32_t device, const ggml_cgraph * cgraph) 
         send_async(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request));
     } else {
         if (cgraph->uid != 0) {
-            if (device_graph_uids.size() >= GRAPH_CACHE_MAX) {
-                LOG_DBG("[%s] clearing graph cache for device %u (%zu entries)\n",
-                        __func__, device, device_graph_uids.size());
-                device_graph_uids.clear();
+            const size_t n_cached = device_graph_uids.size();
+            const auto added = device_graph_uids.add(cgraph->uid);
+            if (added.cleared) {
+                LOG_DBG("[%s] cleared graph cache for device %u (%zu entries)\n", __func__, device, n_cached);
+            } else if (added.evicted != 0) {
+                LOG_DBG2("[%s] evicted graph %" PRIu64 " from device %u\n", __func__, added.evicted, device);
             }
-            device_graph_uids.insert(cgraph->uid);
         }
         size_t input_size = 0;
         uint8_t * input = serialize_graph(device, cgraph, this, &input_size);
@@ -1863,6 +1933,7 @@ public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
         : backends(std::move(all_backends)), cache_dir(cache_dir) {
         stored_graphs.resize(backends.size());
+        stored_order.resize(backends.size());
         comm_states.resize(backends.size());
     }
     ~rpc_server();
@@ -1946,8 +2017,9 @@ private:
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
-    // computed graphs cached per backend, keyed by uid
+    // computed graphs cached per backend, keyed by uid, and the order the client keeps them in
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
+    std::vector<graph_cache_order> stored_order;
     std::vector<comm_state> comm_states;
 };
 
@@ -2071,6 +2143,9 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     // count the same entries towards GRAPH_CACHE_MAX.
     for (auto & sgs : stored_graphs) {
         sgs.clear();
+    }
+    for (auto & order : stored_order) {
+        order.clear();
     }
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
@@ -2668,11 +2743,16 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     const rpc_tensor * tensors = (const rpc_tensor *)src;
     LOG_DBG("[%s] device: %u, uid: %" PRIu64 ", n_nodes: %u, n_tensors: %u\n", __func__, device, uid, n_nodes, n_tensors);
 
-    // graphs with uid == 0 are not cached, see GRAPH_CACHE_MAX for the eviction policy
-    if (uid != 0 && stored_graphs[device].size() >= GRAPH_CACHE_MAX) {
-        LOG_DBG("[%s] clearing graph cache for device %u (%zu entries)\n",
-                __func__, device, stored_graphs[device].size());
-        stored_graphs[device].clear();
+    // graphs with uid == 0 are not cached; a full cache drops graphs as the client does (graph_cache_order)
+    if (uid != 0 && !stored_order[device].touch(uid)) {
+        const size_t n_cached = stored_order[device].size();
+        const auto added = stored_order[device].add(uid);
+        if (added.cleared) {
+            LOG_DBG("[%s] cleared graph cache for device %u (%zu entries)\n", __func__, device, n_cached);
+            stored_graphs[device].clear();
+        } else if (added.evicted != 0) {
+            stored_graphs[device].erase(added.evicted);
+        }
     }
     stored_graph sg_tmp;
     stored_graph & sg = uid != 0 ? stored_graphs[device][uid] : sg_tmp;
@@ -2732,6 +2812,7 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
         return false;
     }
     ggml_cgraph * graph = it->second.graph;
+    stored_order[device].touch(request.uid);
     LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
     ggml_status status = ggml_backend_graph_compute_async(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
