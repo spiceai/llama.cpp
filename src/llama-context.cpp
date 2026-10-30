@@ -730,7 +730,8 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
 }
 
 // LLAMA_GRAPH_SLOTS: "2" gives each context a second scheduler, so a context alternating between two graphs reuses
-// both; "flag:<path>" uses the second only while <path> exists (re-checked at most every 100 ms)
+// both; "flag:<path>" uses the second only while <path> exists (re-checked at most every 100 ms). Unset, a tensor split
+// (whose graph rebuild sends every device's graph again) gets the second scheduler and any other model does not.
 static const std::string & llama_graph_slots_mode() {
     static const std::string mode = [] {
         const char * v = getenv("LLAMA_GRAPH_SLOTS");
@@ -739,7 +740,7 @@ static const std::string & llama_graph_slots_mode() {
     return mode;
 }
 
-static bool llama_graph_slots_on() {
+static bool llama_graph_slots_on(bool tensor_split) {
     const std::string & mode = llama_graph_slots_mode();
     if (mode.rfind("flag:", 0) == 0) {
         static std::atomic<int64_t> next_check_us{0};
@@ -751,7 +752,7 @@ static bool llama_graph_slots_on() {
         }
         return on.load(std::memory_order_relaxed);
     }
-    return atoi(mode.c_str()) >= 2;
+    return mode.empty() ? tensor_split : atoi(mode.c_str()) >= 2;
 }
 
 static bool llama_graph_slots_all_outputs() {
@@ -780,7 +781,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
     // LLAMA_GRAPH_SLOTS=2: one scheduler per graph slot, so a context alternating between two graphs reuses both
-    const bool graph_slots = llama_graph_slots_mode().rfind("flag:", 0) == 0 || atoi(llama_graph_slots_mode().c_str()) >= 2;
+    const std::string & slots_mode = llama_graph_slots_mode();
+    const bool graph_slots = slots_mode.rfind("flag:", 0) == 0 ||
+        (slots_mode.empty() ? model.split_mode() == LLAMA_SPLIT_MODE_TENSOR : atoi(slots_mode.c_str()) >= 2);
     sched_alt.reset();
     sched_slot = 0;
     gf_res_prev_active_alt = nullptr;
@@ -1642,7 +1645,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // counts) binds them to the graph it is built into, and a slot switch would reuse the other graph without
         // rebinding them, so its inputs would be set in one graph and read in the other: such a chain keeps one
         // graph slot, as without LLAMA_GRAPH_SLOTS (a greedy chain binds none)
-        sched_slots_on = llama_graph_slots_on() && !sampling_binds_inputs();
+        sched_slots_on = llama_graph_slots_on(model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) && !sampling_binds_inputs();
         const int slot = sched_slots_on && n_outputs > 0 && (!all_outputs || n_outputs == ubatch.n_tokens);
         if (slot != sched_slot) {
             std::swap(sched, sched_alt);
