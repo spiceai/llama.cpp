@@ -292,6 +292,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             n_head = 6; // whole heads per device when the tensor split runs on 2 or 3 devices
         }
         if (arch == LLM_ARCH_MISTRAL_LARGE4) {
+            n_head  = 6; // whole heads per device when the tensor split runs on 2 or 3 devices
             n_layer = 4; // cover NoPE, shared indexer and KV sharing layers
         }
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -369,7 +370,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41) ? uint32_t(1) : n_head_kv);
+        // MLA keeps one latent KV head, as Mistral Large 4's GGUF does
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 ||
+            arch == LLM_ARCH_MISTRAL_LARGE4) ? uint32_t(1) : n_head_kv);
     }
 
     ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS, 8.0f);

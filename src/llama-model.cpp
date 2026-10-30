@@ -425,6 +425,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
     const bool is_glm5_next = ud->model->arch == LLM_ARCH_GLM5_NEXT;
+    // Mistral Large 4 and its DSpark drafter, whose dense MLA stages (kv_lora_rank) split as the target's attention does
+    const bool is_mistral_large4 = ud->model->arch == LLM_ARCH_MISTRAL_LARGE4 ||
+        (ud->model->arch == LLM_ARCH_DFLASH && hparams.n_lora_kv > 0);
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -459,6 +462,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ssm_conv1d_qkv  ("blk\\.\\d*\\.ssm_conv1d_(q|k|v)\\.weight"); // GLM5-Next KDA
     static const std::regex pattern_ssm_fg_b        ("blk\\.\\d*\\.ssm_(f|g)_b\\.weight");       // GLM5-Next KDA gates
     static const std::regex pattern_attn_kv_b_weight("blk\\.\\d*\\.attn_(k|v)_b\\.weight");      // MLA per-head K/V up-projections
+    static const std::regex pattern_attn_ssmax      ("blk\\.\\d*\\.attn_ssmax\\.(weight|bias)");  // per-head SSMax scale and bias
 
     static const std::regex pattern_ffn_up_weight     ("blk\\.\\d*\\.ffn_up(_exps)?.weight");
     static const std::regex pattern_ffn_up_bias       ("blk\\.\\d*\\.ffn_up(_exps)?.bias");
@@ -572,6 +576,31 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
                     std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
+                    std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+            }
+        }
+
+        // Mistral Large 4: MLA split by whole query heads, as in GLM5-Next. The latent and indexer caches (both named
+        // cache_k_l<il>), the latent projection and the indexer are mirrored, so every device computes them in full and
+        // attends over the whole latent with its own heads; the per-head SSMax scale goes with those heads
+        if (is_mistral_large4) {
+            if (std::regex_match(tensor_name, pattern_kv_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            if (std::regex_match(tensor_name, pattern_q_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_attn_kv_b_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_attn_ssmax)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
             }
             if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
@@ -811,16 +840,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return {g * head_dim};
             }
         }
-        if (is_glm5_next && !hparams.is_recr(il)) {
+        if ((is_glm5_next && !hparams.is_recr(il)) || is_mistral_large4) {
             // MLA: whole heads, and no quant block of the output projection straddles two devices
             const int64_t dk      = hparams.n_embd_head_k_mla();
             const int64_t dv      = hparams.n_embd_head_v_mla();
             const int64_t g_heads = std::lcm(std::lcm(blck_size, (int64_t) 128), dv) / dv;
-            if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
+            if (std::regex_match(tensor_name, pattern_attn_q_b_weight) ||
+                    (is_mistral_large4 && std::regex_match(tensor_name, pattern_q_weight))) {
                 GGML_ASSERT(segments.size() == 1);
                 return {g_heads * dk};
             }
-            if (std::regex_match(tensor_name, pattern_attn_kv_b_weight)) {
+            if (std::regex_match(tensor_name, pattern_attn_kv_b_weight) || std::regex_match(tensor_name, pattern_attn_ssmax)) {
                 GGML_ASSERT(segments.size() == 1);
                 return {g_heads};
             }
