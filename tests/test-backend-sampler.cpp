@@ -456,14 +456,20 @@ static void test_row_argmax(const test_params & params) {
         }
     }
     // a row a backend sampler sampled holds only its candidates, so there is no pick from the row
-    {
+    // picks: the chain also picks a token on the backend; !picks: top-k alone, as the DSpark drafter attaches it
+    for (const bool picks : {true, false}) {
         llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
-        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(8));
-        llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(10));
+        if (picks) {
+            llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
+        }
         std::vector<llama_sampler_seq_config> configs = {{0, chain.get()}};
         test_context test_ctx(params, configs);
         GGML_ASSERT(test_ctx.decode({{0, "Write a Python function"}}));
-        GGML_ASSERT(common_sampler_row_argmax(test_ctx.ctx.get(), test_ctx.idx_for_seq(0)) == LLAMA_TOKEN_NULL);
+        const int32_t idx = test_ctx.idx_for_seq(0);
+        GGML_ASSERT((llama_get_sampled_token_ith(test_ctx.ctx.get(), idx) != LLAMA_TOKEN_NULL) == picks);
+        GGML_ASSERT(llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), idx) == 10);
+        GGML_ASSERT(common_sampler_row_argmax(test_ctx.ctx.get(), idx) == LLAMA_TOKEN_NULL);
     }
 }
 
