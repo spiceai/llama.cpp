@@ -990,6 +990,67 @@ static void dtm(const char * mark) {
     }
 }
 
+// The token with the largest logit in output row idx of ctx, the first on a tie, as the greedy sampler picks it, read
+// from the row in place. LLAMA_TOKEN_NULL when the row went through a backend sampler, which leaves the CPU only its
+// candidates, or was not output.
+//
+// The greedy sampler walks the row from its first logit and moves to a later one only when it is larger, and no
+// comparison with a NaN holds: it picks token 0 when the first logit is a NaN, and otherwise the first token whose logit
+// is the largest of those that are not. This finds that token in two passes the compiler can vectorize, the largest
+// logit and then where it first appears; a single scan that keeps the running maximum waits on a compare at each logit.
+static llama_token common_speculative_row_argmax(llama_context * ctx, int32_t idx) {
+    if (llama_get_sampled_token_ith (ctx, idx) != LLAMA_TOKEN_NULL ||
+        llama_get_sampled_logits_ith(ctx, idx) != nullptr ||
+        llama_get_sampled_probs_ith (ctx, idx) != nullptr) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    if (logits == nullptr || n_vocab <= 0) {
+        return LLAMA_TOKEN_NULL;
+    }
+    if (std::isnan(logits[0])) {
+        return 0;
+    }
+
+    // the largest logit that is not a NaN: a NaN fails the compare and never replaces a lane
+    constexpr int32_t n_lanes = 16;
+    float lanes[n_lanes];
+    std::fill(lanes, lanes + n_lanes, -INFINITY);
+    int32_t id = 0;
+    for (; id + n_lanes <= n_vocab; id += n_lanes) {
+        for (int32_t l = 0; l < n_lanes; ++l) {
+            lanes[l] = logits[id + l] > lanes[l] ? logits[id + l] : lanes[l];
+        }
+    }
+    float max_logit = -INFINITY;
+    for (; id < n_vocab; ++id) {
+        max_logit = logits[id] > max_logit ? logits[id] : max_logit;
+    }
+    for (const float lane : lanes) {
+        max_logit = lane > max_logit ? lane : max_logit;
+    }
+
+    // no logit exceeds max_logit, so >= holds exactly for those equal to it (either zero for a zero), never for a NaN
+    constexpr int32_t n_block = 64;
+    for (int32_t beg = 0; beg < n_vocab; beg += n_block) {
+        const int32_t end = std::min(beg + n_block, n_vocab);
+        bool hit = false;
+        for (int32_t t = beg; t < end; ++t) {
+            hit |= logits[t] >= max_logit;
+        }
+        if (hit) {
+            for (int32_t t = beg; t < end; ++t) {
+                if (logits[t] >= max_logit) {
+                    return t;
+                }
+            }
+        }
+    }
+    return 0; // not reached: logits[0] is not a NaN, so some logit equals max_logit
+}
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1032,6 +1093,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // dspark speculators
     bool sample_from_anchor = true;
+
+    // whether each sequence's CPU chain is top-k and its final pick alone, so the first candidate it leaves, the
+    // DSpark draft token, is the row's largest logit
+    bool cpu_top1_is_argmax = false;
 
     // block-internal attention
     bool causal_attn = false;
@@ -1124,12 +1189,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
 
         smpls.resize(n_seq);
+        cpu_top1_is_argmax = true;
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(model_dft, sparams));
+
+            // no grammar or reasoning budget runs ahead of the chain with these parameters, and only a logit bias (the
+            // vocabulary's suppressed tokens) can come ahead of top-k in it
+            llama_sampler * chain = common_sampler_get(s.get());
+            cpu_top1_is_argmax = cpu_top1_is_argmax && llama_sampler_chain_n(chain) == 2 &&
+                std::strcmp(llama_sampler_name(llama_sampler_chain_get(chain, 0)), "top-k") == 0;
         }
 
         // offload draft sampling to the backend
@@ -1487,17 +1559,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         break;
                     }
 
-                    common_sampler_sample(smpl, ctx_dft, idx, true);
+                    // the draft token is the CPU chain's first candidate; when that is the row's largest logit, read
+                    // it from the row instead of copying the row into a candidate per vocabulary token to top-k sort
+                    llama_token id = cpu_top1_is_argmax ? common_speculative_row_argmax(ctx_dft, idx) : LLAMA_TOKEN_NULL;
 
-                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                    if (id == LLAMA_TOKEN_NULL) {
+                        common_sampler_sample(smpl, ctx_dft, idx, true);
 
-                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                        const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                        for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                            LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                    seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                    common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                        }
+
+                        id = cur_p->data[0].id;
+                    } else {
+                        LOG_DBG(" - seq_id %d, draft pos %3d: %6d, the row's largest logit '%s'\n",
+                                seq_id, i, id, common_token_to_piece(ctx_dft, id).c_str());
                     }
-
-                    const llama_token id = cur_p->data[0].id;
 
                     common_sampler_accept(smpl, id, true);
 
