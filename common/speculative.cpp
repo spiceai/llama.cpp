@@ -990,61 +990,6 @@ static void dtm(const char * mark) {
     }
 }
 
-// The greedy sampler's pick from output row idx (first max on a tie, a NaN never wins), read from the row in two vectorizable passes.
-// LLAMA_TOKEN_NULL when a backend sampler sampled the row (the CPU then has only its candidates) or the row was not output.
-static llama_token common_speculative_row_argmax(llama_context * ctx, int32_t idx) {
-    if (llama_get_sampled_token_ith (ctx, idx) != LLAMA_TOKEN_NULL ||
-        llama_get_sampled_logits_ith(ctx, idx) != nullptr ||
-        llama_get_sampled_probs_ith (ctx, idx) != nullptr) {
-        return LLAMA_TOKEN_NULL;
-    }
-
-    const float * logits = llama_get_logits_ith(ctx, idx);
-    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
-    if (logits == nullptr || n_vocab <= 0) {
-        return LLAMA_TOKEN_NULL;
-    }
-    if (std::isnan(logits[0])) {
-        return 0;
-    }
-
-    // pass 1: largest logit that is not a NaN (a NaN fails the compare and never replaces a lane)
-    constexpr int32_t n_lanes = 16;
-    float lanes[n_lanes];
-    std::fill(lanes, lanes + n_lanes, -INFINITY);
-    int32_t id = 0;
-    for (; id + n_lanes <= n_vocab; id += n_lanes) {
-        for (int32_t l = 0; l < n_lanes; ++l) {
-            lanes[l] = logits[id + l] > lanes[l] ? logits[id + l] : lanes[l];
-        }
-    }
-    float max_logit = -INFINITY;
-    for (; id < n_vocab; ++id) {
-        max_logit = logits[id] > max_logit ? logits[id] : max_logit;
-    }
-    for (const float lane : lanes) {
-        max_logit = lane > max_logit ? lane : max_logit;
-    }
-
-    // pass 2: first logit equal to max_logit (no logit exceeds it, so >= means equal, and is false for a NaN)
-    constexpr int32_t n_block = 64;
-    for (int32_t beg = 0; beg < n_vocab; beg += n_block) {
-        const int32_t end = std::min(beg + n_block, n_vocab);
-        bool hit = false;
-        for (int32_t t = beg; t < end; ++t) {
-            hit |= logits[t] >= max_logit;
-        }
-        if (hit) {
-            for (int32_t t = beg; t < end; ++t) {
-                if (logits[t] >= max_logit) {
-                    return t;
-                }
-            }
-        }
-    }
-    return 0; // not reached: logits[0] is not a NaN, so pass 2 finds max_logit
-}
-
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1552,7 +1497,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
 
                     // read the draft token from the row when it is the chain's first candidate, instead of filling and top-k sorting candidates
-                    llama_token id = cpu_top1_is_argmax ? common_speculative_row_argmax(ctx_dft, idx) : LLAMA_TOKEN_NULL;
+                    llama_token id = cpu_top1_is_argmax ? common_sampler_row_argmax(ctx_dft, idx) : LLAMA_TOKEN_NULL;
 
                     if (id == LLAMA_TOKEN_NULL) {
                         common_sampler_sample(smpl, ctx_dft, idx, true);

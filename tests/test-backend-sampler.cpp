@@ -440,6 +440,33 @@ static void test_greedy_filtered(const test_params & params) {
     }
 }
 
+static void test_row_argmax(const test_params & params) {
+    // a row no backend sampler touched: the greedy sampler's pick, read from the logits
+    {
+        std::vector<llama_sampler_seq_config> configs;
+        test_context test_ctx(params, configs, 1);
+        GGML_ASSERT(test_ctx.decode({{0, "Write a Python function"}}));
+        llama_sampler_ptr greedy(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(greedy.get(), llama_sampler_init_greedy());
+        for (int step = 0; step < 8; ++step) {
+            const int32_t idx = test_ctx.idx_for_seq(0);
+            const llama_token expected = llama_sampler_sample(greedy.get(), test_ctx.ctx.get(), idx);
+            GGML_ASSERT(common_sampler_row_argmax(test_ctx.ctx.get(), idx) == expected);
+            GGML_ASSERT(test_ctx.decode_token(expected));
+        }
+    }
+    // a row a backend sampler sampled holds only its candidates, so there is no pick from the row
+    {
+        llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(8));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_greedy());
+        std::vector<llama_sampler_seq_config> configs = {{0, chain.get()}};
+        test_context test_ctx(params, configs);
+        GGML_ASSERT(test_ctx.decode({{0, "Write a Python function"}}));
+        GGML_ASSERT(common_sampler_row_argmax(test_ctx.ctx.get(), test_ctx.idx_for_seq(0)) == LLAMA_TOKEN_NULL);
+    }
+}
+
 static void test_top_k(const test_params & params) {
     const int seq_id = 0;
     const int32_t k = 8;
@@ -2072,6 +2099,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_greedy",                 test_greedy,                 true },
     { "test_greedy_filtered",        test_greedy_filtered,        true },
     { "test_greedy_filtered_common", test_greedy_filtered_common, true },
+    { "test_row_argmax",             test_row_argmax,             true },
     { "test_temp",                   test_temp,                   true },
     { "test_temp_ext",               test_temp_ext,               true },
     { "test_top_k",                  test_top_k,                  true },

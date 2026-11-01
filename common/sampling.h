@@ -124,6 +124,13 @@ void common_sampling_add_preserved_tokens(common_params_sampling & sampling, con
 // add grammar triggers, a trigger word that is a single token becomes a token trigger and must be a preserved token
 void common_sampling_add_grammar_triggers(common_params_sampling & sampling, const llama_vocab * vocab, std::vector<common_grammar_trigger> triggers);
 
+// the greedy sampler's pick from n > 0 logits (first max on a tie, a NaN never wins), found in two vectorizable passes
+llama_token common_logits_argmax(const float * logits, int32_t n);
+
+// the same pick from output row idx of ctx, read in place
+// LLAMA_TOKEN_NULL when a backend sampler sampled the row (the CPU then has only its candidates) or the row was not output
+llama_token common_sampler_row_argmax(llama_context * ctx, int32_t idx);
+
 llama_sampler * llama_sampler_init_llg(const llama_vocab * vocab,
                 const char * grammar_kind, const char * grammar_data);
 
