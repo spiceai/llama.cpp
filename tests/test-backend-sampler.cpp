@@ -467,6 +467,40 @@ static void test_row_argmax(const test_params & params) {
     }
 }
 
+static void test_top1_is_argmax(const test_params & params) {
+    auto top1_is_argmax = [&](common_params_sampling sp) {
+        common_sampler_ptr sampler(common_sampler_init(params.model.get(), sp));
+        return common_sampler_top1_is_argmax(sampler.get());
+    };
+
+    // the DSpark drafter's CPU chain: top-k(10) and its final pick, unless the vocabulary suppresses tokens
+    common_params_sampling draft;
+    draft.top_k    = 10;
+    draft.samplers = {COMMON_SAMPLER_TYPE_TOP_K};
+    int32_t n_suppress = 0;
+    llama_vocab_get_suppress_tokens(llama_model_get_vocab(params.model.get()), &n_suppress);
+    GGML_ASSERT(top1_is_argmax(draft) == (n_suppress == 0));
+
+    auto biased = draft;
+    biased.logit_bias = {{1, 5.0f}};
+    GGML_ASSERT(!top1_is_argmax(biased));
+    auto no_k = draft;
+    no_k.top_k = 0;
+    GGML_ASSERT(!top1_is_argmax(no_k));
+    auto tempered = draft;
+    tempered.temp     = 0.8f;
+    tempered.samplers = {COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE};
+    GGML_ASSERT(!top1_is_argmax(tempered));
+    auto grammar = draft;
+    grammar.grammar = {COMMON_GRAMMAR_TYPE_USER, "root ::= [a-z]+"};
+    GGML_ASSERT(!top1_is_argmax(grammar));
+    auto budget = draft;
+    budget.reasoning_budget_start  = {1};
+    budget.reasoning_budget_end    = {{2}};
+    budget.reasoning_budget_tokens = 1;
+    GGML_ASSERT(!top1_is_argmax(budget));
+}
+
 static void test_top_k(const test_params & params) {
     const int seq_id = 0;
     const int32_t k = 8;
@@ -2100,6 +2134,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_greedy_filtered",        test_greedy_filtered,        true },
     { "test_greedy_filtered_common", test_greedy_filtered_common, true },
     { "test_row_argmax",             test_row_argmax,             true },
+    { "test_top1_is_argmax",         test_top1_is_argmax,         true },
     { "test_temp",                   test_temp,                   true },
     { "test_temp_ext",               test_temp_ext,               true },
     { "test_top_k",                  test_top_k,                  true },

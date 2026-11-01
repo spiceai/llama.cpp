@@ -1090,6 +1090,15 @@ void common_sampling_add_grammar_triggers(common_params_sampling & sampling, con
     }
 }
 
+bool common_sampler_top1_is_argmax(const struct common_sampler * gsmpl) {
+    // a grammar or reasoning budget runs before the chain; a logit bias (user or suppressed tokens) comes before top-k in it
+    if (gsmpl->grmr || gsmpl->rbudget || gsmpl->params.top_k <= 0) {
+        return false;
+    }
+    return llama_sampler_chain_n(gsmpl->chain) == 2 &&
+        std::strcmp(llama_sampler_name(llama_sampler_chain_get(gsmpl->chain, 0)), "top-k") == 0;
+}
+
 llama_token common_logits_argmax(const float * logits, int32_t n) {
     if (std::isnan(logits[0])) {
         return 0;

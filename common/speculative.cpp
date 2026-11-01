@@ -1134,11 +1134,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(model_dft, sparams));
-
-            // these params add no grammar or reasoning budget; only a logit bias (suppressed tokens) can come before top-k
-            llama_sampler * chain = common_sampler_get(s.get());
-            cpu_top1_is_argmax = cpu_top1_is_argmax && llama_sampler_chain_n(chain) == 2 &&
-                std::strcmp(llama_sampler_name(llama_sampler_chain_get(chain, 0)), "top-k") == 0;
+            cpu_top1_is_argmax = cpu_top1_is_argmax && common_sampler_top1_is_argmax(s.get());
         }
 
         // offload draft sampling to the backend
