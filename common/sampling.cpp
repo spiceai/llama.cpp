@@ -1089,3 +1089,69 @@ void common_sampling_add_grammar_triggers(common_params_sampling & sampling, con
         throw std::runtime_error("Error: no triggers set for lazy grammar!");
     }
 }
+
+bool common_sampler_top1_is_argmax(const struct common_sampler * gsmpl) {
+    // a grammar or reasoning budget runs before the chain; a logit bias (user or suppressed tokens) comes before top-k in it
+    if (gsmpl->grmr || gsmpl->rbudget || gsmpl->params.top_k <= 0) {
+        return false;
+    }
+    return llama_sampler_chain_n(gsmpl->chain) == 2 &&
+        std::strcmp(llama_sampler_name(llama_sampler_chain_get(gsmpl->chain, 0)), "top-k") == 0;
+}
+
+llama_token common_logits_argmax(const float * logits, int32_t n) {
+    if (std::isnan(logits[0])) {
+        return 0;
+    }
+
+    // pass 1: largest logit that is not a NaN (a NaN fails the compare and never replaces a lane)
+    constexpr int32_t n_lanes = 16;
+    float lanes[n_lanes];
+    std::fill(lanes, lanes + n_lanes, -INFINITY);
+    int32_t id = 0;
+    for (; id + n_lanes <= n; id += n_lanes) {
+        for (int32_t l = 0; l < n_lanes; ++l) {
+            lanes[l] = logits[id + l] > lanes[l] ? logits[id + l] : lanes[l];
+        }
+    }
+    float max_logit = -INFINITY;
+    for (; id < n; ++id) {
+        max_logit = logits[id] > max_logit ? logits[id] : max_logit;
+    }
+    for (const float lane : lanes) {
+        max_logit = lane > max_logit ? lane : max_logit;
+    }
+
+    // pass 2: first logit equal to max_logit (no logit exceeds it, so >= means equal, and is false for a NaN)
+    constexpr int32_t n_block = 64;
+    for (int32_t beg = 0; beg < n; beg += n_block) {
+        const int32_t end = std::min(beg + n_block, n);
+        bool hit = false;
+        for (int32_t t = beg; t < end; ++t) {
+            hit |= logits[t] >= max_logit;
+        }
+        if (hit) {
+            for (int32_t t = beg; t < end; ++t) {
+                if (logits[t] >= max_logit) {
+                    return t;
+                }
+            }
+        }
+    }
+    return 0; // not reached: logits[0] is not a NaN, so pass 2 finds max_logit
+}
+
+llama_token common_sampler_row_argmax(llama_context * ctx, int32_t idx) {
+    if (llama_get_sampled_token_ith (ctx, idx) != LLAMA_TOKEN_NULL ||
+        llama_get_sampled_logits_ith(ctx, idx) != nullptr ||
+        llama_get_sampled_probs_ith (ctx, idx) != nullptr) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    if (logits == nullptr || n_vocab <= 0) {
+        return LLAMA_TOKEN_NULL;
+    }
+    return common_logits_argmax(logits, n_vocab);
+}

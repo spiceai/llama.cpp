@@ -1033,6 +1033,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // dspark speculators
     bool sample_from_anchor = true;
 
+    // true when each CPU chain is top-k plus its final pick only, so the DSpark draft token (its first candidate) is the row's largest logit
+    bool cpu_top1_is_argmax = false;
+
     // block-internal attention
     bool causal_attn = false;
 
@@ -1124,12 +1127,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
 
         smpls.resize(n_seq);
+        cpu_top1_is_argmax = true;
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
             sparams.top_k    = 10;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(model_dft, sparams));
+            cpu_top1_is_argmax = cpu_top1_is_argmax && common_sampler_top1_is_argmax(s.get());
         }
 
         // offload draft sampling to the backend
@@ -1487,17 +1492,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         break;
                     }
 
-                    common_sampler_sample(smpl, ctx_dft, idx, true);
+                    // read the draft token from the row when it is the chain's first candidate, instead of filling and top-k sorting candidates
+                    llama_token id = cpu_top1_is_argmax ? common_sampler_row_argmax(ctx_dft, idx) : LLAMA_TOKEN_NULL;
 
-                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                    if (id == LLAMA_TOKEN_NULL) {
+                        common_sampler_sample(smpl, ctx_dft, idx, true);
 
-                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                        const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+                        for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                            LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                    seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                    common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                        }
+
+                        id = cur_p->data[0].id;
+                    } else {
+                        LOG_DBG(" - seq_id %d, draft pos %3d: %6d, the row's largest logit '%s'\n",
+                                seq_id, i, id, common_token_to_piece(ctx_dft, id).c_str());
                     }
-
-                    const llama_token id = cur_p->data[0].id;
 
                     common_sampler_accept(smpl, id, true);
 
