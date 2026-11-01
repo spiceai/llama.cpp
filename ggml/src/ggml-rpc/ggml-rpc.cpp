@@ -3186,9 +3186,10 @@ static bool rpc_comm_mesh_eager(const std::vector<socket_ptr> & peers) {
 // Sends this rank's partial (`nbytes` at `own`) to every peer and receives theirs into `parts`, then sums all of them
 // in rank order into `sum`, so every rank holds the same bits. Each partial goes behind its rpc_comm_part_hdr, as a
 // separate message: the RDMA transport delivers messages whole, so a read must take exactly what one send wrote.
-// GGML_RPC_COMM_SEND_DEFER=1 (or flag:<path>, re-checked at most every 100 ms): an eager all-reduce posts its partial to
-// every peer without waiting for each send to complete; over RDMA a send's completion only frees the connection's send
-// buffer, so it is waited for when that buffer or the send queue is needed again, not before the peers' partials are read
+// GGML_RPC_COMM_SEND_DEFER (on unless "0"; or flag:<path>, re-checked at most every 100 ms): an eager all-reduce posts
+// its partial to every peer without waiting for each send to complete; over RDMA a send's completion only frees the
+// connection's send buffer, so it is waited for when that buffer or the send queue is needed again, not before the
+// peers' partials are read. Only a tensor split's all-reduce reaches it.
 static bool rpc_comm_send_defer() {
     static const std::string mode = [] {
         const char * e = std::getenv("GGML_RPC_COMM_SEND_DEFER");
@@ -3204,7 +3205,7 @@ static bool rpc_comm_send_defer() {
         }
         return on.load(std::memory_order_relaxed);
     }
-    return mode == "1";
+    return mode != "0";
 }
 
 // `eager`: every link is RDMA (rpc_comm_mesh_eager), so a partial up to RPC_COMM_MESH_EAGER_BYTES may be sent to every
@@ -3288,10 +3289,10 @@ static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32
     return true;
 }
 
-// GGML_RPC_COMM_ASYNC=1 (or flag:<path>, on while the file exists): the backend's stream copies each partial to host
-// memory, signals `ready` and waits on `done`; this thread exchanges and sums the partials and signals `done`, so the
-// server thread never waits for the stream and the next subgraph is already queued behind the wait. Only for a backend
-// that exports ggml_backend_cuda_comm_stage (CUDA) and whose device can wait on host memory.
+// GGML_RPC_COMM_ASYNC (on unless "0"; or flag:<path>, on while the file exists): the backend's stream copies each
+// partial to host memory, signals `ready` and waits on `done`; this thread exchanges and sums the partials and signals
+// `done`, so the server thread never waits for the stream and the next subgraph is already queued behind the wait. Only
+// for a backend that exports ggml_backend_cuda_comm_stage (CUDA) and whose device can wait on host memory.
 // The flags are std::atomic objects in that host memory, so that the host reads and writes them the same way on every
 // compiler; the stream writes and waits on them as plain 32-bit words.
 typedef void * (*rpc_comm_host_alloc_t)(size_t size);
@@ -3459,10 +3460,11 @@ static bool rpc_comm_async_broken(const rpc_comm_async & async) {
     return async.broken.load(std::memory_order_acquire);
 }
 
+// on unless GGML_RPC_COMM_ASYNC is "0" (see above); only a tensor split's all-reduce reaches it
 static bool rpc_comm_async_enabled() {
     static const char * env = std::getenv("GGML_RPC_COMM_ASYNC");
     if (env == nullptr) {
-        return false;
+        return true;
     }
     if (strncmp(env, "flag:", 5) == 0) {
         return std::filesystem::exists(env + 5);
