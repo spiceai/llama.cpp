@@ -296,7 +296,8 @@ struct rpc_comm_part_hdr {
 static_assert(sizeof(rpc_comm_part_hdr) % sizeof(float) == 0, "the partial after the header must stay F32-aligned");
 
 // world > 2: when every link is RDMA, partials up to this size fit each peer's receive ring, so a rank sends to every peer
-// before receiving; larger ones, and every partial of a mesh with a TCP link, go pair by pair (rpc_comm_mesh_eager)
+// before receiving; larger ones go as pieces of this size, each the same way (rpc_comm_mesh_chunked), and every partial
+// of a mesh with a TCP link goes pair by pair (rpc_comm_mesh_eager)
 static constexpr size_t RPC_COMM_MESH_EAGER_BYTES = 1024 * 1024;
 
 struct rpc_msg_comm_init_rsp {
@@ -3207,8 +3208,32 @@ static bool rpc_comm_send_defer() {
     return mode == "1";
 }
 
+// GGML_RPC_COMM_CHUNKED (on unless "0"; or flag:<path>, re-checked at most every 100 ms): on a mesh whose links are all
+// RDMA, a partial larger than RPC_COMM_MESH_EAGER_BYTES goes as pieces of at most that size, each sent to every peer
+// before any is received, instead of pair by pair. Each pair of ranks has its own link, so the pieces travel on all of
+// them at once rather than on one link at a time. A rank sends piece k+1 only after it has read piece k from every peer,
+// so a link never holds more than two unread pieces: the bound the eager exchange of two consecutive partials already
+// relies on. Only a tensor split's all-reduce reaches it.
+static bool rpc_comm_mesh_chunked() {
+    static const std::string mode = [] {
+        const char * e = std::getenv("GGML_RPC_COMM_CHUNKED");
+        return std::string(e != nullptr ? e : "");
+    }();
+    if (mode.rfind("flag:", 0) == 0) {
+        static std::atomic<int64_t> next_check_us{0};
+        static std::atomic<bool>    on{false};
+        const int64_t now = ggml_time_us();
+        if (now >= next_check_us.load(std::memory_order_relaxed)) {
+            on.store(fs::exists(mode.substr(5)), std::memory_order_relaxed);
+            next_check_us.store(now + 100000, std::memory_order_relaxed);
+        }
+        return on.load(std::memory_order_relaxed);
+    }
+    return mode != "0";
+}
+
 // `eager`: every link is RDMA (rpc_comm_mesh_eager), so a partial up to RPC_COMM_MESH_EAGER_BYTES may be sent to every
-// peer before any is received
+// peer before any is received, and a larger one piece by piece the same way (rpc_comm_mesh_chunked)
 static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32_t rank, uint32_t world, uint64_t seq,
                                    size_t nbytes, const uint8_t * own, std::vector<std::vector<uint8_t>> & parts, float * sum,
                                    bool eager) {
@@ -3259,6 +3284,53 @@ static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32
         for (uint32_t j = 0; defer && j < world; j++) {
             if (j != rank && !peers[j]->wait_sends()) {
                 return lost(j);
+            }
+        }
+    } else if (eager && rpc_comm_mesh_chunked()) {
+        // piece by piece, each piece to every peer before any is received; every piece lands at its offset, so the sum
+        // below reads the same partials as after a pair-by-pair exchange
+        static std::atomic<bool> announced{false};
+        if (!announced.exchange(true, std::memory_order_relaxed)) {
+            LOG_INFO("[%s] rank %u exchanges partials over %zu bytes in pieces sent to every peer at once; GGML_RPC_COMM_CHUNKED=0 "
+                     "exchanges them pair by pair\n", __func__, rank, RPC_COMM_MESH_EAGER_BYTES);
+        }
+        const bool defer = rpc_comm_send_defer();
+        for (size_t off = 0; off < nbytes; off += RPC_COMM_MESH_EAGER_BYTES) {
+            const size_t            n    = std::min(RPC_COMM_MESH_EAGER_BYTES, nbytes - off);
+            const rpc_comm_part_hdr phdr = { seq, (uint64_t) n };
+            for (uint32_t j = 0; j < world; j++) {
+                if (j == rank) {
+                    continue;
+                }
+                const bool ok = defer
+                    ? peers[j]->send_data_deferred(&phdr, sizeof(phdr)) && peers[j]->send_data_deferred(own + off, n) && peers[j]->flush()
+                    : peers[j]->send_data(&phdr, sizeof(phdr)) && peers[j]->send_data(own + off, n) && peers[j]->flush();
+                if (!ok) {
+                    return lost(j);
+                }
+            }
+            for (uint32_t j = 0; j < world; j++) {
+                if (j == rank) {
+                    continue;
+                }
+                rpc_comm_part_hdr got;
+                if (!peers[j]->recv_data(&got, sizeof(got))) {
+                    return lost(j);
+                }
+                if (got.seq != phdr.seq || got.nbytes != phdr.nbytes) {
+                    LOG_ERROR("[%s] rank %u expected a piece of %" PRIu64 " bytes of all-reduce %" PRIu64 " from rank %u, got %" PRIu64
+                              " bytes of all-reduce %" PRIu64 "\n", __func__, rank, phdr.nbytes, phdr.seq, j, got.nbytes, got.seq);
+                    return false;
+                }
+                if (!peers[j]->recv_data(parts[j].data() + off, n)) {
+                    return lost(j);
+                }
+            }
+            // as in the eager exchange: a deferred send that failed fails this all-reduce
+            for (uint32_t j = 0; defer && j < world; j++) {
+                if (j != rank && !peers[j]->wait_sends()) {
+                    return lost(j);
+                }
             }
         }
     } else {
