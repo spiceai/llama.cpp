@@ -34,8 +34,8 @@ struct socket_t {
     socket_ptr accept();
     // accept(), waiting at most timeout_ms for a connection; nullptr when none arrived in time
     socket_ptr accept(int timeout_ms);
-    // From now on a receive fails once `deadline` has passed, however its data arrives, until clear_recv_deadline. TCP
-    // only; an RDMA receive ignores it.
+    // From now on a receive fails once `deadline` has passed, however its data arrives, until clear_recv_deadline: over
+    // TCP and over RDMA, whose receive gives up waiting for a completion then.
     void set_recv_deadline(std::chrono::steady_clock::time_point deadline);
     bool clear_recv_deadline();
 

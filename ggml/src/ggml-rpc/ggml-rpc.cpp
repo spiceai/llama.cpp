@@ -3291,18 +3291,19 @@ static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32
         }
     } else if (chunked) {
         // piece by piece, each piece to every peer before any is received; every piece lands at its offset, so the sum
-        // below reads the same partials as after a pair-by-pair exchange
+        // below reads the same partials as after a pair-by-pair exchange. Each piece's header is the whole partial's,
+        // its sequence number and size, so a peer on another all-reduce or with a partial of another size fails at the
+        // first piece, as it does in the other exchanges; a piece's own size follows from its offset.
         const bool defer = rpc_comm_send_defer();
         for (size_t off = 0; off < nbytes; off += RPC_COMM_MESH_EAGER_BYTES) {
-            const size_t            n    = std::min(RPC_COMM_MESH_EAGER_BYTES, nbytes - off);
-            const rpc_comm_part_hdr phdr = { seq, (uint64_t) n };
+            const size_t n = std::min(RPC_COMM_MESH_EAGER_BYTES, nbytes - off);
             for (uint32_t j = 0; j < world; j++) {
                 if (j == rank) {
                     continue;
                 }
                 const bool ok = defer
-                    ? peers[j]->send_data_deferred(&phdr, sizeof(phdr)) && peers[j]->send_data_deferred(own + off, n) && peers[j]->flush()
-                    : peers[j]->send_data(&phdr, sizeof(phdr)) && peers[j]->send_data(own + off, n) && peers[j]->flush();
+                    ? peers[j]->send_data_deferred(&hdr, sizeof(hdr)) && peers[j]->send_data_deferred(own + off, n) && peers[j]->flush()
+                    : peers[j]->send_data(&hdr, sizeof(hdr)) && peers[j]->send_data(own + off, n) && peers[j]->flush();
                 if (!ok) {
                     return lost(j);
                 }
@@ -3315,9 +3316,10 @@ static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32
                 if (!peers[j]->recv_data(&got, sizeof(got))) {
                     return lost(j);
                 }
-                if (got.seq != phdr.seq || got.nbytes != phdr.nbytes) {
-                    LOG_ERROR("[%s] rank %u expected a piece of %" PRIu64 " bytes of all-reduce %" PRIu64 " from rank %u, got %" PRIu64
-                              " bytes of all-reduce %" PRIu64 "\n", __func__, rank, phdr.nbytes, phdr.seq, j, got.nbytes, got.seq);
+                if (got.seq != hdr.seq || got.nbytes != hdr.nbytes) {
+                    LOG_ERROR("[%s] rank %u expected a piece of all-reduce %" PRIu64 " of %" PRIu64 " bytes from rank %u, got "
+                              "one of all-reduce %" PRIu64 " of %" PRIu64 " bytes\n", __func__, rank, hdr.seq, hdr.nbytes, j,
+                              got.seq, got.nbytes);
                     return false;
                 }
                 if (!peers[j]->recv_data(parts[j].data() + off, n)) {
@@ -3547,8 +3549,8 @@ static bool rpc_comm_async_enabled() {
 static constexpr int RPC_COMM_MESH_INIT_TIMEOUT_MS = 30000;
 
 // What a rank sends every peer once the mesh has formed: whether it wants partials over RPC_COMM_MESH_EAGER_BYTES
-// exchanged in pieces. Shaped as a rpc_comm_part_hdr of sequence 0, which no all-reduce uses, so a peer of a build that
-// sends none fails the agreement within the mesh's deadline instead of reading it as a partial.
+// exchanged in pieces. Shaped as a rpc_comm_part_hdr of sequence 0, which no all-reduce uses. A peer of a build that
+// sends none fails the agreement once the mesh's deadline passes, which bounds the receive over RDMA as over TCP.
 static constexpr uint64_t RPC_COMM_MESH_AGREE_MAGIC  = 0x434855'4e4b0000ull; // "CHUNK" in the high bytes
 static constexpr uint64_t RPC_COMM_MESH_AGREE_CHUNKS = 1u;
 

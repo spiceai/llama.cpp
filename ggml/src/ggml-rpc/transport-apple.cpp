@@ -436,7 +436,7 @@ bool apple_rdma::send(const void * data, size_t size) {
     return true;
 }
 
-bool apple_rdma::recv(void * data, size_t size) {
+bool apple_rdma::recv(void * data, size_t size, const std::chrono::steady_clock::time_point * deadline) {
     impl * c = pimpl.get();
     uint8_t * p = (uint8_t *)data;
     if (!c->post_pending()) return false;   // turnaround: flush the coalesced request
@@ -451,6 +451,12 @@ bool apple_rdma::recv(void * data, size_t size) {
                 // the liveness anchor: nothing crosses it once RDMA is up, so any
                 // readability means the peer's FIN (macOS has no POLLRDHUP).
                 // Same idle interval as the Linux path.
+                // a receive past its deadline leaves the stream mid-message, so the connection is done
+                if (deadline != nullptr && (idle & 0x3FF) == 0x3FF && std::chrono::steady_clock::now() >= *deadline) {
+                    LOG_ERROR("RDMA(Apple/UC) recv failed: past its deadline\n");
+                    c->broken = true;
+                    return false;
+                }
                 if ((++idle & 0xFFFFF) == 0) {
                     struct pollfd pfd = { c->fd, POLLIN, 0 };
                     if (poll(&pfd, 1, 0) > 0 &&
