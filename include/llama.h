@@ -1197,6 +1197,11 @@ extern "C" {
     LLAMA_API llama_token * llama_get_sampled_candidates_ith      (struct llama_context * ctx, int32_t i);
     LLAMA_API uint32_t      llama_get_sampled_candidates_count_ith(struct llama_context * ctx, int32_t i);
 
+    // The full logits of the ith token, one per vocabulary token, when no backend sampler sampled it.
+    // Returns NULL when one did (the host then has only its candidates) or for an invalid id.
+    // Synchronizes once; checking with the getters above and then calling llama_get_logits_ith synchronizes in each.
+    LLAMA_API float * llama_get_unsampled_logits_ith(struct llama_context * ctx, int32_t i);
+
     //
     // Vocab
     //

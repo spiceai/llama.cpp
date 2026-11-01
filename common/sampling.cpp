@@ -1142,13 +1142,7 @@ llama_token common_logits_argmax(const float * logits, int32_t n) {
 }
 
 llama_token common_sampler_row_argmax(llama_context * ctx, int32_t idx) {
-    if (llama_get_sampled_token_ith (ctx, idx) != LLAMA_TOKEN_NULL ||
-        llama_get_sampled_logits_ith(ctx, idx) != nullptr ||
-        llama_get_sampled_probs_ith (ctx, idx) != nullptr) {
-        return LLAMA_TOKEN_NULL;
-    }
-
-    const float * logits = llama_get_logits_ith(ctx, idx);
+    const float * logits = llama_get_unsampled_logits_ith(ctx, idx);
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
     if (logits == nullptr || n_vocab <= 0) {
         return LLAMA_TOKEN_NULL;

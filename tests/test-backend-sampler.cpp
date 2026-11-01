@@ -451,6 +451,7 @@ static void test_row_argmax(const test_params & params) {
         for (int step = 0; step < 8; ++step) {
             const int32_t idx = test_ctx.idx_for_seq(0);
             const llama_token expected = llama_sampler_sample(greedy.get(), test_ctx.ctx.get(), idx);
+            GGML_ASSERT(llama_get_unsampled_logits_ith(test_ctx.ctx.get(), idx) == llama_get_logits_ith(test_ctx.ctx.get(), idx));
             GGML_ASSERT(common_sampler_row_argmax(test_ctx.ctx.get(), idx) == expected);
             GGML_ASSERT(test_ctx.decode_token(expected));
         }
@@ -469,6 +470,7 @@ static void test_row_argmax(const test_params & params) {
         const int32_t idx = test_ctx.idx_for_seq(0);
         GGML_ASSERT((llama_get_sampled_token_ith(test_ctx.ctx.get(), idx) != LLAMA_TOKEN_NULL) == picks);
         GGML_ASSERT(llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), idx) == 10);
+        GGML_ASSERT(llama_get_unsampled_logits_ith(test_ctx.ctx.get(), idx) == nullptr);
         GGML_ASSERT(common_sampler_row_argmax(test_ctx.ctx.get(), idx) == LLAMA_TOKEN_NULL);
     }
 }
