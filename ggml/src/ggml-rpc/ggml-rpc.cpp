@@ -137,11 +137,19 @@ struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
+// bits of rpc_msg_hello_rsp::op_caps: ops a server says every backend it serves runs, for the few ops a client may not
+// assume a remote backend runs (it answers every other op as supported). A server that sets no bit, as one built before
+// the bit does, is taken not to run the op.
+enum rpc_op_cap : uint8_t {
+    // GGML_OP_ARGMAX_PART and GGML_OP_ARGMAX_MERGE over F32 with contiguous elements
+    RPC_OP_CAP_ARGMAX_SPLIT = 1 << 0,
+};
+
 struct rpc_msg_hello_rsp {
     uint8_t major;
     uint8_t minor;
     uint8_t patch;
-    uint8_t padding;
+    uint8_t op_caps; // rpc_op_cap bits
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
@@ -334,6 +342,7 @@ struct ggml_backend_rpc_device_context {
     uint32_t    device;
     std::string name;
     std::string description;
+    uint8_t     op_caps; // the rpc_op_cap bits the server set in its HELLO
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -500,7 +509,8 @@ static inline void rpc_cpu_relax() {
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+// The server's rpc_op_cap bits are stored in op_caps.
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t & op_caps) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -515,6 +525,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
         return false;
     }
 
+    op_caps = response.op_caps;
     sock->update_caps(response.conn_caps);
     LOG_DBG("[%s] handshake ok: server version %d.%d.%d, transport: %s\n",
             __func__, response.major, response.minor, response.patch, sock->transport_name());
@@ -613,6 +624,9 @@ public:
     void start(const std::string & endpoint);
     void work();
 
+    // the rpc_op_cap bits the server set in its HELLO
+    uint8_t server_op_caps() const { return op_caps; }
+
     ~rpc_dispatcher();
 
 private:
@@ -642,6 +656,7 @@ private:
     std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
     rpc_msg_queue    queue;
     socket_ptr       sock;
+    uint8_t          op_caps = 0;
     std::atomic_uint busy_spin_users = 0;
     std::atomic_bool running;
     std::thread      thread;
@@ -773,7 +788,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
     }
-    if (!negotiate_hello(sock)) {
+    if (!negotiate_hello(sock, op_caps)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
@@ -1950,11 +1965,25 @@ private:
     std::vector<comm_state> comm_states;
 };
 
+// whether every backend runs GGML_OP_ARGMAX_PART and GGML_OP_ARGMAX_MERGE over F32 with contiguous elements
+static bool rpc_backends_run_argmax_split(const std::vector<ggml_backend_t> & backends) {
+    ggml_init_params params = { 3*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * part  = ggml_argmax_part(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 1), 2);
+    ggml_tensor * merge = ggml_argmax_merge(ctx, part);
+    return !backends.empty() && std::all_of(backends.begin(), backends.end(), [&](ggml_backend_t backend) {
+        return ggml_backend_supports_op(backend, part) && ggml_backend_supports_op(backend, merge);
+    });
+}
+
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
-    response.major = RPC_PROTO_MAJOR_VERSION;
-    response.minor = RPC_PROTO_MINOR_VERSION;
-    response.patch = RPC_PROTO_PATCH_VERSION;
-    LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
+    response.major   = RPC_PROTO_MAJOR_VERSION;
+    response.minor   = RPC_PROTO_MINOR_VERSION;
+    response.patch   = RPC_PROTO_PATCH_VERSION;
+    response.op_caps = rpc_backends_run_argmax_split(backends) ? RPC_OP_CAP_ARGMAX_SPLIT : 0;
+    LOG_DBG("[%s] version: %d.%d.%d, op caps: 0x%02x\n", __func__, response.major, response.minor, response.patch, response.op_caps);
 }
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
@@ -4351,10 +4380,17 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 }
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    //TODO: call the remote backend and cache the results
-    return true;
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    switch (op->op) {
+        case GGML_OP_ARGMAX_PART:
+        case GGML_OP_ARGMAX_MERGE:
+            // a server whose backend lacks them aborts on them (Metal: "unsupported op"), so ask its HELLO
+            return (ctx->op_caps & RPC_OP_CAP_ARGMAX_SPLIT) != 0 &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float);
+        default:
+            //TODO: call the remote backend and cache the results
+            return true;
+    }
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -4697,10 +4733,12 @@ ggml_backend_reg_t ggml_backend_rpc_reg(void) {
     return &ggml_backend_rpc_reg;
 }
 
-static uint32_t ggml_backend_rpc_get_device_count(const char * endpoint) {
+// the server's device count, and in op_caps the rpc_op_cap bits it set in its HELLO
+static uint32_t ggml_backend_rpc_get_device_count(const char * endpoint, uint8_t & op_caps) {
     auto dispatcher = get_dispatcher(endpoint);
     rpc_msg_device_count_rsp response;
     dispatcher->send(RPC_CMD_DEVICE_COUNT, nullptr, 0, &response, sizeof(response));
+    op_caps = dispatcher->server_op_caps();
     return response.device_count;
 }
 
@@ -4720,8 +4758,9 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
         LOG_DBG3("[%s] endpoint %s already registered\n", __func__, endpoint);
         return reg_map[endpoint];
     }
-    uint32_t dev_count = ggml_backend_rpc_get_device_count(endpoint);
-    LOG_DBG2("[%s] endpoint: %s, device count: %u\n", __func__, endpoint, dev_count);
+    uint8_t  op_caps   = 0;
+    uint32_t dev_count = ggml_backend_rpc_get_device_count(endpoint, op_caps);
+    LOG_DBG2("[%s] endpoint: %s, device count: %u, op caps: 0x%02x\n", __func__, endpoint, dev_count, op_caps);
     if (dev_count == 0) {
         return nullptr;
     }
@@ -4735,6 +4774,7 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
             /* .device      = */    ind,
             /* .name        = */    dev_name,
             /* .description = */    dev_desc,
+            /* .op_caps     = */    op_caps,
         };
 
         ggml_backend_dev_t dev = new ggml_backend_device {
