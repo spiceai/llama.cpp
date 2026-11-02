@@ -3,7 +3,8 @@
 // of each column comes from one (value, index) pair per copy. Checks that the gathered product equals the product of the
 // whole matrix bit for bit (a row's dot product does not depend on which rows a device computes), and that the picks
 // are the first max of each column as the greedy sampler takes it: the earliest index on a tie, 0 when the first value
-// is a NaN, NaNs skipped otherwise. Ties straddle the devices' rows, from duplicated rows of the matrix.
+// is a NaN, NaNs skipped otherwise. Ties straddle the devices' rows, from duplicated rows of the matrix. Two copies of a
+// CUDA device reduce through the CUDA internal all-reduce, three through the meta backend's butterfly.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -305,9 +306,6 @@ static int test_meta(ggml_backend_dev_t dev, ggml_type type, int64_t k, int64_t 
 }
 
 int main() {
-    // copies of one CUDA device: the two-device all-reduce pipeline assumes two devices, so reduce through the meta
-    // backend's butterfly as a meta device over RPC devices does
-    setenv("GGML_CUDA_ALLREDUCE", "none", 0);
     ggml_backend_load_all();
 
     const char * dev_name = getenv("TEST_DEVICE");
