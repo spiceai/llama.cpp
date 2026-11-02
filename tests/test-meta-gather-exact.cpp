@@ -40,6 +40,26 @@ static ggml_backend_meta_split_state split_state(const ggml_tensor * tensor, voi
     return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
 }
 
+// the first op of the test's graph that dev cannot run (a product, the gather's pad, or the add the meta backend
+// reduces with), or nullptr when it runs them all: a GPU without the kernels this product needs is skipped
+static const char * unsupported_op(ggml_backend_dev_t dev) {
+    ggml_init_params p = { ggml_tensor_overhead()*16, nullptr, true };
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, V);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, NCOLS);
+    ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+    ggml_tensor * z = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ZC, ZR);
+    const char * missing = nullptr;
+    for (ggml_tensor * t : { y, ggml_backend_meta_gather(ctx, y), ggml_add(ctx, y, y), ggml_backend_meta_gather(ctx, z), ggml_add(ctx, z, z) }) {
+        if (!ggml_backend_dev_supports_op(dev, t)) {
+            missing = ggml_op_desc(t);
+            break;
+        }
+    }
+    ggml_free(ctx);
+    return missing;
+}
+
 // the number of gathered products that differ from the whole product on a meta device over two copies of dev
 static int test_device(ggml_backend_dev_t dev) {
     const char * ar  = getenv("GGML_CUDA_ALLREDUCE");
@@ -186,10 +206,17 @@ int main() {
             }
         }
     }
-    int n_fail = 0;
+    int n_fail = 0, n_run = 0;
     for (ggml_backend_dev_t dev : devs) {
+        if (const char * op = unsupported_op(dev)) {
+            printf("device %s: skipped, it cannot run %s\n", ggml_backend_dev_name(dev), op);
+            continue;
+        }
         n_fail += test_device(dev);
+        n_run++;
     }
-    printf("%zu devices: %s\n", devs.size(), n_fail == 0 ? "OK" : "FAILED");
+    // TEST_DEVICE names the device to test, so skipping it is a failure
+    n_fail += dev_name != nullptr && n_run == 0;
+    printf("%d of %zu devices run: %s\n", n_run, devs.size(), n_fail == 0 ? "OK" : "FAILED");
     return n_fail == 0 ? 0 : 1;
 }
