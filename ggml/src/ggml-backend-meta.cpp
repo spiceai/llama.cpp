@@ -1474,11 +1474,29 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         t_ij->buffer = simple_buf;
         t_ij->view_src = tensor->view_src;
         t_ij->view_offs = tensor->view_offs;
+        // A split view of a tensor that every device holds whole: a rows view, or a view or reshape of one (a view of a view
+        // is a view of its source, so it no longer sees the rows view). The device holds the whole of the source, so its
+        // part starts at the view's own offset plus the parts of the devices before it along the split axis, not at an
+        // offset scaled to a slice.
+        const bool split_view_of_mirrored = t_ij->view_src != nullptr && ggml_backend_buffer_is_meta(t_ij->view_src->buffer) &&
+            split_dim >= 0 && split_dim < GGML_MAX_DIMS &&
+            ggml_backend_meta_get_split_state(tensor->view_src, /*assume_sync =*/ true).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+        if (split_view_of_mirrored) {
+            GGML_ASSERT(split_state.n_segments == 1 && split_state.nr[0] == 1);
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                // the strides above were scaled to a slice: only a dimension of one may have had its stride scaled
+                GGML_ASSERT((tensor->nb[i] <= tensor->nb[split_dim] || tensor->ne[i] == 1) &&
+                    "a split view of a mirrored tensor must not be strided beyond its split axis");
+            }
+            int64_t lp = 0;
+            for (size_t jj = 0; jj < j; jj++) {
+                lp += split_state.ne[jj];
+            }
+            t_ij->view_offs = tensor->view_offs + lp*tensor->nb[split_dim];
+        }
         if (t_ij->view_src != nullptr && ggml_backend_buffer_is_meta(t_ij->view_src->buffer)) {
             t_ij->view_src = ggml_backend_meta_buffer_simple_tensor(tensor->view_src, j);
-            // a rows view takes its offset below: its source is mirrored, so the device's view is the whole offset
-            // plus the rows of the devices before it, not an offset scaled to a slice
-            if (t_ij->view_offs > 0 && split_dim >= 0 && split_dim < GGML_MAX_DIMS && !ggml_backend_meta_is_rows(tensor)) {
+            if (t_ij->view_offs > 0 && split_dim >= 0 && split_dim < GGML_MAX_DIMS && !split_view_of_mirrored) {
                 GGML_ASSERT(tensor->ne[split_dim] != 0);
                 const int split_dim_view_src = ggml_backend_meta_get_split_state(tensor->view_src, /*assume_sync =*/ true).axis;
                 GGML_ASSERT(split_dim_view_src >= 0 && split_dim_view_src < GGML_MAX_DIMS);
@@ -1497,14 +1515,6 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                     t_ij->view_offs = t_ij->view_offs * ne[split_dim]/tensor->ne[split_dim];
                 }
             }
-        }
-        if (ggml_backend_meta_is_rows(tensor)) {
-            // the device holds the whole matrix: its rows start after the rows of the devices before it
-            int64_t lp = 0;
-            for (size_t jj = 0; jj < j; jj++) {
-                lp += split_state.ne[jj];
-            }
-            t_ij->view_offs = tensor->view_offs + lp*tensor->nb[1];
         }
         // TODO: revisit once the graph allocator has been refactored, see https://github.com/ggml-org/llama.cpp/pull/25051#issuecomment-4842873396
         ggml_backend_buffer_t init_buf = simple_buf;

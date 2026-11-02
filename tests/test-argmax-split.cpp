@@ -434,6 +434,136 @@ static int test_meta_nan(ggml_backend_dev_t dev, const std::vector<int64_t> & pa
     return n_fail;
 }
 
+// views derived from a rows view (the reverse of test_meta_offset_view): an identity view, a view of the second half of
+// each row, a view of the rows from row 250 (where each device's share of them is whole: the meta backend scales a view's
+// shares from its source's and asserts that they divide), and a reshape. Each must keep the device's rows of the rows view: gathered, each equals the rows of the matrix
+// it views value for value (row r holds r*1000 + i at column i, and -(r - 750)^2 in its last column, all exact in F32).
+// A product with the identity view must equal the rows view's product value for value, and its first column, the last
+// column of the matrix, must pick row 750, in the last device's rows: a device reading another device's rows picks another.
+static int test_meta_view_of_rows(ggml_backend_dev_t dev, const std::vector<int64_t> & parts) {
+    const int     n_parts = (int) parts.size();
+    const int64_t k = 32, v = 1000, ncols = 2;
+    std::vector<ggml_backend_dev_t> devs(n_parts, dev);
+    ggml_backend_t backend = ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), mirrored_split_state, nullptr), nullptr);
+    GGML_ASSERT(backend != nullptr);
+    std::string layout;
+    for (int64_t p : parts) {
+        layout += (layout.empty() ? "" : "/") + std::to_string(p);
+    }
+
+    std::vector<float> wf(k*v);
+    for (int64_t r = 0; r < v; r++) {
+        for (int64_t i = 0; i < k; i++) {
+            wf[r*k + i] = (float) (r*1000 + i);
+        }
+        wf[r*k + k - 1] = (float) -((r - 750)*(r - 750));
+    }
+    std::mt19937 rng(3);
+    std::normal_distribution<float> nd;
+    std::vector<float> xf(k*ncols);
+    for (int64_t i = 0; i < k; i++) {
+        xf[0*k + i] = i == k - 1 ? 1.0f : 0.0f; // column 0 reads the last column
+        xf[1*k + i] = nd(rng);
+    }
+    ggml_init_params wp = { ggml_tensor_overhead()*2, nullptr, true };
+    ggml_context * ctx_w = ggml_init(wp);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, k, v);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+    GGML_ASSERT(wbuf != nullptr);
+    ggml_backend_tensor_set(w, wf.data(), 0, ggml_nbytes(w));
+
+    ggml_init_params gp = { ggml_tensor_overhead()*40 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(gp);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, ncols);
+    ggml_set_input(x);
+    ggml_tensor * rows  = ggml_backend_meta_rows(ctx, w, n_parts, parts.data());
+    ggml_tensor * ident = ggml_view_2d(ctx, rows, k, v, rows->nb[1], 0);
+    ggml_tensor * half  = ggml_view_2d(ctx, rows, k/2, v, rows->nb[1], (k/2)*ggml_element_size(rows));
+    ggml_tensor * tail  = ggml_view_2d(ctx, rows, k, v - 250, rows->nb[1], 250*rows->nb[1]);
+    ggml_tensor * resh  = ggml_reshape_3d(ctx, rows, k, v, 1);
+    struct derived { const char * what; ggml_tensor * gather; int64_t row0, nrow, col0, ncol; };
+    std::vector<derived> views = {
+        { "identity view",           ggml_backend_meta_gather(ctx, ident), 0,   v,       0,   k   },
+        { "view of each row's half", ggml_backend_meta_gather(ctx, half),  0,   v,       k/2, k/2 },
+        { "reshape",                 ggml_backend_meta_gather(ctx, resh),  0,   v,       0,   k   },
+    };
+    bool tail_divides = true;
+    for (int64_t p : parts) {
+        tail_divides = tail_divides && p*(v - 250) % v == 0;
+    }
+    if (tail_divides) {
+        views.push_back({ "view from row 250", ggml_backend_meta_gather(ctx, tail), 250, v - 250, 0, k });
+    }
+    ggml_tensor * prod_rows  = ggml_mul_mat(ctx, rows,  x);
+    ggml_tensor * prod_ident = ggml_mul_mat(ctx, ident, x);
+    ggml_tensor * gath_rows  = ggml_backend_meta_gather(ctx, prod_rows);
+    ggml_tensor * gath_ident = ggml_backend_meta_gather(ctx, prod_ident);
+    ggml_tensor * pick_rows  = ggml_argmax_merge(ctx, ggml_backend_meta_gather(ctx, ggml_argmax_part(ctx, prod_rows,  n_parts)));
+    ggml_tensor * pick_ident = ggml_argmax_merge(ctx, ggml_backend_meta_gather(ctx, ggml_argmax_part(ctx, prod_ident, n_parts)));
+    ggml_set_output(x);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    for (const derived & d : views) {
+        ggml_set_output(d.gather);
+        ggml_build_forward_expand(gf, d.gather);
+    }
+    for (ggml_tensor * t : { gath_rows, gath_ident, pick_rows, pick_ident }) {
+        ggml_set_output(t);
+        ggml_build_forward_expand(gf, t);
+    }
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+    ggml_backend_tensor_set(x, xf.data(), 0, ggml_nbytes(x));
+    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+
+    int n_fail = 0;
+    for (const derived & d : views) {
+        std::vector<float> g(d.ncol*d.nrow);
+        ggml_backend_tensor_get(d.gather, g.data(), 0, ggml_nbytes(d.gather));
+        int64_t n_diff = 0, first = -1;
+        for (int64_t r = 0; r < d.nrow; r++) {
+            for (int64_t i = 0; i < d.ncol; i++) {
+                if (g[r*d.ncol + i] != wf[(d.row0 + r)*k + d.col0 + i]) {
+                    n_diff++;
+                    first = first < 0 ? r : first;
+                }
+            }
+        }
+        n_fail += n_diff != 0;
+        printf("  %s %s of a rows view, parts %s: %lld of %lld gathered values differ from the rows they view", ggml_backend_dev_name(dev),
+            d.what, layout.c_str(), (long long) n_diff, (long long) (d.ncol*d.nrow));
+        if (first >= 0) {
+            printf(" (first in row %lld: %.0f, want %.0f)", (long long) (d.row0 + first), g[first*d.ncol], wf[(d.row0 + first)*k + d.col0]);
+        }
+        printf(" %s\n", n_diff == 0 ? "ok" : "FAIL");
+    }
+    std::vector<float> yr(v*ncols), yi(v*ncols);
+    ggml_backend_tensor_get(gath_rows,  yr.data(), 0, ggml_nbytes(gath_rows));
+    ggml_backend_tensor_get(gath_ident, yi.data(), 0, ggml_nbytes(gath_ident));
+    int64_t n_diff = 0;
+    for (int64_t i = 0; i < v*ncols; i++) {
+        n_diff += memcmp(&yr[i], &yi[i], sizeof(float)) != 0;
+    }
+    n_fail += n_diff != 0;
+    printf("  %s product with an identity view of a rows view, parts %s: %lld of %lld values differ from the rows view's product %s\n",
+        ggml_backend_dev_name(dev), layout.c_str(), (long long) n_diff, (long long) (v*ncols), n_diff == 0 ? "ok" : "FAIL");
+    std::vector<int32_t> pr(ncols), pi(ncols);
+    ggml_backend_tensor_get(pick_rows,  pr.data(), 0, ggml_nbytes(pick_rows));
+    ggml_backend_tensor_get(pick_ident, pi.data(), 0, ggml_nbytes(pick_ident));
+    for (int64_t c = 0; c < ncols; c++) {
+        const bool ok = pi[c] == pr[c] && (c != 0 || pi[c] == 750);
+        n_fail += !ok;
+        printf("  %s product with an identity view of a rows view, parts %s, col %lld: pick %d, the rows view's pick %d%s %s\n",
+            ggml_backend_dev_name(dev), layout.c_str(), (long long) c, pi[c], pr[c], c == 0 ? ", want 750" : "", ok ? "ok" : "FAIL");
+    }
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(ctx_w);
+    ggml_backend_free(backend);
+    return n_fail;
+}
+
 // a rows view of a mirrored matrix that is itself a view at a row offset: each device's rows start after the offset
 static int test_meta_offset_view(ggml_backend_dev_t dev, const std::vector<int64_t> & parts) {
     const int     n_parts = (int) parts.size();
@@ -698,6 +828,7 @@ int main() {
     for (int n_parts : {2, 3}) {
         n_fail += test_meta_nan(dev, even_parts(1000, n_parts));
         n_fail += test_meta_offset_view(dev, even_parts(1000, n_parts));
+        n_fail += test_meta_view_of_rows(dev, even_parts(1000, n_parts));
         n_fail += test_meta_whole_rows(dev, n_parts);
     }
     for (int n_parts : {2, 3}) {

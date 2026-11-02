@@ -436,7 +436,8 @@ extern "C" {
 
     // a view of matrix a whose rows a meta backend splits n_parts ways, ne_parts[j] rows to device j, from the copy of a
     // that each device holds whole (a must be mirrored, with contiguous rows): a product with it is split along axis 0
-    // without gathering a second, split copy of a; on any other backend, or when a part is empty, a view of the whole of a
+    // without gathering a second, split copy of a, and views and reshapes of it keep each device's rows; on any other
+    // backend, or when a part is empty, a view of the whole of a
     GGML_API struct ggml_tensor * ggml_backend_meta_rows(
         struct ggml_context * ctx, struct ggml_tensor * a, int n_parts, const int64_t * ne_parts);
 
