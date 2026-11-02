@@ -476,6 +476,23 @@ static std::vector<int64_t> dspark_vocab_parts(const llm_graph_context & g, cons
     if (model.dspark_markov_w2->ne[1] != n_vocab) {
         return {};
     }
+    // the drafter's sampler biases suppressed tokens to -inf before its pick, and then reads the row, not its argmax: a
+    // one-hot row whose winner is suppressed would leave it nothing, where the whole row has the next-best token
+    if (!model.vocab.get_suppress_tokens().empty()) {
+        return {};
+    }
+    // both weights must be on the drafter's meta device, so that each device holds them and computes its rows: a weight
+    // placed elsewhere (an override that keeps the head on the CPU, say) computes the whole head there
+    auto on_meta = [](const ggml_tensor * t) {
+        if (t->buffer == nullptr) {
+            return false;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+        return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
+    };
+    if (!on_meta(output) || !on_meta(model.dspark_markov_w2)) {
+        return {};
+    }
 
     const dspark_block_params bp = dspark_get_block_params(model);
     const int64_t n_tok    = g.ubatch.n_tokens;
