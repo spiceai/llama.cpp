@@ -3057,6 +3057,94 @@ struct test_argmax : public test_case {
     }
 };
 
+// GGML_OP_ARGMAX_PART: each row's first max and its index in slot 0, (-inf, -1) in the other n_parts - 1 slots
+struct test_argmax_part : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int n_parts;
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, n_parts);
+    }
+
+    test_argmax_part(std::array<int64_t, 4> ne = {1000, 3, 1, 1}, int n_parts = 3)
+        : ne(ne), n_parts(n_parts) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_argmax_part(ctx, a, n_parts);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // each value twice, so every row's max ties: the first index must win
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<float> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = (float) (i / 2) - 0.5f*t->ne[0];
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+};
+
+// GGML_OP_ARGMAX_MERGE: the index of the largest of n (value, index) pairs, the first on a tie, skipping index -1
+struct test_argmax_merge : public test_case {
+    const int64_t n_pairs;
+    const int64_t n_rows;
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_pairs, n_rows);
+    }
+
+    test_argmax_merge(int64_t n_pairs = 3, int64_t n_rows = 4)
+        : n_pairs(n_pairs), n_rows(n_rows) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*n_pairs, n_rows);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_argmax_merge(ctx, a);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        std::uniform_int_distribution<int> value(-3, 3);
+        std::uniform_int_distribution<int> index(-1, 1000);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // few distinct values, so pairs tie; index -1 marks a pair without a candidate
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<float> data(t->ne[0]);
+                for (int64_t k = 0; k < t->ne[0]/2; k++) {
+                    data[2*k + 0] = (float) value(rng);
+                    data[2*k + 1] = (float) index(rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+};
+
 // GGML_OP_COUNT_EQUAL
 struct test_count_equal : public test_case {
     const ggml_type type;
@@ -10723,6 +10811,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 12, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {2000, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {5438,  3, 1, 1}));
+    test_cases.emplace_back(new test_argmax_part({32,     1, 1, 1}, 1));
+    test_cases.emplace_back(new test_argmax_part({1000,   3, 1, 1}, 3));
+    test_cases.emplace_back(new test_argmax_part({43094,  3, 1, 1}, 3));
+    test_cases.emplace_back(new test_argmax_part({129280, 1, 1, 1}, 2));
+    test_cases.emplace_back(new test_argmax_merge(1, 1));
+    test_cases.emplace_back(new test_argmax_merge(3, 4));
+    test_cases.emplace_back(new test_argmax_merge(12, 64));
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));
