@@ -597,8 +597,6 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
-        GGML_OP_ARGMAX_PART,
-        GGML_OP_ARGMAX_MERGE,
 
         GGML_OP_UNARY,
 
@@ -614,6 +612,10 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        // appended, so the numbers of the ops above stay as RPC peers and older builds know them
+        GGML_OP_ARGMAX_PART,
+        GGML_OP_ARGMAX_MERGE,
 
         GGML_OP_COUNT,
     };

@@ -6,12 +6,15 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    8
+// the major moved from 8 for ARGMAX_PART and ARGMAX_MERGE: ops are sent by number, an inserted op renumbers every op after
+// it, and the handshake compares only the major (and the minor against the client's), never the patch, so peers that
+// differ in their ops must differ in the major to refuse each other at connect rather than run each other's ops as others
+#define RPC_PROTO_MAJOR_VERSION    9
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    2
+#define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT has changed - update RPC_PROTO_MAJOR_VERSION (the handshake ignores the patch)");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

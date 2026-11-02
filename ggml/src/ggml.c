@@ -1101,8 +1101,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
-    "ARGMAX_PART",
-    "ARGMAX_MERGE",
 
     "UNARY",
 
@@ -1118,6 +1116,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "ARGMAX_PART",
+    "ARGMAX_MERGE",
 };
 
 static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
@@ -1219,8 +1220,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
-    "argmax_part(x)",
-    "argmax_merge(x)",
 
     "unary(x)",
 
@@ -1236,6 +1235,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "argmax_part(x)",
+    "argmax_merge(x)",
 };
 
 static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
