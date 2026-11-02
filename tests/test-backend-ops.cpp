@@ -3098,6 +3098,16 @@ struct test_argmax_part : public test_case {
     double max_nmse_err() override {
         return 0.0;
     }
+
+    // the number of values that differ, an infinity matching only itself and a NaN only a NaN: the pairs' (-inf, -1)
+    // padding would make the default nmse NaN, which never exceeds max_err, so a wrong pair would pass
+    double err(const float * a, const float * b, size_t n) override {
+        double n_diff = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            n_diff += !(a[i] == b[i] || (std::isnan(a[i]) && std::isnan(b[i])));
+        }
+        return n_diff;
+    }
 };
 
 // GGML_OP_ARGMAX_MERGE: the index of the largest of n (value, index) pairs, the first on a tie, skipping index -1
@@ -3142,6 +3152,15 @@ struct test_argmax_merge : public test_case {
 
     double max_nmse_err() override {
         return 0.0;
+    }
+
+    // the number of picks that differ: the default nmse is 0/0 when every reference pick is 0
+    double err(const float * a, const float * b, size_t n) override {
+        double n_diff = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            n_diff += !(a[i] == b[i]);
+        }
+        return n_diff;
     }
 };
 
