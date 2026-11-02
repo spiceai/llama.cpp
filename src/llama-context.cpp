@@ -4467,6 +4467,18 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     return res;
 }
 
+float * llama_get_unsampled_logits_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    if (ctx->get_sampled_token_ith(i) != LLAMA_TOKEN_NULL ||
+        ctx->get_sampled_logits_ith(i) != nullptr ||
+        ctx->get_sampled_probs_ith(i) != nullptr) {
+        return nullptr;
+    }
+
+    return ctx->get_logits_ith(i);
+}
+
 float * llama_get_embeddings(llama_context * ctx) {
     ctx->synchronize();
 
