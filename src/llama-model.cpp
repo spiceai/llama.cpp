@@ -1462,12 +1462,12 @@ struct llama_model::impl {
     std::vector<float> tensor_split_owned;
 };
 
-bool llama_prec_policy::apply(ggml_tensor * res) const {
+bool llama_prec_policy::apply(ggml_tensor * res, const ggml_tensor * w) const {
     if (!res || !res->src[0]) {
         return false;
     }
 
-    const auto it = prec_src1.find(res->src[0]);
+    const auto it = prec_src1.find(w ? w : res->src[0]);
     if (it == prec_src1.end()) {
         return false;
     }

@@ -695,7 +695,8 @@ struct llama_prec_policy {
     // the key is the weight tensor `res->src[0]`, stores the recommended activation precision type
     std::unordered_map<const ggml_tensor *, ggml_prec> prec_src1;
 
-    bool apply(ggml_tensor * res) const;
+    // w: the weight whose entry applies, res->src[0] when null (a view of a weight reads the weight's entry)
+    bool apply(ggml_tensor * res, const ggml_tensor * w = nullptr) const;
 
     void load(llama_model_loader & ml, const llama_model & model);
 };

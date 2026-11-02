@@ -561,6 +561,38 @@ static bool ggml_backend_meta_is_gather(const struct ggml_tensor * tensor) {
         ggml_get_op_params_i32(tensor, GGML_BACKEND_META_GATHER_PARAM) == GGML_BACKEND_META_GATHER_MAGIC;
 }
 
+// A rows view is a VIEW of a whole matrix whose op params, after the view's offset, hold ROWS_MAGIC and the rows of each
+// device: on any backend a view of the matrix, on a meta backend each device's view of its rows of the matrix that it
+// holds whole (mirrored), so a product with it is split by those rows without a second copy of the matrix.
+static constexpr int     GGML_BACKEND_META_ROWS_PARAM = 2;          // after VIEW's offset (a size_t)
+static constexpr int32_t GGML_BACKEND_META_ROWS_MAGIC = 0x53574f52; // "ROWS"
+static constexpr int     GGML_BACKEND_META_ROWS_MAX   = GGML_MAX_OP_PARAMS/sizeof(int32_t) - GGML_BACKEND_META_ROWS_PARAM - 2;
+
+struct ggml_tensor * ggml_backend_meta_rows(struct ggml_context * ctx, struct ggml_tensor * a, int n_parts, const int64_t * ne_parts) {
+    GGML_ASSERT(ggml_is_matrix(a));
+    GGML_ASSERT(n_parts > 0 && n_parts <= GGML_BACKEND_META_ROWS_MAX);
+    int64_t ne_sum = 0;
+    for (int j = 0; j < n_parts; j++) {
+        GGML_ASSERT(ne_parts[j] >= 0 && ne_parts[j] <= INT32_MAX);
+        ne_sum += ne_parts[j];
+    }
+    GGML_ASSERT(ne_sum == a->ne[1]);
+
+    ggml_tensor * result = ggml_view_2d(ctx, a, a->ne[0], a->ne[1], a->nb[1], 0);
+    ggml_set_op_params_i32(result, GGML_BACKEND_META_ROWS_PARAM + 0, GGML_BACKEND_META_ROWS_MAGIC);
+    ggml_set_op_params_i32(result, GGML_BACKEND_META_ROWS_PARAM + 1, n_parts);
+    for (int j = 0; j < n_parts; j++) {
+        ggml_set_op_params_i32(result, GGML_BACKEND_META_ROWS_PARAM + 2 + j, (int32_t) ne_parts[j]);
+    }
+    ggml_format_name(result, "%s (rows)", a->name);
+    return result;
+}
+
+static bool ggml_backend_meta_is_rows(const struct ggml_tensor * tensor) {
+    return tensor->op == GGML_OP_VIEW &&
+        ggml_get_op_params_i32(tensor, GGML_BACKEND_META_ROWS_PARAM) == GGML_BACKEND_META_ROWS_MAGIC;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
@@ -977,6 +1009,27 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         }
 
+        // a rows view of a mirrored matrix is split by the rows its op params give each device
+        if (ggml_backend_meta_is_rows(tensor)) {
+            GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT((size_t) ggml_get_op_params_i32(tensor, GGML_BACKEND_META_ROWS_PARAM + 1) == n_bufs);
+            ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+            for (size_t j = 0; j < n_bufs; j++) {
+                ret.ne[j] = ggml_get_op_params_i32(tensor, GGML_BACKEND_META_ROWS_PARAM + 2 + (int) j);
+            }
+            return ret;
+        }
+        // each device writes one (value, index) pair for its slice of a row split along axis 0
+        if (tensor->op == GGML_OP_ARGMAX_PART && src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[0].n_segments == 1 && src_ss[0].nr[0] == 1);
+            GGML_ASSERT(tensor->ne[0] == 2*(int64_t) n_bufs);
+            ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+            for (size_t j = 0; j < n_bufs; j++) {
+                ret.ne[j] = 2;
+            }
+            return ret;
+        }
+
         ggml_backend_meta_split_state split_state;
         switch (tensor->op) {
             case GGML_OP_NONE: {
@@ -1017,6 +1070,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_CUMSUM:
             case GGML_OP_MEAN:
             case GGML_OP_ARGMAX:
+            case GGML_OP_ARGMAX_PART:
+            case GGML_OP_ARGMAX_MERGE:
             case GGML_OP_COUNT_EQUAL: {
                 split_state = handle_per_row(src_ss);
             } break;
@@ -1381,6 +1436,17 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 ggml_set_op_params_i32(t_ij, 2*ss_src.axis + 1, (int32_t) rp);
             }
         }
+        if (tensor->op == GGML_OP_ARGMAX_PART && split_dim == GGML_BACKEND_SPLIT_AXIS_0) {
+            // the device's indices count from the start of its slice in the row
+            const ggml_backend_meta_split_state ss_src = ggml_backend_meta_get_split_state(tensor->src[0], /*assume_sync =*/ true);
+            GGML_ASSERT(ss_src.axis == GGML_BACKEND_SPLIT_AXIS_0);
+            int64_t lp = 0;
+            for (size_t jj = 0; jj < j; jj++) {
+                lp += ss_src.ne[jj];
+            }
+            GGML_ASSERT(lp <= INT32_MAX);
+            ggml_set_op_params_i32(t_ij, 0, (int32_t) lp);
+        }
         ggml_set_name(t_ij, tensor->name);
         t_ij->buffer = simple_buf;
         t_ij->view_src = tensor->view_src;
@@ -1406,6 +1472,14 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                     t_ij->view_offs = t_ij->view_offs * ne[split_dim]/tensor->ne[split_dim];
                 }
             }
+        }
+        if (ggml_backend_meta_is_rows(tensor)) {
+            // the device holds the whole matrix: its rows start after the rows of the devices before it
+            int64_t lp = 0;
+            for (size_t jj = 0; jj < j; jj++) {
+                lp += split_state.ne[jj];
+            }
+            t_ij->view_offs = tensor->view_offs + lp*tensor->nb[1];
         }
         // TODO: revisit once the graph allocator has been refactored, see https://github.com/ggml-org/llama.cpp/pull/25051#issuecomment-4842873396
         ggml_backend_buffer_t init_buf = simple_buf;

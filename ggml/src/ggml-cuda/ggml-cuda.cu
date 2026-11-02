@@ -2273,6 +2273,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
             break;
+        case GGML_OP_ARGMAX_PART:
+            ggml_cuda_argmax_part(ctx, dst);
+            break;
+        case GGML_OP_ARGMAX_MERGE:
+            ggml_cuda_argmax_merge(ctx, dst);
+            break;
         case GGML_OP_COUNT_EQUAL:
             ggml_cuda_count_equal(ctx, dst);
             break;
@@ -5905,6 +5911,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_ARGMAX:
         case GGML_OP_COUNT_EQUAL:
             return true;
+        case GGML_OP_ARGMAX_PART:
+        case GGML_OP_ARGMAX_MERGE:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float);
         case GGML_OP_REPEAT:
             {
                 // the CUDA REPEAT path only implements F32/F16; other types assert at runtime

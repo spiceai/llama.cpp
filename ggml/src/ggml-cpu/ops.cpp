@@ -1631,6 +1631,100 @@ void ggml_compute_forward_argmax(
     }
 }
 
+// ggml_compute_forward_argmax_part
+
+void ggml_compute_forward_argmax_part(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    const int64_t ne00   = src0->ne[0];
+    const int64_t ne01   = src0->ne[1];
+    const int64_t n_dst  = dst->ne[0];
+    const int32_t origin = ggml_get_op_params_i32(dst, 0);
+
+    for (int64_t i1 = 0; i1 < ne01; i1++) {
+        const float * x = (const float *) ((const char *) src0->data + i1*src0->nb[1]);
+        float       * y = (float       *) ((char       *)  dst->data + i1*dst->nb[1]);
+
+        float   best_v = -INFINITY;
+        int64_t best_i = -1;
+        if (origin == 0 && ne00 > 0 && std::isnan(x[0])) {
+            best_v = NAN;
+            best_i = 0;
+        } else {
+            for (int64_t i0 = 0; i0 < ne00; i0++) {
+                // a NaN fails both tests; the first value that is not one starts the scan
+                if (best_i < 0 ? !std::isnan(x[i0]) : x[i0] > best_v) {
+                    best_v = x[i0];
+                    best_i = i0;
+                }
+            }
+            if (best_i >= 0) {
+                best_i += origin;
+            }
+        }
+        y[0] = best_v;
+        y[1] = (float) best_i;
+        for (int64_t k = 2; k < n_dst; k += 2) {
+            y[k + 0] = -INFINITY;
+            y[k + 1] = -1.0f;
+        }
+    }
+}
+
+// ggml_compute_forward_argmax_merge
+
+void ggml_compute_forward_argmax_merge(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    const int64_t n_pairs = src0->ne[0] / 2;
+    const int64_t ne01    = src0->ne[1];
+
+    for (int64_t i1 = 0; i1 < ne01; i1++) {
+        const float * x = (const float *) ((const char *) src0->data + i1*src0->nb[1]);
+        int32_t     * y = (int32_t     *) ((char       *)  dst->data + i1*dst->nb[0]);
+
+        int32_t best_i = -1;
+        float   best_v = -INFINITY;
+        bool    nan    = false;
+        for (int64_t k = 0; k < n_pairs && !nan; k++) {
+            const float   v = x[2*k + 0];
+            const int32_t i = (int32_t) x[2*k + 1];
+            if (i < 0) {
+                continue;
+            }
+            if (std::isnan(v)) {
+                best_i = i;
+                nan    = true;
+            } else if (best_i < 0 || v > best_v) {
+                best_v = v;
+                best_i = i;
+            }
+        }
+        y[0] = best_i < 0 ? 0 : best_i;
+    }
+}
+
 // ggml_compute_forward_count_equal
 
 static void ggml_compute_forward_count_equal_i32(

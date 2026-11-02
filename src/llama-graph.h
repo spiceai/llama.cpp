@@ -1124,10 +1124,13 @@ struct llm_graph_context {
               ggml_tensor * cur) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
+    // w_mm, if set, is multiplied in place of w: a view of w (ggml_backend_meta_rows) whose Hadamard rotation and
+    // precision are w's; w must then have no LoRA
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s  = nullptr,
+              ggml_tensor * w_mm = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
