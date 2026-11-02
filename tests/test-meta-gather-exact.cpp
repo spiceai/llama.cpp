@@ -10,8 +10,8 @@
 // It runs on two copies of every CPU and GPU device found, or of TEST_DEVICE alone when that is set. On CUDA the
 // reduction is GGML_CUDA_ALLREDUCE's, or the platform default (NCCL on Linux when the build has it, else the internal
 // all-reduce); the registered tests pin GGML_CUDA_AR_BF16_THRESHOLD=1 so BF16 compression applies to every F32 tensor.
-// With GGML_CUDA_ALLREDUCE=nccl a CUDA device runs only beside a second GPU (NCCL takes one rank per GPU) in a build
-// with NCCL, and is skipped otherwise.
+// When a CUDA device would reduce through NCCL (GGML_CUDA_ALLREDUCE=nccl, or the Linux default in a build with NCCL), it
+// runs beside a second GPU, since NCCL takes one rank per GPU, and is skipped without one or without NCCL.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -71,6 +71,25 @@ static const char * unsupported_op(ggml_backend_dev_t dev) {
 static bool is_cuda(ggml_backend_dev_t dev) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     return reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+}
+
+static bool has_nccl(ggml_backend_dev_t dev) {
+    return ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_nccl_allreduce") != nullptr;
+}
+
+// whether CUDA devices reduce through NCCL: GGML_CUDA_ALLREDUCE=nccl, or with it unset the platform default, which is
+// NCCL on Linux when the build has it (ggml_backend_cuda_comm_init) and the internal all-reduce otherwise
+static bool cuda_reduces_with_nccl(ggml_backend_dev_t dev) {
+    const char * ar = getenv("GGML_CUDA_ALLREDUCE");
+    if (ar != nullptr) {
+        return strcmp(ar, "nccl") == 0;
+    }
+#if defined(__linux__)
+    return has_nccl(dev);
+#else
+    (void) dev;
+    return false;
+#endif
 }
 
 // the number of gathers that differ from their slices on a meta device over dev0 and dev1
@@ -249,8 +268,6 @@ int main() {
             }
         }
     }
-    const char * ar   = getenv("GGML_CUDA_ALLREDUCE");
-    const bool   nccl = ar != nullptr && strcmp(ar, "nccl") == 0;
     int n_fail = 0, n_run = 0;
     bool nccl_done = false;
     for (ggml_backend_dev_t dev : devs) {
@@ -259,12 +276,12 @@ int main() {
             continue;
         }
         ggml_backend_dev_t dev1 = dev;
-        if (nccl && is_cuda(dev)) {
+        if (is_cuda(dev) && cuda_reduces_with_nccl(dev)) {
             if (nccl_done) {
                 continue;
             }
             nccl_done = true;
-            if (ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_nccl_allreduce") == nullptr) {
+            if (!has_nccl(dev)) {
                 printf("device %s: skipped, GGML_CUDA_ALLREDUCE=nccl and this build has no NCCL\n", ggml_backend_dev_name(dev));
                 continue;
             }
@@ -276,7 +293,7 @@ int main() {
                 }
             }
             if (dev1 == nullptr) {
-                printf("device %s: skipped, GGML_CUDA_ALLREDUCE=nccl needs a second GPU (NCCL takes one rank per GPU)\n", ggml_backend_dev_name(dev));
+                printf("device %s: skipped, it reduces through NCCL, which needs a second GPU (one rank per GPU)\n", ggml_backend_dev_name(dev));
                 continue;
             }
         }
