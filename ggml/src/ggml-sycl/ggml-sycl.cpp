@@ -7988,7 +7988,9 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
     // NCCL allreduce pattern for n_backends=2.
     static constexpr int64_t BF16_THRESHOLD = 32768;
 
-    if (nelem < BF16_THRESHOLD) {
+    // a gather (ggml_is_meta_gather) moves values instead of summing partials, so rounding it would change the values
+    // themselves (logits, token ids, argmax picks): it takes the FP32 path whatever its size
+    if (nelem < BF16_THRESHOLD || ggml_is_meta_gather(tensors[0])) {
         // FP32 small path: 4 SYCL submissions per allreduce.
         float * tmp0 = (float *) buf0;
         float * tmp1 = (float *) buf1;
