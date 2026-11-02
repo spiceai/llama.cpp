@@ -2,7 +2,8 @@
 // values (logits, token ids) rather than summing partial results, so a reduction that rounds them (to BF16, say) changes
 // them. On a meta device over two copies of one device, a product split by rows is gathered and compared bit for bit
 // with the same product of a mirrored copy of the matrix: logits-like values, and integer values that BF16 cannot
-// represent (token ids above 100000). It runs on every CPU and GPU device found, or on TEST_DEVICE alone when that is
+// represent (token ids above 100000). A gather is exact in value, but a -0.0 comes back as +0.0, the sum of -0.0 and the
+// other device's zero padding: a split tensor of signed zeros and other values is gathered and compared by value. It runs on every CPU and GPU device found, or on TEST_DEVICE alone when that is
 // set; on CUDA, two devices reduce through the CUDA internal all-reduce unless GGML_CUDA_ALLREDUCE says otherwise.
 
 #include "ggml.h"
@@ -10,6 +11,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +23,8 @@ static const int64_t K      = 64;
 static const int64_t V      = 129280; // DeepSeek-V4.1's vocabulary
 static const int64_t NCOLS  = 3;
 static const int     N_DEVS = 2;
+static const int64_t ZC     = 4;      // the signed-zeros tensor: ZC x ZR, split by rows
+static const int64_t ZR     = 1000;
 
 // the matrices named "*split" are split by rows (axis 1) evenly across the devices, every other tensor is mirrored
 static ggml_backend_meta_split_state split_state(const ggml_tensor * tensor, void * userdata) {
@@ -64,18 +68,26 @@ static int test_device(ggml_backend_dev_t dev) {
         }
     }
 
+    // signed zeros, among values a reduction carries exactly
+    std::vector<float> zf(ZC*ZR);
+    for (int64_t i = 0; i < ZC*ZR; i++) {
+        zf[i] = i % 4 == 0 ? -0.0f : i % 4 == 1 ? 0.0f : (i % 4 == 2 ? 1.0f : -1.0f) * (float) i * 0.25f;
+    }
+
     ggml_init_params wp = { ggml_tensor_overhead()*8, nullptr, true };
     ggml_context * ctx_w = ggml_init(wp);
     ggml_tensor * w_logits_split = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, K, V); ggml_set_name(w_logits_split, "w_logits_split");
     ggml_tensor * w_logits_whole = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, K, V); ggml_set_name(w_logits_whole, "w_logits_whole");
     ggml_tensor * w_ids_split    = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, K, V); ggml_set_name(w_ids_split,    "w_ids_split");
     ggml_tensor * w_ids_whole    = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, K, V); ggml_set_name(w_ids_whole,    "w_ids_whole");
+    ggml_tensor * z_split        = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, ZC, ZR); ggml_set_name(z_split,       "z_split");
     ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
     GGML_ASSERT(wbuf != nullptr);
     ggml_backend_tensor_set(w_logits_split, wl.data(), 0, ggml_nbytes(w_logits_split));
     ggml_backend_tensor_set(w_logits_whole, wl.data(), 0, ggml_nbytes(w_logits_whole));
     ggml_backend_tensor_set(w_ids_split,    wi.data(), 0, ggml_nbytes(w_ids_split));
     ggml_backend_tensor_set(w_ids_whole,    wi.data(), 0, ggml_nbytes(w_ids_whole));
+    ggml_backend_tensor_set(z_split,        zf.data(), 0, ggml_nbytes(z_split));
 
     ggml_init_params gp = { ggml_tensor_overhead()*32 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(gp);
@@ -86,6 +98,7 @@ static int test_device(ggml_backend_dev_t dev) {
         { "logits",    ggml_backend_meta_gather(ctx, ggml_mul_mat(ctx, w_logits_split, x)), ggml_mul_mat(ctx, w_logits_whole, x) },
         { "token ids", ggml_backend_meta_gather(ctx, ggml_mul_mat(ctx, w_ids_split,    x)), ggml_mul_mat(ctx, w_ids_whole,    x) },
     };
+    ggml_tensor * z_gathered = ggml_backend_meta_gather(ctx, z_split);
     ggml_cgraph * gf = ggml_new_graph(ctx);
     for (const pair & p : pairs) {
         ggml_set_output(p.gathered);
@@ -93,6 +106,8 @@ static int test_device(ggml_backend_dev_t dev) {
         ggml_build_forward_expand(gf, p.gathered);
         ggml_build_forward_expand(gf, p.whole);
     }
+    ggml_set_output(z_gathered);
+    ggml_build_forward_expand(gf, z_gathered);
     ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
     ggml_backend_tensor_set(x, xf.data(), 0, ggml_nbytes(x));
@@ -123,6 +138,22 @@ static int test_device(ggml_backend_dev_t dev) {
             printf("; ids at rows 0, 64640, 129279: %.0f %.0f %.0f (want %.0f %.0f %.0f)", g[0], g[64640], g[V - 1], w[0], w[64640], w[V - 1]);
         }
         printf(" %s\n", n_diff == 0 ? "ok" : "FAIL");
+    }
+
+    {
+        std::vector<float> g(ZC*ZR);
+        ggml_backend_tensor_get(z_gathered, g.data(), 0, ggml_nbytes(z_gathered));
+        int64_t n_diff = 0, n_neg_zero = 0, n_now_pos = 0;
+        for (int64_t i = 0; i < ZC*ZR; i++) {
+            n_diff += !(g[i] == zf[i]); // -0.0 == +0.0
+            if (zf[i] == 0.0f && std::signbit(zf[i])) {
+                n_neg_zero++;
+                n_now_pos += !std::signbit(g[i]);
+            }
+        }
+        n_fail += n_diff != 0;
+        printf("  %-9s gathered differs from the source in value in %lld of %lld values; %lld of %lld -0.0 came back +0.0 %s\n",
+            "zeros", (long long) n_diff, (long long) (ZC*ZR), (long long) n_now_pos, (long long) n_neg_zero, n_diff == 0 ? "ok" : "FAIL");
     }
 
     ggml_gallocr_free(galloc);
