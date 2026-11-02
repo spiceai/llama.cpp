@@ -2421,6 +2421,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         {
             // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
             auto get_i_delayed_branch = [&](const int i) -> int {
+                // a gather's all-reduce moves values, so it stays at the gather, where the reductions see the marker that
+                // keeps it in F32 (ggml_is_meta_gather): delayed to a following node it would be reduced without it
+                if (ggml_backend_meta_is_gather(cgraph->nodes[i])) {
+                    return i;
+                }
                 int id = i; // i_delayed
                 int idr = i; // i_delayed return, last safe return value
 
@@ -2522,6 +2527,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             // AllReduce(a) + AllReduce(b) == AllReduce(a + b) for independent partial branches.
             auto get_i_delayed = [&](const int i) -> int {
+                // nor is a gather merged into another branch's reduction, for the same reason
+                if (ggml_backend_meta_is_gather(cgraph->nodes[i])) {
+                    return i;
+                }
                 const int i_delayed = get_i_delayed_branch(i);
                 ggml_tensor * node = cgraph->nodes[i_delayed];
 
@@ -2548,6 +2557,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
 
                     const int i_other = id;
+                    if (ggml_backend_meta_is_gather(next)) {
+                        return i_delayed;
+                    }
                     const int i_other_delayed = get_i_delayed_branch(i_other);
                     ggml_tensor * other = cgraph->nodes[i_other_delayed];
                     if (ggml_node_get_use_count(cgraph, i_other_delayed) != 1 || i_other_delayed + 1 >= cgraph->n_nodes) {

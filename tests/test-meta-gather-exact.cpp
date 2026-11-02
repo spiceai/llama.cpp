@@ -4,6 +4,8 @@
 // device holds them, read back: two products (logits-like values, and integer values that BF16 cannot represent, token
 // ids above 100000) bit for bit, and a directly populated tensor of signed zeros and values BF16 cannot represent by
 // value. A gather is exact in value, but a -0.0 comes back as +0.0, the sum of -0.0 and the other device's zero padding.
+// A gather multiplied by a mirrored tensor and then rectified checks that the meta backend keeps the gather's all-reduce
+// at the gather, where a reduction sees its marker, rather than delaying it to the product as it does for partial sums.
 //
 // It runs on two copies of every CPU and GPU device found, or of TEST_DEVICE alone when that is set. On CUDA the
 // reduction is GGML_CUDA_ALLREDUCE's, or the platform default (NCCL on Linux when the build has it, else the internal
@@ -114,11 +116,16 @@ static int test_devices(ggml_backend_dev_t dev0, ggml_backend_dev_t dev1) {
     ggml_tensor * w_logits_split = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, K, V);   ggml_set_name(w_logits_split, "w_logits_split");
     ggml_tensor * w_ids_split    = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, K, V);   ggml_set_name(w_ids_split,    "w_ids_split");
     ggml_tensor * z_split        = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, ZC, ZR); ggml_set_name(z_split,        "z_split");
+    ggml_tensor * ones           = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, V, 1);   ggml_set_name(ones,           "ones");
     ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
     GGML_ASSERT(wbuf != nullptr);
     ggml_backend_tensor_set(w_logits_split, wl.data(), 0, ggml_nbytes(w_logits_split));
     ggml_backend_tensor_set(w_ids_split,    wi.data(), 0, ggml_nbytes(w_ids_split));
     ggml_backend_tensor_set(z_split,        zf.data(), 0, ggml_nbytes(z_split));
+    {
+        const std::vector<float> one(V, 1.0f);
+        ggml_backend_tensor_set(ones, one.data(), 0, ggml_nbytes(ones));
+    }
 
     ggml_init_params gp = { ggml_tensor_overhead()*32 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(gp);
@@ -133,6 +140,8 @@ static int test_devices(ggml_backend_dev_t dev0, ggml_backend_dev_t dev1) {
         { "token ids", y_ids,    ggml_backend_meta_gather(ctx, y_ids)    },
     };
     ggml_tensor * z_gathered = ggml_backend_meta_gather(ctx, z_split);
+    // gather -> times mirrored ones -> relu: the shape whose partial-sum all-reduce the meta backend delays to the product
+    ggml_tensor * r_gathered = ggml_relu(ctx, ggml_mul(ctx, ggml_backend_meta_gather(ctx, y_logits), ones));
     ggml_cgraph * gf = ggml_new_graph(ctx);
     for (const pair & p : pairs) {
         ggml_set_output(p.split);
@@ -141,6 +150,8 @@ static int test_devices(ggml_backend_dev_t dev0, ggml_backend_dev_t dev1) {
     }
     ggml_set_output(z_gathered);
     ggml_build_forward_expand(gf, z_gathered);
+    ggml_set_output(r_gathered);
+    ggml_build_forward_expand(gf, r_gathered);
     ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
     ggml_backend_tensor_set(x, xf.data(), 0, ggml_nbytes(x));
@@ -186,6 +197,26 @@ static int test_devices(ggml_backend_dev_t dev0, ggml_backend_dev_t dev1) {
         n_fail += n_diff != 0;
         printf("  %-9s gathered differs from the source in value in %lld of %lld values; %lld of %lld -0.0 came back +0.0 %s\n",
             "direct", (long long) n_diff, (long long) (ZC*ZR), (long long) n_now_pos, (long long) n_neg_zero, n_diff == 0 ? "ok" : "FAIL");
+    }
+
+    {
+        std::vector<float> g(V*NCOLS), s(V*NCOLS);
+        ggml_backend_tensor_get(r_gathered, g.data(), 0, ggml_nbytes(r_gathered));
+        ggml_backend_tensor_get(y_logits,   s.data(), 0, ggml_nbytes(y_logits));
+        int64_t n_diff = 0, first = -1;
+        for (int64_t i = 0; i < V*NCOLS; i++) {
+            const float want = s[i] > 0.0f ? s[i] : 0.0f; // the slices times one, rectified
+            if (!(g[i] == want)) {
+                n_diff++;
+                first = first < 0 ? i : first;
+            }
+        }
+        n_fail += n_diff != 0;
+        printf("  %-9s relu(gather * ones) differs from its slices' in value in %lld of %lld values", "delayed", (long long) n_diff, (long long) (V*NCOLS));
+        if (first >= 0) {
+            printf(" (first at %lld: %.9g, want %.9g)", (long long) first, g[first], s[first] > 0.0f ? s[first] : 0.0f);
+        }
+        printf(" %s\n", n_diff == 0 ? "ok" : "FAIL");
     }
 
     ggml_gallocr_free(galloc);
