@@ -3,7 +3,7 @@
 // of each column comes from one (value, index) pair per copy. Checks that the gathered product equals the product of the
 // whole matrix bit for bit (a row's dot product does not depend on which rows a device computes), and that the picks
 // are the first max of each column as the greedy sampler takes it: the earliest index on a tie, 0 when the first value
-// is a NaN, NaNs skipped otherwise. Ties straddle the devices' rows, from duplicated rows of the matrix. Two copies of a
+// is a NaN, NaNs skipped otherwise, including one at the start of a later device's rows. Ties straddle the devices' rows, from duplicated rows of the matrix. Two copies of a
 // CUDA device reduce through the CUDA internal all-reduce, three through the meta backend's butterfly.
 
 #include "ggml.h"
@@ -305,6 +305,94 @@ static int test_meta(ggml_backend_dev_t dev, ggml_type type, int64_t k, int64_t 
     return n_fail;
 }
 
+// NaNs on the split path: a product with a rows view whose rows are given values (row r of w is value r times e_0, and
+// x = e_0), so a NaN can sit at the start of a later device's slice. Only the row's first value decides token 0; a NaN
+// at a later slice's start is skipped like any other. Each case sets the weights and runs the graph again.
+static int test_meta_nan(ggml_backend_dev_t dev, const std::vector<int64_t> & parts) {
+    const int     n_parts = (int) parts.size();
+    const int64_t k = 32, v = 1000;
+    std::vector<ggml_backend_dev_t> devs(n_parts, dev);
+    ggml_backend_t backend = ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), mirrored_split_state, nullptr), nullptr);
+    GGML_ASSERT(backend != nullptr);
+    std::string layout;
+    for (int64_t p : parts) {
+        layout += (layout.empty() ? "" : "/") + std::to_string(p);
+    }
+
+    struct nan_case { std::string what; std::vector<float> vals; };
+    std::vector<nan_case> cases;
+    {
+        std::vector<float> r(v, -1.0f);
+        r[0] = NAN; r[v - 1] = 100.0f;
+        cases.push_back({ "NaN at row 0, max at the last row", r });
+    }
+    int64_t start = 0;
+    for (int j = 0; j + 1 < n_parts; j++) {
+        start += parts[j];
+        const std::string at = "NaN at row " + std::to_string(start) + " (device " + std::to_string(j + 1) + "'s first row)";
+        {
+            std::vector<float> r(v, -1.0f);
+            r[start] = NAN; r[v - 1] = 100.0f;
+            cases.push_back({ at + ", max at the last row", r });
+        }
+        {
+            std::vector<float> r(v, -1.0f);
+            r[start] = NAN; r[10] = 100.0f;
+            cases.push_back({ at + ", max at row 10", r });
+        }
+        {
+            std::vector<float> r(v, -INFINITY);
+            r[start] = NAN;
+            cases.push_back({ at + ", every other row -inf", r });
+        }
+    }
+
+    ggml_init_params wp = { ggml_tensor_overhead()*2, nullptr, true };
+    ggml_context * ctx_w = ggml_init(wp);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, k, v);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+    GGML_ASSERT(wbuf != nullptr);
+
+    ggml_init_params gp = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(gp);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+    ggml_set_input(x);
+    ggml_tensor * split = ggml_mul_mat(ctx, ggml_backend_meta_rows(ctx, w, n_parts, parts.data()), x);
+    ggml_tensor * pick  = ggml_argmax_merge(ctx, ggml_backend_meta_gather(ctx, ggml_argmax_part(ctx, split, n_parts)));
+    ggml_set_output(x);
+    ggml_set_output(pick);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, pick);
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+
+    std::vector<float> xf(k, 0.0f);
+    xf[0] = 1.0f;
+    int n_fail = 0;
+    for (const nan_case & c : cases) {
+        std::vector<float> wf(k*v, 0.0f);
+        for (int64_t r = 0; r < v; r++) {
+            wf[r*k] = c.vals[r];
+        }
+        ggml_backend_tensor_set(w, wf.data(), 0, ggml_nbytes(w));
+        ggml_backend_tensor_set(x, xf.data(), 0, ggml_nbytes(x));
+        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        int32_t got = -1;
+        ggml_backend_tensor_get(pick, &got, 0, sizeof(got));
+        const int32_t want = ref_argmax(c.vals.data(), v);
+        n_fail += got != want;
+        printf("  %s nan parts=%s, %s: pick %d, want %d %s\n", ggml_backend_dev_name(dev), layout.c_str(), c.what.c_str(), got, want,
+            got == want ? "ok" : "FAIL");
+    }
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(ctx_w);
+    ggml_backend_free(backend);
+    return n_fail;
+}
+
 // The DSpark Markov head's graph: block_drafts positions of n_blocks sequences, base = head x hidden [V, n_blocks*block],
 // position i of every block a strided view of base, plus that position's Markov bias, and its pick from the pairs. With one
 // block the head is split by rows (as the drafter does); with more, the views would step over the other blocks' rows of a
@@ -412,6 +500,9 @@ int main() {
     }
     // the DeepSeek-V4.1 DSpark shapes: the Q6_K output head (3 draft columns) and the BF16 Markov transition (1 column)
     const int64_t v = getenv("TEST_VOCAB") ? atoll(getenv("TEST_VOCAB")) : 129280;
+    for (int n_parts : {2, 3}) {
+        n_fail += test_meta_nan(dev, even_parts(1000, n_parts));
+    }
     for (int n_parts : {2, 3}) {
         const std::vector<int64_t> parts = even_parts(v, n_parts);
         n_fail += test_meta(dev, GGML_TYPE_Q6_K, 5120, v, 3, parts, false);
