@@ -1,9 +1,9 @@
 // ggml_backend_meta_gather must reproduce the split tensor exactly, whatever all-reduce the devices use: a gather moves
 // values (logits, token ids) rather than summing partial results, so a reduction that rounds them (to BF16, say) changes
-// them. On a meta device over two copies of one device (TEST_DEVICE, default CPU; on CUDA, two devices reduce through the
-// CUDA internal all-reduce unless GGML_CUDA_ALLREDUCE says otherwise), a product split by rows is gathered and compared
-// bit for bit with the same product of a mirrored copy of the matrix: logits-like values, and integer values that BF16
-// cannot represent (token ids above 100000).
+// them. On a meta device over two copies of one device, a product split by rows is gathered and compared bit for bit
+// with the same product of a mirrored copy of the matrix: logits-like values, and integer values that BF16 cannot
+// represent (token ids above 100000). It runs on every CPU and GPU device found, or on TEST_DEVICE alone when that is
+// set; on CUDA, two devices reduce through the CUDA internal all-reduce unless GGML_CUDA_ALLREDUCE says otherwise.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -36,12 +36,8 @@ static ggml_backend_meta_split_state split_state(const ggml_tensor * tensor, voi
     return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
 }
 
-int main() {
-    setvbuf(stdout, nullptr, _IONBF, 0);
-    ggml_backend_load_all();
-    const char * dev_name = getenv("TEST_DEVICE");
-    ggml_backend_dev_t dev = dev_name ? ggml_backend_dev_by_name(dev_name) : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    GGML_ASSERT(dev != nullptr);
+// the number of gathered products that differ from the whole product on a meta device over two copies of dev
+static int test_device(ggml_backend_dev_t dev) {
     const char * ar  = getenv("GGML_CUDA_ALLREDUCE");
     const char * thr = getenv("GGML_CUDA_AR_BF16_THRESHOLD");
     printf("device %s x %d, GGML_CUDA_ALLREDUCE=%s, GGML_CUDA_AR_BF16_THRESHOLD=%s\n", ggml_backend_dev_name(dev), N_DEVS,
@@ -134,6 +130,35 @@ int main() {
     ggml_backend_buffer_free(wbuf);
     ggml_free(ctx_w);
     ggml_backend_free(backend);
-    printf("%s\n", n_fail == 0 ? "OK" : "FAILED");
+    return n_fail;
+}
+
+int main() {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    ggml_backend_load_all();
+    std::vector<ggml_backend_dev_t> devs;
+    const char * dev_name = getenv("TEST_DEVICE");
+    if (dev_name != nullptr) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(dev_name);
+        if (dev == nullptr) {
+            printf("TEST_DEVICE=%s: no such device\nFAILED\n", dev_name);
+            return 1;
+        }
+        devs.push_back(dev);
+    } else {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+            // an accelerator (BLAS, say) runs only beside the CPU, not as a device of its own
+            if (type == GGML_BACKEND_DEVICE_TYPE_CPU || type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                devs.push_back(dev);
+            }
+        }
+    }
+    int n_fail = 0;
+    for (ggml_backend_dev_t dev : devs) {
+        n_fail += test_device(dev);
+    }
+    printf("%zu devices: %s\n", devs.size(), n_fail == 0 ? "OK" : "FAILED");
     return n_fail == 0 ? 0 : 1;
 }
