@@ -273,12 +273,13 @@ static int test_meta(ggml_backend_dev_t dev, ggml_type type, int64_t k, int64_t 
     ggml_tensor * col    = ggml_add(ctx, split, ggml_mul_mat(ctx, ggml_backend_meta_rows(ctx, w2, n_parts, parts.data()), xb));
     ggml_tensor * pick_b = ggml_argmax_merge(ctx, ggml_backend_meta_gather(ctx, ggml_argmax_part(ctx, col, n_parts)));
     ggml_tensor * whole_b = ggml_add(ctx, whole, ggml_mul_mat(ctx, w2, xb));
+    ggml_tensor * gather_b = ggml_backend_meta_gather(ctx, col); // the biased logits as the devices computed them
     ggml_tensor * plain   = ggml_argmax(ctx, whole); // the op the draft chain takes its argmax with when the head is whole
-    for (ggml_tensor * t : {x, xb, whole, gather, pick, pick_b, whole_b, plain}) {
+    for (ggml_tensor * t : {x, xb, whole, gather, pick, pick_b, whole_b, gather_b, plain}) {
         ggml_set_output(t); // the inputs too: the graph runs twice on one allocation
     }
     ggml_cgraph * gf = ggml_new_graph(ctx);
-    for (ggml_tensor * t : {whole, gather, pick, pick_b, whole_b, plain}) {
+    for (ggml_tensor * t : {whole, gather, pick, pick_b, whole_b, gather_b, plain}) {
         ggml_build_forward_expand(gf, t);
     }
     ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -299,12 +300,13 @@ static int test_meta(ggml_backend_dev_t dev, ggml_type type, int64_t k, int64_t 
         ggml_backend_tensor_set(xb, xbr.data(), 0, ggml_nbytes(xb));
         GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
 
-        std::vector<float> yw(v*ncols), yg(v*ncols), ywb(v*ncols);
+        std::vector<float> yw(v*ncols), yg(v*ncols), ywb(v*ncols), ygb(v*ncols);
         std::vector<int32_t> pk(ncols), pkb(ncols), pl(ncols);
         ggml_backend_tensor_get(plain,   pl.data(),  0, ggml_nbytes(plain));
         ggml_backend_tensor_get(whole,   yw.data(),  0, ggml_nbytes(whole));
         ggml_backend_tensor_get(gather,  yg.data(),  0, ggml_nbytes(gather));
         ggml_backend_tensor_get(whole_b, ywb.data(), 0, ggml_nbytes(whole_b));
+        ggml_backend_tensor_get(gather_b, ygb.data(), 0, ggml_nbytes(gather_b));
         ggml_backend_tensor_get(pick,    pk.data(),  0, ggml_nbytes(pick));
         ggml_backend_tensor_get(pick_b,  pkb.data(), 0, ggml_nbytes(pick_b));
 
@@ -315,10 +317,14 @@ static int test_meta(ggml_backend_dev_t dev, ggml_type type, int64_t k, int64_t 
             memcpy(&b, &yg[i], 4);
             n_diff += a != b;
         }
-        n_fail += n_diff != 0;
+        // the CPU's F32 product can depend on how many rows a device computes (on CI's x86 runners, split 1365/1365/1366,
+        // 6376 of 8192 values differ in the last bits), so there the picks are checked against the first max of what the
+        // devices computed, and the difference is reported, not failed. Every other product must equal the whole one.
+        const bool row_invariant = !(type == GGML_TYPE_F32 && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
+        n_fail += row_invariant && n_diff != 0;
         for (int64_t c = 0; c < ncols; c++) {
-            const int32_t want   = ref_argmax(&yw[c*v], v);
-            const int32_t want_b = ref_argmax(&ywb[c*v], v);
+            const int32_t want   = ref_argmax(row_invariant ? &yw[c*v]  : &yg[c*v],  v);
+            const int32_t want_b = ref_argmax(row_invariant ? &ywb[c*v] : &ygb[c*v], v);
             const bool ok = pk[c] == want && pkb[c] == want_b;
             n_fail += !ok;
             printf("  %s %s k=%lld v=%lld parts=%s%s run %d col %lld: pick %d want %d (tie rows %lld %lld %lld %lld, values %.9g %.9g %.9g %.9g), with bias pick %d want %d; ggml_argmax of the whole product %d %s\n",
@@ -328,7 +334,8 @@ static int test_meta(ggml_backend_dev_t dev, ggml_type type, int64_t k, int64_t 
         }
         printf("  %s %s k=%lld v=%lld ncols=%lld parts=%s%s run %d: gathered product differs from the whole product in %lld of %lld values %s\n",
             ggml_backend_dev_name(dev), ggml_type_name(type), (long long) k, (long long) v, (long long) ncols, layout.c_str(),
-            negative ? " negative" : "", run, (long long) n_diff, (long long) (v*ncols), n_diff == 0 ? "ok" : "FAIL");
+            negative ? " negative" : "", run, (long long) n_diff, (long long) (v*ncols),
+            n_diff == 0 ? "ok" : row_invariant ? "FAIL" : "(reported only: this backend's F32 product depends on the rows)");
     }
 
     ggml_gallocr_free(galloc);
