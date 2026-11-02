@@ -571,6 +571,9 @@ static constexpr int     GGML_BACKEND_META_ROWS_MAX   = GGML_MAX_OP_PARAMS/sizeo
 
 struct ggml_tensor * ggml_backend_meta_rows(struct ggml_context * ctx, struct ggml_tensor * a, int n_parts, const int64_t * ne_parts) {
     GGML_ASSERT(ggml_is_matrix(a));
+    // the view is built with ggml_view_2d, which takes rows of contiguous elements: a transposed matrix would be read
+    // with other strides than it has
+    GGML_ASSERT(a->nb[0] == ggml_type_size(a->type) && "ggml_backend_meta_rows: the matrix's rows must be contiguous");
     GGML_ASSERT(n_parts > 0 && n_parts <= GGML_BACKEND_META_ROWS_MAX);
     int64_t ne_sum = 0;
     bool    empty  = false;
