@@ -2766,8 +2766,6 @@ typedef void * (*rpc_nccl_comm_init_rank_t)(ggml_backend_t backend, const void *
 typedef void   (*rpc_nccl_comm_free_t)(void * comm);
 typedef void   (*rpc_nccl_comm_abort_t)(void * comm);
 typedef bool   (*rpc_nccl_allreduce_t)(ggml_backend_t backend, void * comm, ggml_tensor * t);
-typedef bool   (*rpc_nccl_wire_bf16_wanted_t)(void);
-typedef void   (*rpc_nccl_comm_set_wire_bf16_t)(void * comm, bool on);
 
 static void * rpc_backend_proc(ggml_backend_t backend, const char * name) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -2875,13 +2873,17 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
             // ncclCommInitRank can succeed on one rank and fail on the other, so the ranks agree on its result as
             // well: unless both have a communicator, neither keeps one, and both copy through the host. The same byte
             // carries this rank's wish for the BF16 wire (GGML_NCCL_WIRE_BF16, read by the backend): NCCL sums one
-            // datatype per collective, so the wire is BF16 only when both ranks asked for it with gathers kept F32
-            // (rpc_nccl_wire_bf16), and a server that predates the wish or the exception keeps the F32 wire with this one
-            auto wanted   = (rpc_nccl_wire_bf16_wanted_t)   rpc_backend_proc(backend, "ggml_backend_cuda_nccl_wire_bf16_wanted");
-            auto set_wire = (rpc_nccl_comm_set_wire_bf16_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_set_wire_bf16");
+            // datatype per collective, so the wire is BF16 only when both ranks sent the same wish (rpc_nccl_wire_agree):
+            // with gathers kept F32 when both backends can, rounded on both when neither can, F32 otherwise
+            const rpc_nccl_wire_procs procs = {
+                (rpc_nccl_wire_bf16_wanted_t)   rpc_backend_proc(backend, "ggml_backend_cuda_nccl_wire_bf16_wanted"),
+                (rpc_nccl_comm_set_wire_bf16_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_set_wire_bf16"),
+                // a backend that keeps gathers F32 on the BF16 wire exports this setter; one that does not rounds them
+                (rpc_nccl_comm_set_wire_bf16_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_set_wire_bf16_exact"),
+            };
             const bool    inited      = nccl != nullptr;
-            const bool    wire_wanted = inited && wanted != nullptr && set_wire != nullptr && wanted();
-            const uint8_t word        = rpc_nccl_word(inited, wire_wanted);
+            const bool    wire_wanted = rpc_nccl_wire_wanted(inited, procs);
+            const uint8_t word        = rpc_nccl_word(inited, wire_wanted, procs);
             uint8_t peer_word = 0;
             const bool agreed = request.rank == 0 ?
                 state.peer->send_data(&word, 1) && state.peer->flush() && state.peer->recv_data(&peer_word, 1) :
@@ -2899,20 +2901,18 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
                 return true;
             }
             if (inited && peer_inited) {
-                const bool peer_wire     = (peer_word & RPC_NCCL_WIRE_BF16_EXACT) != 0;
-                const bool peer_wire_old = (peer_word & RPC_NCCL_WIRE_BF16) != 0;
-                if (wire_wanted && peer_wire_old) {
-                    LOG_WARN("[%s] device %u the peer's build rounds gathers on the BF16 wire, which this build keeps F32, so the all-reduce wire stays F32 on both ranks; run the same build on every rank\n",
+                const bool          peer_wire = (peer_word & (RPC_NCCL_WIRE_BF16 | RPC_NCCL_WIRE_BF16_EXACT)) != 0;
+                const rpc_nccl_wire wire      = rpc_nccl_wire_agree(word, peer_word);
+                if (wire_wanted && peer_wire && wire == RPC_NCCL_WIRE_AGREED_F32) {
+                    LOG_WARN("[%s] device %u one rank of this pair keeps gathers F32 on the BF16 wire and the other rounds them, so the all-reduce wire stays F32 on both ranks; run the same build on every rank\n",
                              __func__, request.device);
                 } else if (wire_wanted != peer_wire) {
                     LOG_WARN("[%s] device %u GGML_NCCL_WIRE_BF16 is set on %s rank of this pair, so the all-reduce wire stays F32 on both ranks; set it on every rank, or on none\n",
                              __func__, request.device, wire_wanted ? "this rank but not the peer" : "the peer but not this");
                 }
                 std::lock_guard<std::mutex> lock(comm_mutex);
-                state.nccl_wire_bf16 = rpc_nccl_wire_bf16(word, peer_word);
-                if (set_wire != nullptr) {
-                    set_wire(state.nccl, state.nccl_wire_bf16);
-                }
+                state.nccl_wire_bf16 = wire != RPC_NCCL_WIRE_AGREED_F32;
+                rpc_nccl_wire_set(state.nccl, procs, wire);
             }
         }
         bool nccl_on;
