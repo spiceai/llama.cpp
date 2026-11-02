@@ -362,9 +362,19 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # reads tensors split in segments across two slices of the CPU device, including a slice with no data
     llama_build_and_test(test-meta-async-read.cpp LINK ggml)
     target_include_directories(test-meta-async-read PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
-    # gathers a product split by rows across two copies of one device and checks it bit for bit, whatever all-reduce runs
+    # gathers tensors split by rows across two devices and checks them against their slices, whatever all-reduce runs: the
+    # platform default, then each CUDA path pinned (the NCCL one skips without NCCL or a second GPU), with BF16 compression
+    # applied to every F32 tensor
     llama_build_and_test(test-meta-gather-exact.cpp LINK ggml)
-    # the NCCL wire two RPC servers agree on, for every pair of builds and wishes, in both rank orders
+    llama_test(test-meta-gather-exact NAME test-meta-gather-exact-internal)
+    llama_test(test-meta-gather-exact NAME test-meta-gather-exact-nccl)
+    set_tests_properties(test-meta-gather-exact PROPERTIES
+        ENVIRONMENT "GGML_CUDA_AR_BF16_THRESHOLD=1" ENVIRONMENT_MODIFICATION "GGML_CUDA_ALLREDUCE=unset:")
+    set_tests_properties(test-meta-gather-exact-internal PROPERTIES
+        ENVIRONMENT "GGML_CUDA_ALLREDUCE=internal;GGML_CUDA_AR_BF16_THRESHOLD=1")
+    set_tests_properties(test-meta-gather-exact-nccl PROPERTIES
+        ENVIRONMENT "GGML_CUDA_ALLREDUCE=nccl;GGML_CUDA_AR_BF16_THRESHOLD=1")
+    # the NCCL wire two RPC servers agree on, for every pair of server and backend builds and wishes, in both rank orders
     llama_build_and_test(test-rpc-nccl-wire.cpp LINK ggml)
     # a product split by the rows of a mirrored matrix and its argmax across the devices, on a meta device of copies of one device
     llama_build_and_test(test-argmax-split.cpp LINK ggml)

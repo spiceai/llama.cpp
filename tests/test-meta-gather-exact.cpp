@@ -1,10 +1,15 @@
 // ggml_backend_meta_gather must reproduce the split tensor exactly, whatever all-reduce the devices use: a gather moves
 // values (logits, token ids) rather than summing partial results, so a reduction that rounds them (to BF16, say) changes
-// them. On a meta device over two copies of one device, a product split by rows is gathered and compared bit for bit
-// with the same product of a mirrored copy of the matrix: logits-like values, and integer values that BF16 cannot
-// represent (token ids above 100000). A gather is exact in value, but a -0.0 comes back as +0.0, the sum of -0.0 and the
-// other device's zero padding: a split tensor of signed zeros and other values is gathered and compared by value. It runs on every CPU and GPU device found, or on TEST_DEVICE alone when that is
-// set; on CUDA, two devices reduce through the CUDA internal all-reduce unless GGML_CUDA_ALLREDUCE says otherwise.
+// them. On a meta device over two devices, tensors split by rows are gathered and compared with their slices as each
+// device holds them, read back: two products (logits-like values, and integer values that BF16 cannot represent, token
+// ids above 100000) bit for bit, and a directly populated tensor of signed zeros and values BF16 cannot represent by
+// value. A gather is exact in value, but a -0.0 comes back as +0.0, the sum of -0.0 and the other device's zero padding.
+//
+// It runs on two copies of every CPU and GPU device found, or of TEST_DEVICE alone when that is set. On CUDA the
+// reduction is GGML_CUDA_ALLREDUCE's, or the platform default (NCCL on Linux when the build has it, else the internal
+// all-reduce); the registered tests pin GGML_CUDA_AR_BF16_THRESHOLD=1 so BF16 compression applies to every F32 tensor.
+// With GGML_CUDA_ALLREDUCE=nccl a CUDA device runs only beside a second GPU (NCCL takes one rank per GPU) in a build
+// with NCCL, and is skipped otherwise.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -23,10 +28,11 @@ static const int64_t K      = 64;
 static const int64_t V      = 129280; // DeepSeek-V4.1's vocabulary
 static const int64_t NCOLS  = 3;
 static const int     N_DEVS = 2;
-static const int64_t ZC     = 4;      // the signed-zeros tensor: ZC x ZR, split by rows
-static const int64_t ZR     = 1000;
+// the directly populated tensor: ZC x ZR, split by rows, 65536 elements, above the direct NCCL all-reduce's 32768
+static const int64_t ZC     = 4;
+static const int64_t ZR     = 16384;
 
-// the matrices named "*split" are split by rows (axis 1) evenly across the devices, every other tensor is mirrored
+// the tensors named "*split" are split by rows (axis 1) evenly across the devices, every other tensor is mirrored
 static ggml_backend_meta_split_state split_state(const ggml_tensor * tensor, void * userdata) {
     (void) userdata;
     const std::string name = tensor->name;
@@ -60,14 +66,19 @@ static const char * unsupported_op(ggml_backend_dev_t dev) {
     return missing;
 }
 
-// the number of gathered products that differ from the whole product on a meta device over two copies of dev
-static int test_device(ggml_backend_dev_t dev) {
+static bool is_cuda(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    return reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+}
+
+// the number of gathers that differ from their slices on a meta device over dev0 and dev1
+static int test_devices(ggml_backend_dev_t dev0, ggml_backend_dev_t dev1) {
     const char * ar  = getenv("GGML_CUDA_ALLREDUCE");
     const char * thr = getenv("GGML_CUDA_AR_BF16_THRESHOLD");
-    printf("device %s x %d, GGML_CUDA_ALLREDUCE=%s, GGML_CUDA_AR_BF16_THRESHOLD=%s\n", ggml_backend_dev_name(dev), N_DEVS,
-        ar ? ar : "(unset)", thr ? thr : "(unset)");
+    printf("devices %s + %s, GGML_CUDA_ALLREDUCE=%s, GGML_CUDA_AR_BF16_THRESHOLD=%s\n", ggml_backend_dev_name(dev0),
+        ggml_backend_dev_name(dev1), ar ? ar : "(unset)", thr ? thr : "(unset)");
 
-    std::vector<ggml_backend_dev_t> devs(N_DEVS, dev);
+    std::vector<ggml_backend_dev_t> devs = { dev0, dev1 };
     ggml_backend_t backend = ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), split_state, nullptr), nullptr);
     GGML_ASSERT(backend != nullptr);
 
@@ -87,44 +98,46 @@ static int test_device(ggml_backend_dev_t dev) {
             xf[c*K + i] = c == 0 ? (i == 0 ? 1.0f : 0.0f) : nd(rng) * 20.0f;
         }
     }
-
-    // signed zeros, among values a reduction carries exactly
+    // signed zeros, among values BF16 cannot represent (a quarter-step from 0.25 up to 16383.75, and 100001 up)
     std::vector<float> zf(ZC*ZR);
     for (int64_t i = 0; i < ZC*ZR; i++) {
-        zf[i] = i % 4 == 0 ? -0.0f : i % 4 == 1 ? 0.0f : (i % 4 == 2 ? 1.0f : -1.0f) * (float) i * 0.25f;
+        switch (i % 4) {
+            case 0:  zf[i] = -0.0f;                           break;
+            case 1:  zf[i] =  0.0f;                           break;
+            case 2:  zf[i] =  (float) i * 0.25f + 0.25f;      break;
+            default: zf[i] = -(float) (100001 + i);           break;
+        }
     }
 
     ggml_init_params wp = { ggml_tensor_overhead()*8, nullptr, true };
     ggml_context * ctx_w = ggml_init(wp);
-    ggml_tensor * w_logits_split = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, K, V); ggml_set_name(w_logits_split, "w_logits_split");
-    ggml_tensor * w_logits_whole = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, K, V); ggml_set_name(w_logits_whole, "w_logits_whole");
-    ggml_tensor * w_ids_split    = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, K, V); ggml_set_name(w_ids_split,    "w_ids_split");
-    ggml_tensor * w_ids_whole    = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, K, V); ggml_set_name(w_ids_whole,    "w_ids_whole");
-    ggml_tensor * z_split        = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, ZC, ZR); ggml_set_name(z_split,       "z_split");
+    ggml_tensor * w_logits_split = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, K, V);   ggml_set_name(w_logits_split, "w_logits_split");
+    ggml_tensor * w_ids_split    = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, K, V);   ggml_set_name(w_ids_split,    "w_ids_split");
+    ggml_tensor * z_split        = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, ZC, ZR); ggml_set_name(z_split,        "z_split");
     ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
     GGML_ASSERT(wbuf != nullptr);
     ggml_backend_tensor_set(w_logits_split, wl.data(), 0, ggml_nbytes(w_logits_split));
-    ggml_backend_tensor_set(w_logits_whole, wl.data(), 0, ggml_nbytes(w_logits_whole));
     ggml_backend_tensor_set(w_ids_split,    wi.data(), 0, ggml_nbytes(w_ids_split));
-    ggml_backend_tensor_set(w_ids_whole,    wi.data(), 0, ggml_nbytes(w_ids_whole));
     ggml_backend_tensor_set(z_split,        zf.data(), 0, ggml_nbytes(z_split));
 
     ggml_init_params gp = { ggml_tensor_overhead()*32 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(gp);
     ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, NCOLS);
     ggml_set_input(x);
-    struct pair { const char * what; ggml_tensor * gathered; ggml_tensor * whole; };
+    // each product is split by rows; read back, it is each device's slice as that device computed it
+    struct pair { const char * what; ggml_tensor * split; ggml_tensor * gathered; };
+    ggml_tensor * y_logits = ggml_mul_mat(ctx, w_logits_split, x);
+    ggml_tensor * y_ids    = ggml_mul_mat(ctx, w_ids_split,    x);
     pair pairs[2] = {
-        { "logits",    ggml_backend_meta_gather(ctx, ggml_mul_mat(ctx, w_logits_split, x)), ggml_mul_mat(ctx, w_logits_whole, x) },
-        { "token ids", ggml_backend_meta_gather(ctx, ggml_mul_mat(ctx, w_ids_split,    x)), ggml_mul_mat(ctx, w_ids_whole,    x) },
+        { "logits",    y_logits, ggml_backend_meta_gather(ctx, y_logits) },
+        { "token ids", y_ids,    ggml_backend_meta_gather(ctx, y_ids)    },
     };
     ggml_tensor * z_gathered = ggml_backend_meta_gather(ctx, z_split);
     ggml_cgraph * gf = ggml_new_graph(ctx);
     for (const pair & p : pairs) {
+        ggml_set_output(p.split);
         ggml_set_output(p.gathered);
-        ggml_set_output(p.whole);
         ggml_build_forward_expand(gf, p.gathered);
-        ggml_build_forward_expand(gf, p.whole);
     }
     ggml_set_output(z_gathered);
     ggml_build_forward_expand(gf, z_gathered);
@@ -135,31 +148,30 @@ static int test_device(ggml_backend_dev_t dev) {
 
     int n_fail = 0;
     for (const pair & p : pairs) {
-        std::vector<float> g(V*NCOLS), w(V*NCOLS);
+        std::vector<float> g(V*NCOLS), s(V*NCOLS);
         ggml_backend_tensor_get(p.gathered, g.data(), 0, ggml_nbytes(p.gathered));
-        ggml_backend_tensor_get(p.whole,    w.data(), 0, ggml_nbytes(p.whole));
+        ggml_backend_tensor_get(p.split,    s.data(), 0, ggml_nbytes(p.split));
         int64_t n_diff = 0, first = -1;
         for (int64_t i = 0; i < V*NCOLS; i++) {
             uint32_t a, b;
             memcpy(&a, &g[i], 4);
-            memcpy(&b, &w[i], 4);
+            memcpy(&b, &s[i], 4);
             if (a != b) {
                 n_diff++;
                 first = first < 0 ? i : first;
             }
         }
         n_fail += n_diff != 0;
-        printf("  %-9s gathered differs from the whole product in %lld of %lld values", p.what, (long long) n_diff, (long long) (V*NCOLS));
+        printf("  %-9s gathered differs from its slices in %lld of %lld values", p.what, (long long) n_diff, (long long) (V*NCOLS));
         if (first >= 0) {
-            printf(" (first at %lld: %.9g, want %.9g)", (long long) first, g[first], w[first]);
+            printf(" (first at %lld: %.9g, want %.9g)", (long long) first, g[first], s[first]);
         }
-        if (p.whole == pairs[1].whole) {
+        if (p.split == y_ids) {
             // row r of column 0 is token id 100001 + r: show a few as gathered
-            printf("; ids at rows 0, 64640, 129279: %.0f %.0f %.0f (want %.0f %.0f %.0f)", g[0], g[64640], g[V - 1], w[0], w[64640], w[V - 1]);
+            printf("; ids at rows 0, 64640, 129279: %.0f %.0f %.0f (want %.0f %.0f %.0f)", g[0], g[64640], g[V - 1], s[0], s[64640], s[V - 1]);
         }
         printf(" %s\n", n_diff == 0 ? "ok" : "FAIL");
     }
-
     {
         std::vector<float> g(ZC*ZR);
         ggml_backend_tensor_get(z_gathered, g.data(), 0, ggml_nbytes(z_gathered));
@@ -173,7 +185,7 @@ static int test_device(ggml_backend_dev_t dev) {
         }
         n_fail += n_diff != 0;
         printf("  %-9s gathered differs from the source in value in %lld of %lld values; %lld of %lld -0.0 came back +0.0 %s\n",
-            "zeros", (long long) n_diff, (long long) (ZC*ZR), (long long) n_now_pos, (long long) n_neg_zero, n_diff == 0 ? "ok" : "FAIL");
+            "direct", (long long) n_diff, (long long) (ZC*ZR), (long long) n_now_pos, (long long) n_neg_zero, n_diff == 0 ? "ok" : "FAIL");
     }
 
     ggml_gallocr_free(galloc);
@@ -206,13 +218,38 @@ int main() {
             }
         }
     }
+    const char * ar   = getenv("GGML_CUDA_ALLREDUCE");
+    const bool   nccl = ar != nullptr && strcmp(ar, "nccl") == 0;
     int n_fail = 0, n_run = 0;
+    bool nccl_done = false;
     for (ggml_backend_dev_t dev : devs) {
         if (const char * op = unsupported_op(dev)) {
             printf("device %s: skipped, it cannot run %s\n", ggml_backend_dev_name(dev), op);
             continue;
         }
-        n_fail += test_device(dev);
+        ggml_backend_dev_t dev1 = dev;
+        if (nccl && is_cuda(dev)) {
+            if (nccl_done) {
+                continue;
+            }
+            nccl_done = true;
+            if (ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_nccl_allreduce") == nullptr) {
+                printf("device %s: skipped, GGML_CUDA_ALLREDUCE=nccl and this build has no NCCL\n", ggml_backend_dev_name(dev));
+                continue;
+            }
+            dev1 = nullptr;
+            for (size_t i = 0; i < ggml_backend_dev_count() && dev1 == nullptr; i++) {
+                ggml_backend_dev_t other = ggml_backend_dev_get(i);
+                if (other != dev && is_cuda(other) && ggml_backend_dev_type(other) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    dev1 = other;
+                }
+            }
+            if (dev1 == nullptr) {
+                printf("device %s: skipped, GGML_CUDA_ALLREDUCE=nccl needs a second GPU (NCCL takes one rank per GPU)\n", ggml_backend_dev_name(dev));
+                continue;
+            }
+        }
+        n_fail += test_devices(dev, dev1);
         n_run++;
     }
     // TEST_DEVICE names the device to test, so skipping it is a failure
