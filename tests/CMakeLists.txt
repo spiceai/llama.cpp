@@ -364,6 +364,8 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     target_include_directories(test-meta-async-read PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     # gathers a product split by rows across two copies of one device and checks it bit for bit, whatever all-reduce runs
     llama_build_and_test(test-meta-gather-exact.cpp LINK ggml)
+    # the NCCL wire two RPC servers agree on, for every pair of builds and wishes, in both rank orders
+    llama_build_and_test(test-rpc-nccl-wire.cpp LINK ggml)
     # a product split by the rows of a mirrored matrix and its argmax across the devices, on a meta device of copies of one device
     llama_build_and_test(test-argmax-split.cpp LINK ggml)
 endif()

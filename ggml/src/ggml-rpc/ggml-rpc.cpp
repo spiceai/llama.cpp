@@ -1,5 +1,6 @@
 #include "ggml-rpc.h"
 #include "ggml-impl.h"
+#include "nccl-wire.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
 #include "transport.h"
@@ -267,9 +268,7 @@ static constexpr uint32_t RPC_COMM_FLAG_MESH     = 4u; // two ranks through the 
 // the most ranks one comm joins; more than two connect every pair of ranks directly (a full mesh)
 static constexpr uint32_t RPC_COMM_MAX_WORLD = 8;
 
-// the byte the two servers of a pair exchange once each has tried to initialize its NCCL communicator
-static constexpr uint8_t RPC_NCCL_INITED    = 1u; // this rank has a communicator
-static constexpr uint8_t RPC_NCCL_WIRE_BF16 = 2u; // and asks for the BF16 wire (GGML_NCCL_WIRE_BF16); a server that predates the wish sends 0 or 1
+// the byte the two servers of a pair exchange once each has tried to initialize its NCCL communicator: nccl-wire.h
 
 struct rpc_msg_comm_init_req {
     uint32_t device;
@@ -2876,13 +2875,13 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
             // ncclCommInitRank can succeed on one rank and fail on the other, so the ranks agree on its result as
             // well: unless both have a communicator, neither keeps one, and both copy through the host. The same byte
             // carries this rank's wish for the BF16 wire (GGML_NCCL_WIRE_BF16, read by the backend): NCCL sums one
-            // datatype per collective, so the wire is BF16 only when both ranks asked for it, and a server that
-            // predates the wish never sets its bit, so a pair with one keeps the F32 wire with no further exchange
+            // datatype per collective, so the wire is BF16 only when both ranks asked for it with gathers kept F32
+            // (rpc_nccl_wire_bf16), and a server that predates the wish or the exception keeps the F32 wire with this one
             auto wanted   = (rpc_nccl_wire_bf16_wanted_t)   rpc_backend_proc(backend, "ggml_backend_cuda_nccl_wire_bf16_wanted");
             auto set_wire = (rpc_nccl_comm_set_wire_bf16_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_set_wire_bf16");
             const bool    inited      = nccl != nullptr;
             const bool    wire_wanted = inited && wanted != nullptr && set_wire != nullptr && wanted();
-            const uint8_t word        = (inited ? RPC_NCCL_INITED : 0) | (wire_wanted ? RPC_NCCL_WIRE_BF16 : 0);
+            const uint8_t word        = rpc_nccl_word(inited, wire_wanted);
             uint8_t peer_word = 0;
             const bool agreed = request.rank == 0 ?
                 state.peer->send_data(&word, 1) && state.peer->flush() && state.peer->recv_data(&peer_word, 1) :
@@ -2900,13 +2899,17 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
                 return true;
             }
             if (inited && peer_inited) {
-                const bool peer_wire = (peer_word & RPC_NCCL_WIRE_BF16) != 0;
-                if (wire_wanted != peer_wire) {
+                const bool peer_wire     = (peer_word & RPC_NCCL_WIRE_BF16_EXACT) != 0;
+                const bool peer_wire_old = (peer_word & RPC_NCCL_WIRE_BF16) != 0;
+                if (wire_wanted && peer_wire_old) {
+                    LOG_WARN("[%s] device %u the peer's build rounds gathers on the BF16 wire, which this build keeps F32, so the all-reduce wire stays F32 on both ranks; run the same build on every rank\n",
+                             __func__, request.device);
+                } else if (wire_wanted != peer_wire) {
                     LOG_WARN("[%s] device %u GGML_NCCL_WIRE_BF16 is set on %s rank of this pair, so the all-reduce wire stays F32 on both ranks; set it on every rank, or on none\n",
                              __func__, request.device, wire_wanted ? "this rank but not the peer" : "the peer but not this");
                 }
                 std::lock_guard<std::mutex> lock(comm_mutex);
-                state.nccl_wire_bf16 = wire_wanted && peer_wire;
+                state.nccl_wire_bf16 = rpc_nccl_wire_bf16(word, peer_word);
                 if (set_wire != nullptr) {
                     set_wire(state.nccl, state.nccl_wire_bf16);
                 }
