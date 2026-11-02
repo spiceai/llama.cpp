@@ -572,13 +572,20 @@ struct ggml_tensor * ggml_backend_meta_rows(struct ggml_context * ctx, struct gg
     GGML_ASSERT(ggml_is_matrix(a));
     GGML_ASSERT(n_parts > 0 && n_parts <= GGML_BACKEND_META_ROWS_MAX);
     int64_t ne_sum = 0;
+    bool    empty  = false;
     for (int j = 0; j < n_parts; j++) {
         GGML_ASSERT(ne_parts[j] >= 0 && ne_parts[j] <= INT32_MAX);
         ne_sum += ne_parts[j];
+        empty = empty || ne_parts[j] == 0;
     }
     GGML_ASSERT(ne_sum == a->ne[1]);
 
     ggml_tensor * result = ggml_view_2d(ctx, a, a->ne[0], a->ne[1], a->nb[1], 0);
+    if (empty) {
+        // a device without rows computes nothing, so ops over the rows (ggml_argmax_part) would see no result from it:
+        // every device keeps the whole matrix instead
+        return result;
+    }
     ggml_set_op_params_i32(result, GGML_BACKEND_META_ROWS_PARAM + 0, GGML_BACKEND_META_ROWS_MAGIC);
     ggml_set_op_params_i32(result, GGML_BACKEND_META_ROWS_PARAM + 1, n_parts);
     for (int j = 0; j < n_parts; j++) {
@@ -1025,6 +1032,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             GGML_ASSERT(tensor->ne[0] == 2*(int64_t) n_bufs);
             ggml_backend_meta_split_state ret = {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
             for (size_t j = 0; j < n_bufs; j++) {
+                // a device with an empty slice is not computed, so its pair would be left unwritten
+                GGML_ASSERT(src_ss[0].ne[j] > 0 && "ggml_argmax_part: every device needs rows of the split");
                 ret.ne[j] = 2;
             }
             return ret;

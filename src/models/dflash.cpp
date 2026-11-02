@@ -458,8 +458,8 @@ static dspark_block_params dspark_get_block_params(const llama_model & model) {
 // shares out a split output head (by tensor_split, evenly when it is unset): each device then computes the output head and
 // the Markov transition for its rows only, and the draft chain takes each position's argmax from one (value, index) pair
 // per device instead of every device computing every row. Empty when the head stays whole on every device: without a
-// tensor split, a gathered head (LLAMA_TENSOR_LOGITS_GATHER), a reduced draft vocabulary, the rnn Markov head, a bonus
-// anchor slot, LoRA adapters, or a ubatch the Markov head skips.
+// tensor split, a tensor split that leaves a device no rows, a gathered head (LLAMA_TENSOR_LOGITS_GATHER), a reduced draft
+// vocabulary, the rnn Markov head, a bonus anchor slot, LoRA adapters, or a ubatch the Markov head skips.
 static std::vector<int64_t> dspark_vocab_parts(const llm_graph_context & g, const llama_model & model, const llama_model & output_model,
         const ggml_tensor * output) {
     if (!model.dspark_markov_w1 || model.d2t || model.dspark_joint_proj || g.cparams.logits_gather ||
@@ -496,6 +496,12 @@ static std::vector<int64_t> dspark_vocab_parts(const llm_graph_context & g, cons
         low = high;
     }
     parts[n_devices - 1] = n_vocab - low;
+    // a device without rows would give the argmax across devices no pair to merge
+    for (const int64_t ne : parts) {
+        if (ne <= 0) {
+            return {};
+        }
+    }
     return parts;
 }
 

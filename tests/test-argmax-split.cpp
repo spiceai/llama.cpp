@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -146,16 +147,23 @@ static int test_pairs(ggml_backend_t backend, const char * name) {
     return n_fail;
 }
 
-// a product with a rows view on a meta device of n_parts copies: gathered, it equals the whole product bit for bit; its
-// picks, plain and after a bias like the DSpark Markov head adds, equal the first max of each column of the whole product
-static int test_meta(ggml_backend_dev_t dev, ggml_type type, int64_t k, int64_t v, int64_t ncols, int n_parts) {
+// a product with a rows view on a meta device of parts.size() copies: gathered, it equals the whole product bit for bit;
+// its picks, plain and after a bias like the DSpark Markov head adds, equal the first max of each column of the whole
+// product. negative: the bias puts every logit far below 0, so a pair a device left unwritten (an empty share of the rows)
+// would win. The graph then runs again on the same buffers with other inputs, so a pair left from the first run would show.
+static int test_meta(ggml_backend_dev_t dev, ggml_type type, int64_t k, int64_t v, int64_t ncols, const std::vector<int64_t> & parts,
+        bool negative) {
+    const int n_parts = (int) parts.size();
     std::vector<ggml_backend_dev_t> devs(n_parts, dev);
     ggml_backend_dev_t meta_dev = ggml_backend_meta_device(devs.data(), devs.size(), mirrored_split_state, nullptr);
     GGML_ASSERT(meta_dev != nullptr);
     ggml_backend_t backend = ggml_backend_dev_init(meta_dev, nullptr);
     GGML_ASSERT(backend != nullptr);
 
-    const std::vector<int64_t> parts = even_parts(v, n_parts);
+    std::string layout;
+    for (int64_t p : parts) {
+        layout += (layout.empty() ? "" : "/") + std::to_string(p);
+    }
 
     // weights: row r of w is v's column r of logits; duplicate rows straddling the devices tie
     std::mt19937 rng(42);
@@ -168,11 +176,13 @@ static int test_meta(ggml_backend_dev_t dev, ggml_type type, int64_t k, int64_t 
     for (auto & x : xf) {
         x = nd(rng) * 20.0f;
     }
-    // rows that win: aligned with column c's activations, scaled, then copied across the part boundaries
-    const int64_t r0 = parts[0] - 1;             // last row of device 0
-    const int64_t r1 = parts[0] + 1;             // a row of device 1
-    const int64_t r2 = v - 1;                    // last row of the last device
-    const int64_t r3 = parts[0] - 1 - 517;       // an earlier row of device 0, read by another thread and warp than r0
+    // rows that win: aligned with column c's activations, scaled, then copied across the end of the first device with rows
+    const int64_t cut = parts[0] > 0 ? parts[0] : parts[1];
+    GGML_ASSERT(cut > 518 && cut + 1 < v);
+    const int64_t r0 = cut - 1;                  // the last row of the first device with rows
+    const int64_t r1 = cut + 1;                  // a row of the next device
+    const int64_t r2 = v - 1;                    // the last row of the last device with rows
+    const int64_t r3 = cut - 1 - 517;            // an earlier row of r0's device, read by another thread and warp than r0
     for (int64_t i = 0; i < k; i++) {
         wf[r0*k + i] = xf[0*k + i] * 0.2f;
     }
@@ -184,15 +194,19 @@ static int test_meta(ggml_backend_dev_t dev, ggml_type type, int64_t k, int64_t 
     const int64_t kb = 256;
     std::vector<float> w2f(kb*v);
     for (auto & x : w2f) {
-        x = nd(rng);
+        x = negative ? 1.0f : nd(rng);
     }
     memcpy(&w2f[r1*kb], &w2f[r0*kb], kb*sizeof(float));
     memcpy(&w2f[r2*kb], &w2f[r0*kb], kb*sizeof(float));
     memcpy(&w2f[r3*kb], &w2f[r0*kb], kb*sizeof(float));
-    std::vector<float> xbf(kb*ncols);
-    for (auto & x : xbf) {
-        x = nd(rng) * 5.0f;
-    }
+    auto bias_input = [&](float scale) {
+        std::vector<float> xbf(kb*ncols);
+        for (auto & x : xbf) {
+            x = negative ? -1000.0f : nd(rng) * scale;
+        }
+        return xbf;
+    };
+    const std::vector<float> xbf = bias_input(5.0f);
 
     ggml_init_params wparams = { ggml_tensor_overhead()*4, nullptr, true };
     ggml_context * ctx_w = ggml_init(wparams);
@@ -225,8 +239,8 @@ static int test_meta(ggml_backend_dev_t dev, ggml_type type, int64_t k, int64_t 
     ggml_tensor * pick_b = ggml_argmax_merge(ctx, ggml_backend_meta_gather(ctx, ggml_argmax_part(ctx, col, n_parts)));
     ggml_tensor * whole_b = ggml_add(ctx, whole, ggml_mul_mat(ctx, w2, xb));
     ggml_tensor * plain   = ggml_argmax(ctx, whole); // the op the draft chain takes its argmax with when the head is whole
-    for (ggml_tensor * t : {whole, gather, pick, pick_b, whole_b, plain}) {
-        ggml_set_output(t);
+    for (ggml_tensor * t : {x, xb, whole, gather, pick, pick_b, whole_b, plain}) {
+        ggml_set_output(t); // the inputs too: the graph runs twice on one allocation
     }
     ggml_cgraph * gf = ggml_new_graph(ctx);
     for (ggml_tensor * t : {whole, gather, pick, pick_b, whole_b, plain}) {
@@ -234,40 +248,53 @@ static int test_meta(ggml_backend_dev_t dev, ggml_type type, int64_t k, int64_t 
     }
     ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
-    ggml_backend_tensor_set(x,  xf.data(),  0, ggml_nbytes(x));
-    ggml_backend_tensor_set(xb, xbf.data(), 0, ggml_nbytes(xb));
-    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
 
-    std::vector<float> yw(v*ncols), yg(v*ncols), ywb(v*ncols);
-    std::vector<int32_t> pk(ncols), pkb(ncols), pl(ncols);
-    ggml_backend_tensor_get(plain, pl.data(), 0, ggml_nbytes(plain));
-    ggml_backend_tensor_get(whole,   yw.data(),  0, ggml_nbytes(whole));
-    ggml_backend_tensor_get(gather,  yg.data(),  0, ggml_nbytes(gather));
-    ggml_backend_tensor_get(whole_b, ywb.data(), 0, ggml_nbytes(whole_b));
-    ggml_backend_tensor_get(pick,    pk.data(),  0, ggml_nbytes(pick));
-    ggml_backend_tensor_get(pick_b,  pkb.data(), 0, ggml_nbytes(pick_b));
+    int n_fail = 0;
+    for (int run = 0; run < 2; run++) {
+        // the second run: other activations, on the same buffers
+        std::vector<float> xr = xf;
+        std::vector<float> xbr = xbf;
+        if (run == 1) {
+            for (auto & a : xr) {
+                a = nd(rng) * 20.0f;
+            }
+            xbr = bias_input(7.0f);
+        }
+        ggml_backend_tensor_set(x,  xr.data(),  0, ggml_nbytes(x));
+        ggml_backend_tensor_set(xb, xbr.data(), 0, ggml_nbytes(xb));
+        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
 
-    int64_t n_diff = 0;
-    for (int64_t i = 0; i < v*ncols; i++) {
-        uint32_t a, b;
-        memcpy(&a, &yw[i], 4);
-        memcpy(&b, &yg[i], 4);
-        n_diff += a != b;
+        std::vector<float> yw(v*ncols), yg(v*ncols), ywb(v*ncols);
+        std::vector<int32_t> pk(ncols), pkb(ncols), pl(ncols);
+        ggml_backend_tensor_get(plain,   pl.data(),  0, ggml_nbytes(plain));
+        ggml_backend_tensor_get(whole,   yw.data(),  0, ggml_nbytes(whole));
+        ggml_backend_tensor_get(gather,  yg.data(),  0, ggml_nbytes(gather));
+        ggml_backend_tensor_get(whole_b, ywb.data(), 0, ggml_nbytes(whole_b));
+        ggml_backend_tensor_get(pick,    pk.data(),  0, ggml_nbytes(pick));
+        ggml_backend_tensor_get(pick_b,  pkb.data(), 0, ggml_nbytes(pick_b));
+
+        int64_t n_diff = 0;
+        for (int64_t i = 0; i < v*ncols; i++) {
+            uint32_t a, b;
+            memcpy(&a, &yw[i], 4);
+            memcpy(&b, &yg[i], 4);
+            n_diff += a != b;
+        }
+        n_fail += n_diff != 0;
+        for (int64_t c = 0; c < ncols; c++) {
+            const int32_t want   = ref_argmax(&yw[c*v], v);
+            const int32_t want_b = ref_argmax(&ywb[c*v], v);
+            const bool ok = pk[c] == want && pkb[c] == want_b;
+            n_fail += !ok;
+            printf("  %s %s k=%lld v=%lld parts=%s%s run %d col %lld: pick %d want %d (tie rows %lld %lld %lld %lld, values %.9g %.9g %.9g %.9g), with bias pick %d want %d; ggml_argmax of the whole product %d %s\n",
+                ggml_backend_dev_name(dev), ggml_type_name(type), (long long) k, (long long) v, layout.c_str(), negative ? " negative" : "",
+                run, (long long) c, pk[c], want, (long long) r3, (long long) r0, (long long) r1, (long long) r2,
+                yw[c*v + r3], yw[c*v + r0], yw[c*v + r1], yw[c*v + r2], pkb[c], want_b, pl[c], ok ? "ok" : "FAIL");
+        }
+        printf("  %s %s k=%lld v=%lld ncols=%lld parts=%s%s run %d: gathered product differs from the whole product in %lld of %lld values %s\n",
+            ggml_backend_dev_name(dev), ggml_type_name(type), (long long) k, (long long) v, (long long) ncols, layout.c_str(),
+            negative ? " negative" : "", run, (long long) n_diff, (long long) (v*ncols), n_diff == 0 ? "ok" : "FAIL");
     }
-    int n_fail = n_diff != 0;
-    for (int64_t c = 0; c < ncols; c++) {
-        const int32_t want   = ref_argmax(&yw[c*v], v);
-        const int32_t want_b = ref_argmax(&ywb[c*v], v);
-        const bool ok = pk[c] == want && pkb[c] == want_b;
-        n_fail += !ok;
-        printf("  %s %s k=%lld v=%lld parts=%d col %lld: pick %d want %d (tie rows %lld %lld %lld %lld, values %.9g %.9g %.9g %.9g), with bias pick %d want %d; ggml_argmax of the whole product %d %s\n",
-            ggml_backend_dev_name(dev), ggml_type_name(type), (long long) k, (long long) v, n_parts, (long long) c, pk[c], want,
-            (long long) r3, (long long) r0, (long long) r1, (long long) r2, yw[c*v + r3], yw[c*v + r0], yw[c*v + r1], yw[c*v + r2],
-            pkb[c], want_b, pl[c], ok ? "ok" : "FAIL");
-    }
-    printf("  %s %s k=%lld v=%lld ncols=%lld parts=%d: gathered product differs from the whole product in %lld of %lld values %s\n",
-        ggml_backend_dev_name(dev), ggml_type_name(type), (long long) k, (long long) v, (long long) ncols, n_parts,
-        (long long) n_diff, (long long) (v*ncols), n_diff == 0 ? "ok" : "FAIL");
 
     ggml_gallocr_free(galloc);
     ggml_free(ctx);
@@ -297,9 +324,18 @@ int main() {
     // the DeepSeek-V4.1 DSpark shapes: the Q6_K output head (3 draft columns) and the BF16 Markov transition (1 column)
     const int64_t v = getenv("TEST_VOCAB") ? atoll(getenv("TEST_VOCAB")) : 129280;
     for (int n_parts : {2, 3}) {
-        n_fail += test_meta(dev, GGML_TYPE_Q6_K, 5120, v, 3, n_parts);
-        n_fail += test_meta(dev, GGML_TYPE_BF16, 256,  v, 1, n_parts);
-        n_fail += test_meta(dev, GGML_TYPE_F32,  256,  v, 2, n_parts);
+        const std::vector<int64_t> parts = even_parts(v, n_parts);
+        n_fail += test_meta(dev, GGML_TYPE_Q6_K, 5120, v, 3, parts, false);
+        n_fail += test_meta(dev, GGML_TYPE_BF16, 256,  v, 1, parts, false);
+        n_fail += test_meta(dev, GGML_TYPE_F32,  256,  v, 2, parts, false);
+    }
+    // a device with no rows (a tensor split that gives it none), first and last, under negative logits
+    {
+        const std::vector<int64_t> p2 = even_parts(v, 2);
+        for (const std::vector<int64_t> & parts : {std::vector<int64_t>{0, p2[0], p2[1]}, std::vector<int64_t>{p2[0], p2[1], 0}}) {
+            n_fail += test_meta(dev, GGML_TYPE_Q6_K, 5120, v, 3, parts, true);
+            n_fail += test_meta(dev, GGML_TYPE_BF16, 256,  v, 1, parts, true);
+        }
     }
     printf("%s\n", n_fail == 0 ? "OK" : "FAILED");
     return n_fail == 0 ? 0 : 1;
