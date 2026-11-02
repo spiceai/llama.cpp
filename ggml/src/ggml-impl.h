@@ -162,7 +162,9 @@ static float ggml_get_op_params_f32(const struct ggml_tensor * tensor, uint32_t 
 
 // A meta-backend gather (ggml_backend_meta_gather) is a PAD by nothing whose op param GGML_META_GATHER_PARAM holds
 // GGML_META_GATHER_MAGIC ("GTHR"). Its all-reduce moves values rather than summing them, every device but one adding
-// zeros, so a reduction must carry it exactly: rounded (to BF16, say) it changes logits, token ids and argmax picks.
+// zeros, so a reduction must carry it in its own type: rounded (to BF16, say) it changes logits, token ids and argmax
+// picks. Carried in F32 it is exact in value, and a -0.0 comes back as +0.0 (-0.0 plus a zero is +0.0). Picks are
+// unaffected: a first max compares -0.0 and +0.0 as equal, so a tie between them still resolves by index.
 #define GGML_META_GATHER_PARAM 9          // after PAD's eight paddings and circular flag
 #define GGML_META_GATHER_MAGIC 0x52485447 // "GTHR"
 

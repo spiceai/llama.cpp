@@ -544,8 +544,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
 
 // A gather is a PAD by nothing whose op param GATHER_PARAM holds GATHER_MAGIC, so on its own it is a copy. On a meta
 // backend each device pads its slice of the split source with zeros to the whole tensor, at the slice's offset: the
-// result is a partial sum, and its all-reduce is the whole tensor on every device. Adding zeros to F32 is exact.
-// The marker is GGML_META_GATHER_PARAM / GGML_META_GATHER_MAGIC (ggml-impl.h), which the reductions check to stay exact.
+// result is a partial sum, and its all-reduce is the whole tensor on every device. Adding zeros to F32 is exact in
+// value, though a -0.0 comes back as +0.0. The marker is GGML_META_GATHER_PARAM / GGML_META_GATHER_MAGIC (ggml-impl.h),
+// which the reductions check to keep a gather in F32.
 static constexpr int     GGML_BACKEND_META_GATHER_PARAM = GGML_META_GATHER_PARAM;
 static constexpr int32_t GGML_BACKEND_META_GATHER_MAGIC = GGML_META_GATHER_MAGIC;
 
