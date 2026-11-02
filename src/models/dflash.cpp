@@ -459,7 +459,8 @@ static dspark_block_params dspark_get_block_params(const llama_model & model) {
 // the Markov transition for its rows only, and the draft chain takes each position's argmax from one (value, index) pair
 // per device instead of every device computing every row. Empty when the head stays whole on every device: without a
 // tensor split, a tensor split that leaves a device no rows, a gathered head (LLAMA_TENSOR_LOGITS_GATHER), a reduced draft
-// vocabulary, the rnn Markov head, a bonus anchor slot, LoRA adapters, or a ubatch the Markov head skips.
+// vocabulary, the rnn Markov head, a bonus anchor slot, LoRA adapters, a ubatch of more than one sequence, or a ubatch the
+// Markov head skips.
 static std::vector<int64_t> dspark_vocab_parts(const llm_graph_context & g, const llama_model & model, const llama_model & output_model,
         const ggml_tensor * output) {
     if (!model.dspark_markov_w1 || model.d2t || model.dspark_joint_proj || g.cparams.logits_gather ||
@@ -479,7 +480,9 @@ static std::vector<int64_t> dspark_vocab_parts(const llm_graph_context & g, cons
     const dspark_block_params bp = dspark_get_block_params(model);
     const int64_t n_tok    = g.ubatch.n_tokens;
     const int64_t n_blocks = g.ubatch.n_seqs_unq;
-    if (!bp.sample_from_anchor || n_blocks <= 0 || n_tok % n_blocks != 0 || n_tok / n_blocks > bp.block_size) {
+    // one block (sequence) only: with several, each position's view of the head steps over the other blocks' rows, a
+    // strided view of a row-split tensor that the meta backend cannot split
+    if (!bp.sample_from_anchor || n_blocks != 1 || n_tok > bp.block_size) {
         return {};
     }
 

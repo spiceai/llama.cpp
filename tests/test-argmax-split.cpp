@@ -305,6 +305,97 @@ static int test_meta(ggml_backend_dev_t dev, ggml_type type, int64_t k, int64_t 
     return n_fail;
 }
 
+// The DSpark Markov head's graph: block_drafts positions of n_blocks sequences, base = head x hidden [V, n_blocks*block],
+// position i of every block a strided view of base, plus that position's Markov bias, and its pick from the pairs. With one
+// block the head is split by rows (as the drafter does); with more, the views would step over the other blocks' rows of a
+// row-split tensor, which the meta backend cannot split, so the drafter keeps the head whole: built here on the whole matrix
+// of the same meta device. Either way the picks must equal the first max of each column of the whole computation.
+static int test_markov_blocks(ggml_backend_dev_t dev, int64_t v, int64_t n_blocks, int n_parts) {
+    const int64_t k = 256, kb = 64, block = 3, n_tok = n_blocks*block;
+    const bool split = n_blocks == 1;
+    std::vector<ggml_backend_dev_t> devs(n_parts, dev);
+    ggml_backend_t backend = ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), mirrored_split_state, nullptr), nullptr);
+    GGML_ASSERT(backend != nullptr);
+    const std::vector<int64_t> parts = even_parts(v, n_parts);
+
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.0f, 0.05f);
+    std::vector<float> wf(k*v), w2f(kb*v), xf(k*n_tok), xbf(kb*n_tok);
+    for (auto * vec : {&wf, &w2f}) {
+        for (auto & a : *vec) {
+            a = nd(rng);
+        }
+    }
+    for (auto & a : xf) {
+        a = nd(rng) * 20.0f;
+    }
+    for (auto & a : xbf) {
+        a = nd(rng) * 5.0f;
+    }
+
+    ggml_init_params wp = { ggml_tensor_overhead()*4, nullptr, true };
+    ggml_context * ctx_w = ggml_init(wp);
+    ggml_tensor * w  = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, k, v);
+    ggml_tensor * w2 = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, kb, v);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+    ggml_backend_tensor_set(w,  wf.data(),  0, ggml_nbytes(w));
+    ggml_backend_tensor_set(w2, w2f.data(), 0, ggml_nbytes(w2));
+
+    ggml_init_params gp = { ggml_tensor_overhead()*128 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(gp);
+    ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k,  n_tok);    ggml_set_input(x);
+    ggml_tensor * xb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, kb, n_blocks, block); ggml_set_input(xb);
+    ggml_tensor * base  = ggml_mul_mat(ctx, split ? ggml_backend_meta_rows(ctx, w, n_parts, parts.data()) : w, x);
+    ggml_tensor * basew = ggml_mul_mat(ctx, w, x);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    std::vector<ggml_tensor *> picks, cols;
+    for (int64_t i = 0; i < block; i++) {
+        ggml_tensor * xb_i   = ggml_view_2d(ctx, xb, kb, n_blocks, xb->nb[1], i*xb->nb[2]);
+        ggml_tensor * bias   = ggml_mul_mat(ctx, split ? ggml_backend_meta_rows(ctx, w2, n_parts, parts.data()) : w2, xb_i);
+        ggml_tensor * base_i = ggml_view_2d(ctx, base, v, n_blocks, block*base->nb[1], i*base->nb[1]);
+        ggml_tensor * col    = ggml_add(ctx, base_i, bias);
+        ggml_tensor * pick   = ggml_argmax_merge(ctx, ggml_backend_meta_gather(ctx, ggml_argmax_part(ctx, col, n_parts)));
+        ggml_tensor * colw   = ggml_add(ctx, ggml_cont(ctx, ggml_view_2d(ctx, basew, v, n_blocks, block*basew->nb[1], i*basew->nb[1])),
+                                         ggml_mul_mat(ctx, w2, xb_i));
+        for (ggml_tensor * t : {pick, colw}) {
+            ggml_set_output(t);
+            ggml_build_forward_expand(gf, t);
+        }
+        picks.push_back(pick);
+        cols.push_back(colw);
+    }
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+    ggml_backend_tensor_set(x,  xf.data(),  0, ggml_nbytes(x));
+    ggml_backend_tensor_set(xb, xbf.data(), 0, ggml_nbytes(xb));
+    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+
+    int n_fail = 0;
+    std::string got, want;
+    for (int64_t i = 0; i < block; i++) {
+        std::vector<int32_t> pk(n_blocks);
+        std::vector<float> cw(v*n_blocks);
+        ggml_backend_tensor_get(picks[i], pk.data(), 0, ggml_nbytes(picks[i]));
+        ggml_backend_tensor_get(cols[i],  cw.data(), 0, ggml_nbytes(cols[i]));
+        for (int64_t b = 0; b < n_blocks; b++) {
+            const int32_t ref = ref_argmax(&cw[b*v], v);
+            n_fail += pk[b] != ref;
+            got  += " " + std::to_string(pk[b]);
+            want += " " + std::to_string(ref);
+        }
+    }
+    printf("  %s markov head, %lld block(s) of %lld positions, head %s over %d devices: picks%s, want%s %s\n",
+        ggml_backend_dev_name(dev), (long long) n_blocks, (long long) block, split ? "split by rows" : "whole", n_parts,
+        got.c_str(), want.c_str(), n_fail == 0 ? "ok" : "FAIL");
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(ctx_w);
+    ggml_backend_free(backend);
+    return n_fail;
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -334,6 +425,11 @@ int main() {
             n_fail += test_meta(dev, GGML_TYPE_Q6_K, 5120, v, 3, parts, true);
             n_fail += test_meta(dev, GGML_TYPE_BF16, 256,  v, 1, parts, true);
         }
+    }
+    // the Markov head's graph: one sequence split by rows, two sequences on the whole head
+    for (int n_parts : {2, 3}) {
+        n_fail += test_markov_blocks(dev, v, 1, n_parts);
+        n_fail += test_markov_blocks(dev, v, 2, n_parts);
     }
     printf("%s\n", n_fail == 0 ? "OK" : "FAILED");
     return n_fail == 0 ? 0 : 1;
