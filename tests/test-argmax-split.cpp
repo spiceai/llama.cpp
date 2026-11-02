@@ -18,6 +18,7 @@
 #include <random>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 static ggml_backend_meta_split_state mirrored_split_state(const ggml_tensor * tensor, void * userdata) {
@@ -55,7 +56,35 @@ static std::vector<int64_t> even_parts(int64_t n, int n_parts) {
     return parts;
 }
 
-// rows of logits computed directly, through argmax_part and argmax_merge, on one backend (n_parts pairs, one written)
+// the pair ARGMAX_PART writes first for a whole row (origin 0): (NaN, 0) when the first value is a NaN, else the first
+// largest value that is not one and its index, as stored (a -0.0 stays -0.0), or (-inf, -1) when every value is a NaN;
+// every other pair is (-inf, -1)
+static std::pair<float, float> ref_pair(const float * x, int64_t n) {
+    if (n > 0 && std::isnan(x[0])) {
+        return { NAN, 0.0f };
+    }
+    int64_t best = -1;
+    for (int64_t i = 0; i < n; i++) {
+        if (best < 0 ? !std::isnan(x[i]) : x[i] > x[best]) {
+            best = i;
+        }
+    }
+    return best < 0 ? std::pair<float, float>{ -INFINITY, -1.0f } : std::pair<float, float>{ x[best], (float) best };
+}
+
+// a and b are the same float, bit for bit, any NaN matching any NaN
+static bool same_float(float a, float b) {
+    if (std::isnan(a) || std::isnan(b)) {
+        return std::isnan(a) && std::isnan(b);
+    }
+    uint32_t ua, ub;
+    memcpy(&ua, &a, 4);
+    memcpy(&ub, &b, 4);
+    return ua == ub;
+}
+
+// rows of logits computed directly, through argmax_part and argmax_merge, on one backend (n_parts pairs, one written):
+// the pick and every pair, padding included, against the reference
 static int test_pairs(ggml_backend_t backend, const char * name) {
     const int64_t n = 1000;
     std::vector<std::vector<float>> rows;
@@ -136,7 +165,12 @@ static int test_pairs(ggml_backend_t backend, const char * name) {
     int n_fail = 0;
     for (int64_t r = 0; r < n_rows; r++) {
         const int32_t want = ref_argmax(rows[r].data(), n);
-        const bool    ok   = got[r] == want;
+        const std::pair<float, float> want_pair = ref_pair(rows[r].data(), n);
+        bool pairs_ok = same_float(got_pairs[r*2*n_parts + 0], want_pair.first) && same_float(got_pairs[r*2*n_parts + 1], want_pair.second);
+        for (int k = 1; k < n_parts; k++) {
+            pairs_ok = pairs_ok && same_float(got_pairs[r*2*n_parts + 2*k], -INFINITY) && same_float(got_pairs[r*2*n_parts + 2*k + 1], -1.0f);
+        }
+        const bool    ok   = got[r] == want && pairs_ok;
         n_fail += ok ? 0 : 1;
         printf("  %s pairs row %lld: pick %d, want %d, pair (%g, %g), others (%g, %g) %s\n", name, (long long) r, got[r], want,
             got_pairs[r*2*n_parts + 0], got_pairs[r*2*n_parts + 1], got_pairs[r*2*n_parts + 2], got_pairs[r*2*n_parts + 3],
