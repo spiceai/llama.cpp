@@ -393,6 +393,158 @@ static int test_meta_nan(ggml_backend_dev_t dev, const std::vector<int64_t> & pa
     return n_fail;
 }
 
+// a rows view of a mirrored matrix that is itself a view at a row offset: each device's rows start after the offset
+static int test_meta_offset_view(ggml_backend_dev_t dev, const std::vector<int64_t> & parts) {
+    const int     n_parts = (int) parts.size();
+    const int64_t k = 32, v = 1000, off = 100, ncols = 2;
+    std::vector<ggml_backend_dev_t> devs(n_parts, dev);
+    ggml_backend_t backend = ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), mirrored_split_state, nullptr), nullptr);
+    GGML_ASSERT(backend != nullptr);
+
+    std::mt19937 rng(5);
+    std::normal_distribution<float> nd(0.0f, 0.05f);
+    std::vector<float> wf(k*(v + off)), xf(k*ncols);
+    for (auto & a : wf) {
+        a = nd(rng);
+    }
+    for (auto & a : xf) {
+        a = nd(rng) * 20.0f;
+    }
+    ggml_init_params wp = { ggml_tensor_overhead()*2, nullptr, true };
+    ggml_context * ctx_w = ggml_init(wp);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, k, v + off);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+    GGML_ASSERT(wbuf != nullptr);
+    ggml_backend_tensor_set(w, wf.data(), 0, ggml_nbytes(w));
+
+    ggml_init_params gp = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(gp);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, ncols);
+    ggml_set_input(x);
+    ggml_tensor * sub   = ggml_view_2d(ctx, w, k, v, w->nb[1], off*w->nb[1]); // rows off .. off + v - 1
+    ggml_tensor * split = ggml_mul_mat(ctx, ggml_backend_meta_rows(ctx, sub, n_parts, parts.data()), x);
+    ggml_tensor * gath  = ggml_backend_meta_gather(ctx, split);
+    ggml_tensor * pick  = ggml_argmax_merge(ctx, ggml_backend_meta_gather(ctx, ggml_argmax_part(ctx, split, n_parts)));
+    ggml_set_output(x);
+    ggml_set_output(gath);
+    ggml_set_output(pick);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, gath);
+    ggml_build_forward_expand(gf, pick);
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+    ggml_backend_tensor_set(x, xf.data(), 0, ggml_nbytes(x));
+    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+
+    std::vector<float>   yg(v*ncols);
+    std::vector<int32_t> pk(ncols);
+    ggml_backend_tensor_get(gath, yg.data(), 0, ggml_nbytes(gath));
+    ggml_backend_tensor_get(pick, pk.data(), 0, ggml_nbytes(pick));
+    // the reference: row r of the view is row off + r of w, summed in the same order as the CPU's dot product
+    int n_fail = 0;
+    int64_t n_far = 0;
+    for (int64_t c = 0; c < ncols; c++) {
+        std::vector<float> ref(v);
+        for (int64_t r = 0; r < v; r++) {
+            double acc = 0.0;
+            for (int64_t i = 0; i < k; i++) {
+                acc += (double) wf[(off + r)*k + i] * xf[c*k + i];
+            }
+            ref[r] = (float) acc;
+            n_far += std::fabs(yg[c*v + r] - ref[r]) > 1e-4f * (1.0f + std::fabs(ref[r]));
+        }
+        const int32_t want = ref_argmax(&yg[c*v], v);
+        const int32_t want_ref = ref_argmax(ref.data(), v);
+        n_fail += pk[c] != want || want != want_ref;
+        printf("  %s offset view of %lld rows at row %lld, parts %lld/%lld%s col %lld: pick %d, want %d (rows of w from the offset: %d) %s\n",
+            ggml_backend_dev_name(dev), (long long) v, (long long) off, (long long) parts[0], (long long) parts[1],
+            n_parts > 2 ? "/..." : "", (long long) c, pk[c], want, want_ref, pk[c] == want && want == want_ref ? "ok" : "FAIL");
+    }
+    n_fail += n_far != 0;
+    printf("  %s offset view: %lld of %lld gathered values far from rows %lld.. of w %s\n", ggml_backend_dev_name(dev),
+        (long long) n_far, (long long) (v*ncols), (long long) off, n_far == 0 ? "ok" : "FAIL");
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(ctx_w);
+    ggml_backend_free(backend);
+    return n_fail;
+}
+
+// tensors named "*rsplit" are split by whole rows (axis 1) evenly across the devices, everything else is mirrored
+static ggml_backend_meta_split_state rows_split_state(const ggml_tensor * tensor, void * userdata) {
+    const int n_parts = *(const int *) userdata;
+    const std::string name = tensor->name;
+    if (name.size() >= 6 && name.compare(name.size() - 6, 6, "rsplit") == 0) {
+        ggml_backend_meta_split_state ss = {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        for (int j = 0; j < n_parts; j++) {
+            ss.ne[j] = tensor->ne[1] / n_parts + (j < tensor->ne[1] % n_parts ? 1 : 0);
+        }
+        return ss;
+    }
+    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+}
+
+// whole rows split across the devices (axis 1): each device takes the argmax of its own rows, and the picks stay with
+// the rows, split along the picks' only axis
+static int test_meta_whole_rows(ggml_backend_dev_t dev, int n_parts) {
+    const int64_t n = 1000, rows = 6;
+    std::vector<ggml_backend_dev_t> devs(n_parts, dev);
+    int ud = n_parts;
+    ggml_backend_t backend = ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), rows_split_state, &ud), nullptr);
+    GGML_ASSERT(backend != nullptr);
+
+    std::mt19937 rng(9);
+    std::normal_distribution<float> nd;
+    std::vector<float> xf(n*rows);
+    for (auto & a : xf) {
+        a = nd(rng);
+    }
+    xf[0*n + 0]   = NAN;                        // row 0: a first NaN, token 0
+    xf[1*n + 3]   = NAN;  xf[1*n + 700] = 9.0f; // row 1: a NaN after the first value is skipped
+    xf[2*n + 31]  = 9.0f; xf[2*n + 999] = 9.0f; // row 2: a tie, the first wins
+    xf[3*n + 0]   = NAN;  xf[3*n + 10]  = 9.0f; // row 3, the first row of the second device: a first NaN, token 0
+    xf[4*n + 500] = 50.0f;
+    ggml_init_params wp = { ggml_tensor_overhead()*2, nullptr, true };
+    ggml_context * ctx_w = ggml_init(wp);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n, rows);
+    ggml_set_name(x, "x_rsplit");
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+    GGML_ASSERT(wbuf != nullptr);
+    ggml_backend_tensor_set(x, xf.data(), 0, ggml_nbytes(x));
+
+    ggml_init_params gp = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(gp);
+    ggml_tensor * pick = ggml_argmax_merge(ctx, ggml_argmax_part(ctx, x, n_parts));
+    ggml_set_output(pick);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, pick);
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+
+    std::vector<int32_t> pk(rows);
+    ggml_backend_tensor_get(pick, pk.data(), 0, ggml_nbytes(pick));
+    int n_fail = 0;
+    std::string got, want;
+    for (int64_t r = 0; r < rows; r++) {
+        const int32_t w = ref_argmax(&xf[r*n], n);
+        n_fail += pk[r] != w;
+        got  += " " + std::to_string(pk[r]);
+        want += " " + std::to_string(w);
+    }
+    printf("  %s whole rows split %d ways: picks%s, want%s %s\n", ggml_backend_dev_name(dev), n_parts, got.c_str(), want.c_str(),
+        n_fail == 0 ? "ok" : "FAIL");
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(ctx_w);
+    ggml_backend_free(backend);
+    return n_fail;
+}
+
 // The DSpark Markov head's graph: block_drafts positions of n_blocks sequences, base = head x hidden [V, n_blocks*block],
 // position i of every block a strided view of base, plus that position's Markov bias, and its pick from the pairs. With one
 // block the head is split by rows (as the drafter does); with more, the views would step over the other blocks' rows of a
@@ -498,10 +650,14 @@ int main() {
         n_fail += test_pairs(backend, ggml_backend_dev_name(dev));
         ggml_backend_free(backend);
     }
-    // the DeepSeek-V4.1 DSpark shapes: the Q6_K output head (3 draft columns) and the BF16 Markov transition (1 column)
-    const int64_t v = getenv("TEST_VOCAB") ? atoll(getenv("TEST_VOCAB")) : 129280;
+    // the DeepSeek-V4.1 DSpark shapes: the Q6_K output head (3 draft columns) and the BF16 Markov transition (1 column).
+    // TEST_VOCAB=129280 runs them at the drafter's vocabulary (several GiB on the CPU); the default keeps the test small
+    const int64_t v = getenv("TEST_VOCAB") ? atoll(getenv("TEST_VOCAB")) : 4096;
+    printf("vocabulary %lld\n", (long long) v);
     for (int n_parts : {2, 3}) {
         n_fail += test_meta_nan(dev, even_parts(1000, n_parts));
+        n_fail += test_meta_offset_view(dev, even_parts(1000, n_parts));
+        n_fail += test_meta_whole_rows(dev, n_parts);
     }
     for (int n_parts : {2, 3}) {
         const std::vector<int64_t> parts = even_parts(v, n_parts);

@@ -1027,6 +1027,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             return ret;
         }
+        // whole rows split across the devices: each device takes the pairs of its own rows, whose indices count from 0
+        if (tensor->op == GGML_OP_ARGMAX_PART && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            return src_ss[0];
+        }
+        // the picks of whole rows split across the devices stay with the rows, along the picks' only axis
+        if (tensor->op == GGML_OP_ARGMAX_MERGE && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1) {
+            ggml_backend_meta_split_state ret = src_ss[0];
+            ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
+            return ret;
+        }
         // each device writes one (value, index) pair for its slice of a row split along axis 0
         if (tensor->op == GGML_OP_ARGMAX_PART && src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[0].n_segments == 1 && src_ss[0].nr[0] == 1);
@@ -1463,7 +1473,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         t_ij->view_offs = tensor->view_offs;
         if (t_ij->view_src != nullptr && ggml_backend_buffer_is_meta(t_ij->view_src->buffer)) {
             t_ij->view_src = ggml_backend_meta_buffer_simple_tensor(tensor->view_src, j);
-            if (t_ij->view_offs > 0 && split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
+            // a rows view takes its offset below: its source is mirrored, so the device's view is the whole offset
+            // plus the rows of the devices before it, not an offset scaled to a slice
+            if (t_ij->view_offs > 0 && split_dim >= 0 && split_dim < GGML_MAX_DIMS && !ggml_backend_meta_is_rows(tensor)) {
                 GGML_ASSERT(tensor->ne[split_dim] != 0);
                 const int split_dim_view_src = ggml_backend_meta_get_split_state(tensor->view_src, /*assume_sync =*/ true).axis;
                 GGML_ASSERT(split_dim_view_src >= 0 && split_dim_view_src < GGML_MAX_DIMS);
