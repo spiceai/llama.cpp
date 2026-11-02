@@ -48,17 +48,21 @@ static ggml_backend_meta_split_state split_state(const ggml_tensor * tensor, voi
     return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
 }
 
-// the first op of the test's graph that dev cannot run (a product, the gather's pad, or the add the meta backend
-// reduces with), or nullptr when it runs them all: a GPU without the kernels this product needs is skipped
+// the first op of the test's graph that dev cannot run (a product, the gather's pad, the add the meta backend reduces
+// with, the broadcast product and the relu), or nullptr when it runs them all: a GPU without the kernels this product
+// needs is skipped
 static const char * unsupported_op(ggml_backend_dev_t dev) {
-    ggml_init_params p = { ggml_tensor_overhead()*16, nullptr, true };
+    ggml_init_params p = { ggml_tensor_overhead()*24, nullptr, true };
     ggml_context * ctx = ggml_init(p);
     ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, V);
     ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, NCOLS);
     ggml_tensor * y = ggml_mul_mat(ctx, w, x);
     ggml_tensor * z = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ZC, ZR);
     const char * missing = nullptr;
-    for (ggml_tensor * t : { y, ggml_backend_meta_gather(ctx, y), ggml_add(ctx, y, y), ggml_backend_meta_gather(ctx, z), ggml_add(ctx, z, z) }) {
+    ggml_tensor * ones = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, V, 1);
+    ggml_tensor * prod = ggml_mul(ctx, y, ones);
+    for (ggml_tensor * t : { y, ggml_backend_meta_gather(ctx, y), ggml_add(ctx, y, y), ggml_backend_meta_gather(ctx, z), ggml_add(ctx, z, z),
+                             prod, ggml_relu(ctx, prod) }) {
         if (!ggml_backend_dev_supports_op(dev, t)) {
             missing = ggml_op_desc(t);
             break;
@@ -294,6 +298,10 @@ int main() {
             }
             if (dev1 == nullptr) {
                 printf("device %s: skipped, it reduces through NCCL, which needs a second GPU (one rank per GPU)\n", ggml_backend_dev_name(dev));
+                continue;
+            }
+            if (const char * op = unsupported_op(dev1)) {
+                printf("device %s: skipped, its NCCL peer %s cannot run %s\n", ggml_backend_dev_name(dev), ggml_backend_dev_name(dev1), op);
                 continue;
             }
         }
