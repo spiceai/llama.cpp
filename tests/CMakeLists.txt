@@ -362,6 +362,8 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # reads tensors split in segments across two slices of the CPU device, including a slice with no data
     llama_build_and_test(test-meta-async-read.cpp LINK ggml)
     target_include_directories(test-meta-async-read PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    # gathers a product split by rows across two copies of one device and checks it bit for bit, whatever all-reduce runs
+    llama_build_and_test(test-meta-gather-exact.cpp LINK ggml)
 endif()
 
 # libmtmd

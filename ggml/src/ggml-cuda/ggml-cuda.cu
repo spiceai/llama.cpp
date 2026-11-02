@@ -1062,7 +1062,10 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 
     // For small tensors, simply reduce them as FP32.
     // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
-    if ((n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144)) {
+    // A gather moves values instead of summing partials, so rounding it would change the values themselves (logits,
+    // token ids, argmax picks): it is always reduced as FP32.
+    if ((n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144) ||
+            ggml_is_meta_gather(tensors[0])) {
         for (size_t i = 0; i < n_backends; ++i) {
             if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
@@ -6355,7 +6358,8 @@ static bool ggml_backend_cuda_nccl_allreduce(ggml_backend_t backend, void * comm
     ggml_cuda_set_device(cuda_ctx->device);
     const ggml_cuda_nccl_comm * c = (const ggml_cuda_nccl_comm *) comm;
     const int64_t ne = ggml_nelements(t);
-    if (c->wire_bf16 && t->type == GGML_TYPE_F32 && ne >= 32768) {
+    // a gather moves values instead of summing partials, so it stays FP32 on the wire (see ggml_is_meta_gather)
+    if (c->wire_bf16 && t->type == GGML_TYPE_F32 && ne >= 32768 && !ggml_is_meta_gather(t)) {
         to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
         to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
         ggml_cuda_pool_alloc<nv_bfloat16> tmp;
