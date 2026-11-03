@@ -436,12 +436,19 @@ bool apple_rdma::send(const void * data, size_t size) {
     return true;
 }
 
-bool apple_rdma::recv(void * data, size_t size) {
+bool apple_rdma::recv(void * data, size_t size, const std::chrono::steady_clock::time_point * deadline) {
     impl * c = pimpl.get();
     uint8_t * p = (uint8_t *)data;
     if (!c->post_pending()) return false;   // turnaround: flush the coalesced request
     unsigned idle = 0;
     while (size > 0) {
+        // as over TCP, a receive past its deadline fails even when its data has arrived; it leaves the stream
+        // mid-message, so the connection is done
+        if (deadline != nullptr && std::chrono::steady_clock::now() >= *deadline) {
+            LOG_ERROR("RDMA(Apple/UC) recv failed: past its deadline (%zu bytes left)\n", size);
+            c->broken = true;
+            return false;
+        }
         if (c->inq_count == 0) {
             if (c->broken) return false;
             int n = c->progress();

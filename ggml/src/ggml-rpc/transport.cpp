@@ -174,8 +174,10 @@ struct socket_t::impl {
     bool rdma_recv(void * data, size_t size);
     bool tcp_peer_closed();
     bool rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, const uint8_t * remote_gid);
-    bool rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc);
-    bool rdma_wait_event();
+    // `deadline`: when set, the wait fails once it has passed, as a TCP receive with a deadline does
+    bool rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc,
+                   const std::chrono::steady_clock::time_point * deadline = nullptr);
+    bool rdma_wait_event(const std::chrono::steady_clock::time_point * deadline);
 
     std::unique_ptr<rdma_conn> rdma;
     rdma_local_info            rdma_local = {};
@@ -183,7 +185,7 @@ struct socket_t::impl {
 #endif // GGML_RPC_RDMA
     bool     use_rdma;
     sockfd_t fd;
-    // set_recv_deadline: a TCP receive fails once it passes, however the data arrives
+    // set_recv_deadline: a receive fails once it passes, however the data arrives
     bool                                  has_recv_deadline = false;
     std::chrono::steady_clock::time_point recv_deadline;
 };
@@ -540,15 +542,26 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, con
     return true;
 }
 
-// Sleep until the completion channel has an event or the TCP peer closes.
-bool socket_t::impl::rdma_wait_event() {
+// Sleep until the completion channel has an event or the TCP peer closes; with a deadline, at most until it, and false
+// once it has passed.
+bool socket_t::impl::rdma_wait_event(const std::chrono::steady_clock::time_point * deadline) {
     rdma_conn * c = rdma.get();
     // POLLHUP and POLLERR are always reported, the TCP socket carries no data after the RDMA upgrade
     struct pollfd pfds[2] = {
         { c->ch->fd, POLLIN,    0 },
         { fd,        POLLRDHUP, 0 },
     };
-    if (poll(pfds, 2, -1) < 0) {
+    int timeout_ms = -1;
+    if (deadline != nullptr) {
+        const int64_t left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            *deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0) {
+            LOG_ERROR("RDMA recv failed: past its deadline\n");
+            return false;
+        }
+        timeout_ms = (int) std::min<int64_t>(left, INT32_MAX);
+    }
+    if (poll(pfds, 2, timeout_ms) < 0) {
         return errno == EINTR;
     }
     if (pfds[1].revents & (POLLHUP | POLLERR | POLLRDHUP)) {
@@ -565,7 +578,8 @@ bool socket_t::impl::rdma_wait_event() {
     return true;
 }
 
-bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc) {
+bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc,
+                                const std::chrono::steady_clock::time_point * deadline) {
     rdma_conn * c = rdma.get();
     bool armed = false;
     for (uint64_t s = 1; ; s++) {
@@ -581,11 +595,15 @@ bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc) {
         if (n < 0) return false;
         if (armed) {
             // armed and still empty: sleep until the next completion
-            if (!rdma_wait_event()) {
+            if (!rdma_wait_event(deadline)) {
                 return false;
             }
             armed = false;
             continue;
+        }
+        if (deadline != nullptr && (s & 0x3FF) == 0 && std::chrono::steady_clock::now() >= *deadline) {
+            LOG_ERROR("RDMA recv failed: past its deadline\n");
+            return false;
         }
         // spin while the connection is busy, arm the CQ once it has been idle for RDMA_SPIN_TIME
         // a completion that arrives before arming raises no event, so poll once more after arming
@@ -699,9 +717,15 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
     rdma_conn * c = rdma.get();
     uint8_t * dst = (uint8_t *)data;
     size_t rem = size;
+    const std::chrono::steady_clock::time_point * deadline = has_recv_deadline ? &recv_deadline : nullptr;
     while (rem > 0) {
+        // as over TCP, a receive past its deadline fails even when its data has arrived
+        if (deadline != nullptr && std::chrono::steady_clock::now() >= *deadline) {
+            LOG_ERROR("RDMA recv failed: past its deadline (rem=%zu, size=%zu)\n", rem, size);
+            return false;
+        }
         struct ibv_wc wc;
-        if (!rdma_poll(c->rcq, &wc)) return false;
+        if (!rdma_poll(c->rcq, &wc, deadline)) return false;
 
         int slot = (int)wc.wr_id;
         size_t got = wc.byte_len;
@@ -775,7 +799,7 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
     LOG_DBG3("[%s] transport: %s, size: %s\n", __func__, use_rdma ? "RDMA" : "TCP", rpc_log_format_size(size).c_str());
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
-        return rdma->recv(data, size);
+        return rdma->recv(data, size, has_recv_deadline ? &recv_deadline : nullptr);
     }
 #elif defined(GGML_RPC_RDMA)
     if (use_rdma) {
