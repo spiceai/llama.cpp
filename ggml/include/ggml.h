@@ -613,6 +613,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // appended, so the numbers of the ops above stay as RPC peers and older builds know them
+        GGML_OP_ARGMAX_PART,
+        GGML_OP_ARGMAX_MERGE,
+
         GGML_OP_COUNT,
     };
 
@@ -1084,6 +1088,23 @@ extern "C" {
 
     // argmax along rows
     GGML_API struct ggml_tensor * ggml_argmax(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    // the first largest value of each row of a (F32) that is not a NaN, and its index, as the pair (value, index) in
+    // slots 0 and 1 of an F32 [2*n_parts, rows] result whose other slots hold (-inf, -1); (NaN, 0) when the row's first
+    // value is a NaN, and (-inf, -1) for a row of NaNs. On a meta backend, with a split along axis 0, each device writes
+    // the pair of its slice at slots 2*j and 2*j + 1, its index counted from the start of the row, and
+    // ggml_argmax_merge of their gather takes the row's argmax without gathering the rows
+    GGML_API struct ggml_tensor * ggml_argmax_part(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   n_parts);
+
+    // I32 [rows]: from the pairs of ggml_argmax_part, the index of the pair with the largest value, the first pair on a
+    // tie, so the row's first largest value as the greedy sampler picks it; the index of a (NaN, index) pair if one
+    // holds a NaN, and 0 when no pair has an index
+    GGML_API struct ggml_tensor * ggml_argmax_merge(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 

@@ -437,8 +437,121 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
     ggml_build_forward_expand(gf, cur);
 }
 
+// the DSpark draft block's training size, and whether slot 0 is a prediction slot (it is a bonus token otherwise)
+struct dspark_block_params {
+    int64_t block_size;
+    bool    sample_from_anchor;
+};
+
+static dspark_block_params dspark_get_block_params(const llama_model & model) {
+    const auto it = model.gguf_kv.find("dflash.block_size");
+    GGML_ASSERT(it != model.gguf_kv.end() && "DSpark draft requires 'dflash.block_size' in GGUF metadata");
+    const int64_t block_size = std::stoi(it->second);
+    GGML_ASSERT(block_size > 0);
+
+    // bonus anchor (SpecForge exports): slot 0 is a bonus token, not a prediction slot
+    const auto it_anchor = model.gguf_kv.find("dflash.sample_from_anchor");
+    return { block_size, it_anchor == model.gguf_kv.end() || it_anchor->second == "true" };
+}
+
+// Whether dev runs ggml_argmax_part and ggml_argmax_merge over n_blocks rows of n_vocab logits split n_parts ways. A meta
+// device asks each of its devices, and an RPC device answers from its server's HELLO, which says whether the server's
+// backends run them.
+static bool dspark_runs_argmax_split(ggml_backend_dev_t dev, int64_t n_vocab, int64_t n_blocks, int n_parts) {
+    ggml_init_params params = { 3*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx != nullptr);
+    ggml_tensor * part  = ggml_argmax_part(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, n_blocks), n_parts);
+    ggml_tensor * merge = ggml_argmax_merge(ctx, part);
+    const bool ok = ggml_backend_dev_supports_op(dev, part) && ggml_backend_dev_supports_op(dev, merge);
+    ggml_free(ctx);
+    return ok;
+}
+
+// The rows of the DSpark draft's vocabulary each device of a tensor split computes, as llama_meta_device_get_split_state
+// shares out a split output head (by tensor_split, evenly when it is unset): each device then computes the output head and
+// the Markov transition for its rows only, and the draft chain takes each position's argmax from one (value, index) pair
+// per device instead of every device computing every row. Empty when the head stays whole on every device: without a
+// tensor split, a tensor split that leaves a device no rows, a gathered head (LLAMA_TENSOR_LOGITS_GATHER), a reduced draft
+// vocabulary, the rnn Markov head, a bonus anchor slot, LoRA adapters, suppressed tokens, a weight off the drafter's meta
+// device, a device that cannot run ARGMAX_PART and ARGMAX_MERGE, a ubatch of more than one sequence, or a ubatch the
+// Markov head skips.
+static std::vector<int64_t> dspark_vocab_parts(const llm_graph_context & g, const llama_model & model, const llama_model & output_model,
+        const ggml_tensor * output) {
+    if (!model.dspark_markov_w1 || model.d2t || model.dspark_joint_proj || g.cparams.logits_gather ||
+            model.split_mode() != LLAMA_SPLIT_MODE_TENSOR || output_model.split_mode() != LLAMA_SPLIT_MODE_TENSOR ||
+            (g.loras != nullptr && !g.loras->empty())) {
+        return {};
+    }
+    const size_t n_devices = model.get_split_state_ud.n_devices;
+    if (n_devices < 2 || n_devices != output_model.get_split_state_ud.n_devices || n_devices > 12) {
+        return {};
+    }
+    const int64_t n_vocab = output->ne[1];
+    if (model.dspark_markov_w2->ne[1] != n_vocab) {
+        return {};
+    }
+    // the drafter's sampler biases suppressed tokens to -inf before its pick, and then reads the row, not its argmax: a
+    // one-hot row whose winner is suppressed would leave it nothing, where the whole row has the next-best token
+    if (!model.vocab.get_suppress_tokens().empty()) {
+        return {};
+    }
+    // both weights must be on the drafter's meta device, so that each device holds them and computes its rows: a weight
+    // placed elsewhere (an override that keeps the head on the CPU, say) computes the whole head there
+    auto on_meta = [](const ggml_tensor * t) {
+        if (t->buffer == nullptr) {
+            return false;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+        return dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
+    };
+    if (!on_meta(output) || !on_meta(model.dspark_markov_w2)) {
+        return {};
+    }
+
+    const dspark_block_params bp = dspark_get_block_params(model);
+    const int64_t n_tok    = g.ubatch.n_tokens;
+    const int64_t n_blocks = g.ubatch.n_seqs_unq;
+    // one block (sequence) only: with several, each position's view of the head steps over the other blocks' rows, a
+    // strided view of a row-split tensor that the meta backend cannot split
+    if (!bp.sample_from_anchor || n_blocks != 1 || n_tok > bp.block_size) {
+        return {};
+    }
+    // every device of the split must run ARGMAX_PART and ARGMAX_MERGE: a backend without them aborts on the first draft
+    // (Metal, also behind an RPC server, which says in its HELLO whether its backends run them)
+    for (const ggml_tensor * t : { output, (const ggml_tensor *) model.dspark_markov_w2 }) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+        if (!dspark_runs_argmax_split(dev, n_vocab, n_blocks, (int) n_devices)) {
+            return {};
+        }
+    }
+
+    const float * tensor_split = model.tensor_split();
+    std::vector<float> scan(n_devices);
+    for (size_t j = 0; j < n_devices; j++) {
+        scan[j] = (tensor_split == nullptr ? 0.0f : tensor_split[j]) + (j > 0 ? scan[j - 1] : 0.0f);
+    }
+    std::vector<int64_t> parts(n_devices);
+    int64_t low = 0;
+    for (size_t j = 0; j + 1 < n_devices; j++) {
+        const int64_t high = scan.back() == 0.0f ? n_vocab * (int64_t) (j + 1) / (int64_t) n_devices : (int64_t) (n_vocab * scan[j] / scan.back());
+        parts[j] = high - low;
+        low = high;
+    }
+    parts[n_devices - 1] = n_vocab - low;
+    // a device without rows would give the argmax across devices no pair to merge
+    for (const int64_t ne : parts) {
+        if (ne <= 0) {
+            return {};
+        }
+    }
+    return parts;
+}
+
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
-static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, ggml_tensor * hidden = nullptr) {
+// vocab_parts (dspark_vocab_parts), if not empty: base is split by those rows, and so are the Markov bias and the argmax
+static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, ggml_tensor * hidden = nullptr,
+        const std::vector<int64_t> & vocab_parts = {}) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -457,15 +570,10 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     const int64_t n_vocab = base->ne[0];
     const int64_t n_tok   = base->ne[1];
 
-    const auto it = model.gguf_kv.find("dflash.block_size");
-    GGML_ASSERT(it != model.gguf_kv.end() && "DSpark draft requires 'dflash.block_size' in GGUF metadata");
-    const int64_t block_size = std::stoi(it->second);
-    GGML_ASSERT(block_size > 0);
-
-    // bonus anchor (SpecForge exports): slot 0 is a bonus token, not a prediction slot
-    const auto it_anchor          = model.gguf_kv.find("dflash.sample_from_anchor");
-    const bool sample_from_anchor = it_anchor == model.gguf_kv.end() || it_anchor->second == "true";
-    const int64_t i_draft_beg    = sample_from_anchor ? 0 : 1;
+    const dspark_block_params bp = dspark_get_block_params(model);
+    const int64_t block_size         = bp.block_size;
+    const bool    sample_from_anchor = bp.sample_from_anchor;
+    const int64_t i_draft_beg        = sample_from_anchor ? 0 : 1;
 
     const int64_t n_blocks = g.ubatch.n_seqs_unq;
     GGML_ASSERT(n_blocks > 0 && n_tok % n_blocks == 0 && "DSpark markov head requires equal-size blocks");
@@ -495,6 +603,10 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
     ggml_tensor * state = nullptr; // [R, n_blocks]
 
+    const int     n_parts = (int) vocab_parts.size();
+    ggml_tensor * w2_mm   = n_parts > 0 ? ggml_backend_meta_rows(ctx0, w2, n_parts, vocab_parts.data()) : nullptr;
+    GGML_ASSERT(n_parts == 0 || (sample_from_anchor && !is_rnn && !model.d2t));
+
     // TODO: the in-graph chain is greedy (argmax); sampling params affect only the final
     //       token pick, not the Markov conditioning path
     for (int64_t i = i_draft_beg; i < block_drafts; ++i) {
@@ -523,7 +635,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             markov = ggml_tanh(ctx0, chunk(2));
         }
 
-        ggml_tensor * bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s); // [n_vocab_draft, n_blocks]
+        ggml_tensor * bias = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s, w2_mm); // [n_vocab_draft, n_blocks]
         if (g.cparams.logits_gather && llama_dspark_split()) {
             // the add and argmax below read whole rows
             bias = ggml_backend_meta_gather(ctx0, bias);
@@ -541,6 +653,16 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         // position i of every block: strided view [n_vocab, n_blocks]
         ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
         ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
+
+        ggml_tensor * pick = nullptr;
+        if (n_parts > 0) {
+            // the first max across the devices' rows, from one (value, index) pair per device; the row is one-hot (below)
+            pick = ggml_argmax_merge(ctx0, ggml_backend_meta_gather(ctx0, ggml_argmax_part(ctx0, col, n_parts))); // [n_blocks]
+            ggml_tensor * row  = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_blocks), -INFINITY);
+            ggml_tensor * zero = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, n_blocks), 0.0f);
+            row = ggml_set_rows(ctx0, row, zero, ggml_reshape_2d(ctx0, pick, 1, n_blocks));
+            col = ggml_reshape_2d(ctx0, row, n_vocab, n_blocks);
+        }
 
         cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
 
@@ -561,7 +683,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         }
 
         if (i + 1 < block_drafts) {
-            prev = ggml_argmax(ctx0, col);
+            prev = pick ? pick : ggml_argmax(ctx0, col);
         }
     }
 
@@ -581,6 +703,10 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         ggml_build_forward_expand(g.gf, conf);
     }
 
+    // with vocab_parts the rows are one-hot by design, 0 at the pick and -inf elsewhere: the draft's only reader under a
+    // tensor split takes each row's argmax (common_sampler_row_argmax, or the top candidate of the DSpark chain's top-k, as
+    // backend samplers are refused under a split), and building the rows from the picks spares gathering every device's
+    // rows of the head to every device
     res->t_logits = out;
     ggml_build_forward_expand(g.gf, out);
 }
@@ -1630,26 +1756,34 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
+    const llama_model * output_model = &model;
     auto * output   = model.output;
     auto * output_s = model.output_s;
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->output != nullptr && "DSpark decoder requires the target model's output projection");
+        output_model = model_other;
         output   = model_other->output;
         output_s = model_other->output_s;
     }
 
-    cur = build_lora_mm(output, cur, output_s);
-    if (cparams.logits_gather) {
-        // the draft heads below read whole rows
-        cur = build_logits_gather(cur);
+    const std::vector<int64_t> vocab_parts = dspark_vocab_parts(*this, model, *output_model, output);
+    if (!vocab_parts.empty()) {
+        // each device computes its rows of the head, and the Markov head below takes the argmax across the devices
+        cur = build_lora_mm(output, cur, output_s, ggml_backend_meta_rows(ctx0, output, (int) vocab_parts.size(), vocab_parts.data()));
+    } else {
+        cur = build_lora_mm(output, cur, output_s);
+        if (cparams.logits_gather) {
+            // the draft heads below read whole rows
+            cur = build_logits_gather(cur);
+        }
     }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
     if (model.dspark_markov_w1) {
-        build_dspark_markov_head(*this, model, inp_tokens);
+        build_dspark_markov_head(*this, model, inp_tokens, nullptr, vocab_parts);
     }
 }
 

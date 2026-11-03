@@ -376,6 +376,11 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
         ENVIRONMENT "GGML_CUDA_ALLREDUCE=nccl;GGML_CUDA_AR_BF16_THRESHOLD=1")
     # the NCCL wire two RPC servers agree on, for every pair of server and backend builds and wishes, in both rank orders
     llama_build_and_test(test-rpc-nccl-wire.cpp LINK ggml)
+    # a product split by the rows of a mirrored matrix and its argmax across the devices, on a meta device of copies of one device
+    llama_build_and_test(test-argmax-split.cpp LINK ggml)
+    # ARGMAX_PART and ARGMAX_MERGE nodes built without their constructors, as an RPC server deserializes them: the CPU
+    # kernels must refuse a destination that does not fit before writing past it
+    llama_build_and_test(test-argmax-malformed.cpp LINK ggml)
 endif()
 
 # libmtmd

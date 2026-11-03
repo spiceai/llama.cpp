@@ -1813,13 +1813,14 @@ ggml_tensor * llm_graph_context::build_hadamard_input(
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+          ggml_tensor * w_mm) const {
     // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
+    ggml_tensor * res = ggml_mul_mat(ctx0, w_mm ? w_mm : w, cur_mm);
 
     if (prec_policy) {
-        prec_policy->apply(res);
+        prec_policy->apply(res, w);
     }
 
     if (w->type == GGML_TYPE_NVFP4) {
@@ -1835,6 +1836,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         if (lw == nullptr) {
             continue;
         }
+        GGML_ASSERT((w_mm == nullptr || w_mm == w) && "a LoRA delta needs the weight's own rows");
 
         const float adapter_scale = lora.second;
         const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
