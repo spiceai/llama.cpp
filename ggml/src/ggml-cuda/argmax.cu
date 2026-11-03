@@ -171,10 +171,15 @@ static __global__ void argmax_part_f32(const float * __restrict__ x, float * __r
 void ggml_cuda_argmax_part(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
+    // what ggml_argmax_part builds, which a node deserialized by an RPC server need not be: one row of pairs per source
+    // row, each pair two F32s, so that the pairs the kernel writes fit the destination
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
-    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_is_matrix(src0));
+    GGML_ASSERT(ggml_is_matrix(dst) && ggml_is_contiguous(dst));
+    GGML_ASSERT(dst->ne[0] >= 2 && dst->ne[0] % 2 == 0);
+    GGML_ASSERT(dst->ne[1] == src0->ne[1]);
 
     const int64_t ne00  = src0->ne[0];
     const int64_t nrows = src0->ne[1];
@@ -218,10 +223,14 @@ static __global__ void argmax_merge_f32(const float * __restrict__ x, int32_t * 
 void ggml_cuda_argmax_merge(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
+    // what ggml_argmax_merge builds, which a node deserialized by an RPC server need not be: rows of (value, index) pairs,
+    // and one I32 pick per row, so that the picks the kernel writes fit the destination
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT( dst->type == GGML_TYPE_I32);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
-    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_is_matrix(src0) && src0->ne[0] % 2 == 0);
+    GGML_ASSERT(ggml_is_vector(dst) && ggml_is_contiguous(dst));
+    GGML_ASSERT(dst->ne[0] == src0->ne[1]);
 
     const int64_t nrows = src0->ne[1];
     const int     block = 128;
