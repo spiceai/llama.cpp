@@ -1,5 +1,6 @@
 #include "ggml-rpc.h"
 #include "ggml-impl.h"
+#include "nccl-wire.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
 #include "transport.h"
@@ -267,9 +268,7 @@ static constexpr uint32_t RPC_COMM_FLAG_MESH     = 4u; // two ranks through the 
 // the most ranks one comm joins; more than two connect every pair of ranks directly (a full mesh)
 static constexpr uint32_t RPC_COMM_MAX_WORLD = 8;
 
-// the byte the two servers of a pair exchange once each has tried to initialize its NCCL communicator
-static constexpr uint8_t RPC_NCCL_INITED    = 1u; // this rank has a communicator
-static constexpr uint8_t RPC_NCCL_WIRE_BF16 = 2u; // and asks for the BF16 wire (GGML_NCCL_WIRE_BF16); a server that predates the wish sends 0 or 1
+// the byte the two servers of a pair exchange once each has tried to initialize its NCCL communicator: nccl-wire.h
 
 struct rpc_msg_comm_init_req {
     uint32_t device;
@@ -2769,8 +2768,6 @@ typedef void * (*rpc_nccl_comm_init_rank_t)(ggml_backend_t backend, const void *
 typedef void   (*rpc_nccl_comm_free_t)(void * comm);
 typedef void   (*rpc_nccl_comm_abort_t)(void * comm);
 typedef bool   (*rpc_nccl_allreduce_t)(ggml_backend_t backend, void * comm, ggml_tensor * t);
-typedef bool   (*rpc_nccl_wire_bf16_wanted_t)(void);
-typedef void   (*rpc_nccl_comm_set_wire_bf16_t)(void * comm, bool on);
 
 static void * rpc_backend_proc(ggml_backend_t backend, const char * name) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -2878,13 +2875,17 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
             // ncclCommInitRank can succeed on one rank and fail on the other, so the ranks agree on its result as
             // well: unless both have a communicator, neither keeps one, and both copy through the host. The same byte
             // carries this rank's wish for the BF16 wire (GGML_NCCL_WIRE_BF16, read by the backend): NCCL sums one
-            // datatype per collective, so the wire is BF16 only when both ranks asked for it, and a server that
-            // predates the wish never sets its bit, so a pair with one keeps the F32 wire with no further exchange
-            auto wanted   = (rpc_nccl_wire_bf16_wanted_t)   rpc_backend_proc(backend, "ggml_backend_cuda_nccl_wire_bf16_wanted");
-            auto set_wire = (rpc_nccl_comm_set_wire_bf16_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_set_wire_bf16");
+            // datatype per collective, so the wire is BF16 only when both ranks sent the same wish (rpc_nccl_wire_agree):
+            // with gathers kept F32 when both backends can, rounded on both when neither can, F32 otherwise
+            const rpc_nccl_wire_procs procs = {
+                (rpc_nccl_wire_bf16_wanted_t)   rpc_backend_proc(backend, "ggml_backend_cuda_nccl_wire_bf16_wanted"),
+                (rpc_nccl_comm_set_wire_bf16_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_set_wire_bf16"),
+                // a backend that keeps gathers F32 on the BF16 wire exports this setter; one that does not rounds them
+                (rpc_nccl_comm_set_wire_bf16_t) rpc_backend_proc(backend, "ggml_backend_cuda_nccl_comm_set_wire_bf16_exact"),
+            };
             const bool    inited      = nccl != nullptr;
-            const bool    wire_wanted = inited && wanted != nullptr && set_wire != nullptr && wanted();
-            const uint8_t word        = (inited ? RPC_NCCL_INITED : 0) | (wire_wanted ? RPC_NCCL_WIRE_BF16 : 0);
+            const bool    wire_wanted = rpc_nccl_wire_wanted(inited, procs);
+            const uint8_t word        = rpc_nccl_word(inited, wire_wanted, procs);
             uint8_t peer_word = 0;
             const bool agreed = request.rank == 0 ?
                 state.peer->send_data(&word, 1) && state.peer->flush() && state.peer->recv_data(&peer_word, 1) :
@@ -2902,16 +2903,18 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
                 return true;
             }
             if (inited && peer_inited) {
-                const bool peer_wire = (peer_word & RPC_NCCL_WIRE_BF16) != 0;
-                if (wire_wanted != peer_wire) {
+                const bool          peer_wire = (peer_word & (RPC_NCCL_WIRE_BF16 | RPC_NCCL_WIRE_BF16_EXACT)) != 0;
+                const rpc_nccl_wire wire      = rpc_nccl_wire_agree(word, peer_word);
+                if (wire_wanted && peer_wire && wire == RPC_NCCL_WIRE_AGREED_F32) {
+                    LOG_WARN("[%s] device %u one rank of this pair keeps gathers F32 on the BF16 wire and the other rounds them, so the all-reduce wire stays F32 on both ranks; run the same build on every rank\n",
+                             __func__, request.device);
+                } else if (wire_wanted != peer_wire) {
                     LOG_WARN("[%s] device %u GGML_NCCL_WIRE_BF16 is set on %s rank of this pair, so the all-reduce wire stays F32 on both ranks; set it on every rank, or on none\n",
                              __func__, request.device, wire_wanted ? "this rank but not the peer" : "the peer but not this");
                 }
                 std::lock_guard<std::mutex> lock(comm_mutex);
-                state.nccl_wire_bf16 = wire_wanted && peer_wire;
-                if (set_wire != nullptr) {
-                    set_wire(state.nccl, state.nccl_wire_bf16);
-                }
+                state.nccl_wire_bf16 = wire != RPC_NCCL_WIRE_AGREED_F32;
+                rpc_nccl_wire_set(state.nccl, procs, wire);
             }
         }
         bool nccl_on;
@@ -2988,7 +2991,7 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     // a meta-backend gather (ggml_backend_meta_gather: a PAD by nothing whose op param 9 holds "GTHR") must come
     // out the same on every rank, as the logits each rank samples from do; rounded to bf16 on the wire, each rank
     // would hold its own slice exact and the others rounded, so it is reduced exactly whatever its size
-    const bool   gather     = t_dst->op == GGML_OP_PAD && ggml_get_op_params_i32(t_dst, 9) == 0x52485447;
+    const bool   gather     = ggml_is_meta_gather(t_dst);
     const bool   wire_bf16  = !state.wire_f32 && !gather && t_dst->type == GGML_TYPE_F32 && ne >= 32768;
     const size_t wire_bytes = wire_bf16 ? (size_t) ne*2 : nbytes;
     const size_t need       = wire_bf16 ? 2*nbytes : nbytes;

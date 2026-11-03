@@ -766,10 +766,13 @@ bool ggml_cuda_ar_allreduce(
     // the reduction (chunked or copy-engine), halving on-wire bytes. Matches
     // NCCL's behaviour. The pre-conversion zeroes inactive shards so the
     // inner paths see them as already-prepared compute tensors.
+    // A gather moves values instead of summing partials, so rounding it would change the values themselves (logits,
+    // token ids, argmax picks): it is always reduced in its own type.
     const bool use_bf16 =
         input_type == GGML_TYPE_F32 &&
         p->bf16_threshold > 0 &&
-        input_nbytes >= p->bf16_threshold;
+        input_nbytes >= p->bf16_threshold &&
+        !ggml_is_meta_gather(tensors[0]);
 
     const ggml_type kernel_type = use_bf16 ? GGML_TYPE_BF16 : input_type;
     const size_t    type_size   = ggml_type_size(kernel_type);

@@ -1062,7 +1062,10 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 
     // For small tensors, simply reduce them as FP32.
     // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
-    if ((n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144)) {
+    // A gather moves values instead of summing partials, so rounding it would change the values themselves (logits,
+    // token ids, argmax picks): it is always reduced as FP32.
+    if ((n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144) ||
+            ggml_is_meta_gather(tensors[0])) {
         for (size_t i = 0; i < n_backends; ++i) {
             if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
@@ -6297,7 +6300,8 @@ static bool ggml_backend_cuda_nccl_unique_id(void * out, size_t size) {
 // a communicator handed out by ggml_backend_cuda_nccl_comm_init_rank: the NCCL communicator and the wire its ranks agreed on
 struct ggml_cuda_nccl_comm {
     ncclComm_t comm;
-    bool       wire_bf16; // large F32 reductions travel as BF16, see ggml_backend_cuda_nccl_wire_bf16_wanted
+    bool       wire_bf16;     // large F32 reductions travel as BF16, see ggml_backend_cuda_nccl_wire_bf16_wanted
+    bool       gathers_exact; // except gathers (ggml_is_meta_gather), which stay F32: both ranks agreed on it
 };
 
 // GGML_NCCL_WIRE_BF16=1 asks for a large F32 reduction to travel as BF16 (converted on the device, summed by NCCL in
@@ -6314,9 +6318,21 @@ static bool ggml_backend_cuda_nccl_wire_bf16_wanted(void) {
     return wanted;
 }
 
+// the BF16 wire with every large F32 reduction on it, gathers included: the wire a server from before gathers were kept
+// exact agrees on, and that this backend keeps for a pair with one
 static void ggml_backend_cuda_nccl_comm_set_wire_bf16(void * comm, bool on) {
     if (comm != nullptr) {
-        ((ggml_cuda_nccl_comm *) comm)->wire_bf16 = on;
+        ((ggml_cuda_nccl_comm *) comm)->wire_bf16     = on;
+        ((ggml_cuda_nccl_comm *) comm)->gathers_exact = false;
+    }
+}
+
+// the BF16 wire with gathers kept F32. A server sets it only when both ranks' backends export this function, which is
+// how a server learns that its backend keeps gathers exact
+static void ggml_backend_cuda_nccl_comm_set_wire_bf16_exact(void * comm, bool on) {
+    if (comm != nullptr) {
+        ((ggml_cuda_nccl_comm *) comm)->wire_bf16     = on;
+        ((ggml_cuda_nccl_comm *) comm)->gathers_exact = on;
     }
 }
 
@@ -6329,7 +6345,7 @@ static void * ggml_backend_cuda_nccl_comm_init_rank(ggml_backend_t backend, cons
     if (ncclCommInitRank(&comm, nranks, uid, rank) != ncclSuccess) {
         return nullptr;
     }
-    return new ggml_cuda_nccl_comm{ comm, /*wire_bf16 =*/ false };
+    return new ggml_cuda_nccl_comm{ comm, /*wire_bf16 =*/ false, /*gathers_exact =*/ false };
 }
 
 static void ggml_backend_cuda_nccl_comm_free(void * comm) {
@@ -6355,7 +6371,9 @@ static bool ggml_backend_cuda_nccl_allreduce(ggml_backend_t backend, void * comm
     ggml_cuda_set_device(cuda_ctx->device);
     const ggml_cuda_nccl_comm * c = (const ggml_cuda_nccl_comm *) comm;
     const int64_t ne = ggml_nelements(t);
-    if (c->wire_bf16 && t->type == GGML_TYPE_F32 && ne >= 32768) {
+    // a gather moves values instead of summing partials, so it stays FP32 on the wire (see ggml_is_meta_gather) when
+    // both ranks agreed on that; a pair that did not rounds it on both ranks, as NCCL needs one datatype per collective
+    if (c->wire_bf16 && t->type == GGML_TYPE_F32 && ne >= 32768 && !(c->gathers_exact && ggml_is_meta_gather(t))) {
         to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
         to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
         ggml_cuda_pool_alloc<nv_bfloat16> tmp;
@@ -6510,6 +6528,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_nccl_comm_set_wire_bf16") == 0) {
         return (void *)ggml_backend_cuda_nccl_comm_set_wire_bf16;
+    }
+    if (strcmp(name, "ggml_backend_cuda_nccl_comm_set_wire_bf16_exact") == 0) {
+        return (void *)ggml_backend_cuda_nccl_comm_set_wire_bf16_exact;
     }
 #endif // GGML_USE_NCCL
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
