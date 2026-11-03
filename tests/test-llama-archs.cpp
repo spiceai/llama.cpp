@@ -941,10 +941,12 @@ static llama_token row_first_max(const float * row, uint32_t n) {
 // - every output row's pick, for a batch with every token an output (two ubatches) and for one with the last four (a
 //   verification batch); with the head split the decode's logits are not readable (llama_get_logits_ith returns NULL),
 //   and `split` says whether it was;
-// - with a greedy backend sampler attached (when LLAMA_TENSOR_BACKEND_SAMPLING is set), the sampler still samples the
-//   output row (one per sequence, as backend sampling allows), and llama_get_argmax_ith refuses the row it sampled;
+// - with the head split (so the logits are mirrored, as backend sampling needs), with a greedy backend sampler attached
+//   (when LLAMA_TENSOR_BACKEND_SAMPLING is on), the sampler still samples the output row (one per sequence, as backend
+//   sampling allows), and llama_get_argmax_ith refuses the row it sampled;
 // - with the head split, an embedding context (pooling NONE) whose scheduler was reserved with the mode on computes the
-//   logits once the mode is off again (a whole head computes its logits either way).
+//   logits once the mode is off again (a whole head computes its logits either way), and a pooled embedding context
+//   (pooling MEAN) computes the same embeddings with the mode on as off.
 static bool check_argmax_output(llama_model * model, const llama_context_params & cparams, const std::vector<llama_token> & tokens,
         bool & split, std::string & why) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -1012,7 +1014,9 @@ static bool check_argmax_output(llama_model * model, const llama_context_params 
         }
     }
 
-    if (getenv("LLAMA_TENSOR_BACKEND_SAMPLING") != nullptr) {
+    // on as llama_tensor_backend_sampling() reads it
+    const char * backend_sampling = getenv("LLAMA_TENSOR_BACKEND_SAMPLING");
+    if (split && backend_sampling != nullptr && atoi(backend_sampling) != 0) {
         if (!first_maxes(1, want)) {
             return fail("the reference decode with the mode off failed");
         }
@@ -1078,6 +1082,31 @@ static bool check_argmax_output(llama_model * model, const llama_context_params 
                 return fail("embedding context, row " + std::to_string(i) + ": first max " +
                     std::to_string(row_first_max(row, n_vocab)) + ", want " + std::to_string(want[i]));
             }
+        }
+    }
+
+    if (split) {
+        llama_context_params cp = cparams;
+        cp.embeddings   = true;
+        cp.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+        std::vector<float> pooled[2];
+        for (const bool on : { false, true }) {
+            llama_context_ptr lctx(llama_init_from_model(model, cp));
+            if (!lctx) {
+                return fail("no pooled embedding context");
+            }
+            llama_set_argmax_output(lctx.get(), on);
+            if (decode(lctx.get(), n_tokens) != 0) {
+                return fail(std::string("pooled embedding context: decode with the mode ") + (on ? "on" : "off") + " failed");
+            }
+            const float * e = llama_get_embeddings_seq(lctx.get(), 0);
+            if (e == nullptr) {
+                return fail("pooled embedding context: no embedding");
+            }
+            pooled[on].assign(e, e + llama_model_n_embd_out(model));
+        }
+        if (pooled[0] != pooled[1]) {
+            return fail("pooled embedding context: the embedding differs with the mode on");
         }
     }
     return true;

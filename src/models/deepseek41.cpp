@@ -767,12 +767,13 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
 
 // the rows of the output head each device computes for the argmax output under a tensor split, in the tensor split's
 // proportions, or {} when the head stays whole: no tensor split, LoRA, a gathered head (LLAMA_TENSOR_LOGITS_GATHER), an
-// attached backend sampler (which samples from the logits), a device that would get no rows, a head that is not on a
-// meta device (an override that places it elsewhere), or a device of the split that cannot run ARGMAX_PART and
-// ARGMAX_MERGE (they would run on the CPU, after the split product had been copied there)
+// attached backend sampler (which samples from the logits), a pooled embedding context (whose graph skips the head,
+// build_logits), a device that would get no rows, a head that is not on a meta device (an override that places it
+// elsewhere), or a device of the split that cannot run ARGMAX_PART and ARGMAX_MERGE (they would run on the CPU, after
+// the split product had been copied there)
 static std::vector<int64_t> head_vocab_parts(const llm_graph_context & g, const llama_model & model, const ggml_tensor * output) {
     if (g.cparams.logits_gather || model.split_mode() != LLAMA_SPLIT_MODE_TENSOR || (g.loras != nullptr && !g.loras->empty()) ||
-            !g.samplers.empty()) {
+            !g.samplers.empty() || (g.cparams.embeddings && g.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
         return {};
     }
     const size_t n_devices = model.get_split_state_ud.n_devices;
