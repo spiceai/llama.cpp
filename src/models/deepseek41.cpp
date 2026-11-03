@@ -765,6 +765,43 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     return out;
 }
 
+// the rows of the output head each device computes for the argmax output under a tensor split, in the tensor split's
+// proportions, or {} when the head stays whole: no tensor split, LoRA, a gathered head (LLAMA_TENSOR_LOGITS_GATHER), a
+// device that would get no rows, or a head that is not on a meta device (an override that places it elsewhere)
+static std::vector<int64_t> head_vocab_parts(const llm_graph_context & g, const llama_model & model, const ggml_tensor * output) {
+    if (g.cparams.logits_gather || model.split_mode() != LLAMA_SPLIT_MODE_TENSOR || (g.loras != nullptr && !g.loras->empty())) {
+        return {};
+    }
+    const size_t n_devices = model.get_split_state_ud.n_devices;
+    if (n_devices < 2 || n_devices > 12 || output->buffer == nullptr) {
+        return {};
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(output->buffer));
+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_META) {
+        return {};
+    }
+    const int64_t n_vocab = output->ne[1];
+    const float * tensor_split = model.tensor_split();
+    std::vector<float> scan(n_devices);
+    for (size_t j = 0; j < n_devices; j++) {
+        scan[j] = (tensor_split == nullptr ? 0.0f : tensor_split[j]) + (j > 0 ? scan[j - 1] : 0.0f);
+    }
+    std::vector<int64_t> parts(n_devices);
+    int64_t low = 0;
+    for (size_t j = 0; j + 1 < n_devices; j++) {
+        const int64_t high = scan.back() == 0.0f ? n_vocab * (int64_t) (j + 1) / (int64_t) n_devices : (int64_t) (n_vocab * scan[j] / scan.back());
+        parts[j] = high - low;
+        low = high;
+    }
+    parts[n_devices - 1] = n_vocab - low;
+    for (const int64_t ne : parts) {
+        if (ne <= 0) {
+            return {};
+        }
+    }
+    return parts;
+}
+
 llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_graph_params & params) :
     llama_model_deepseek4::graph(params) {
     const auto & model = static_cast<const llama_model_deepseek41 &>(model_base);
@@ -926,6 +963,21 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
+
+    // with the argmax output on, a tensor split computes each device's rows of the head (a view of the copy it holds)
+    // and takes the picks from one (value, index) pair per device, as the DSpark drafter does, instead of computing
+    // every row of the head on every device and copying the logits back
+    const std::vector<int64_t> parts = cparams.argmax_output && n_outputs > 0 ? head_vocab_parts(*this, model, model.output) : std::vector<int64_t>{};
+    if (!parts.empty()) {
+        const int n_parts = (int) parts.size();
+        ggml_tensor * split = build_lora_mm(model.output, cur, nullptr, ggml_backend_meta_rows(ctx0, model.output, n_parts, parts.data()));
+        cb(split, "result_output_rows", -1);
+        res->t_argmax = ggml_argmax_merge(ctx0, ggml_backend_meta_gather(ctx0, ggml_argmax_part(ctx0, split, n_parts)));
+        cb(res->t_argmax, "result_argmax", -1);
+        ggml_build_forward_expand(gf, res->t_argmax);
+        res->t_logits = nullptr;
+        return;
+    }
 
     cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);

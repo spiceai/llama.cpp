@@ -834,6 +834,9 @@ int main() {
     for (int n_parts : {2, 3}) {
         const std::vector<int64_t> parts = even_parts(v, n_parts);
         n_fail += test_meta(dev, GGML_TYPE_Q6_K, 5120, v, 3, parts, false);
+        // the target's verification head under the argmax output: the same Q6_K head at 4 columns (the last token and
+        // three drafts), split by the same rows
+        n_fail += test_meta(dev, GGML_TYPE_Q6_K, 5120, v, 4, parts, false);
         n_fail += test_meta(dev, GGML_TYPE_BF16, 256,  v, 1, parts, false);
         n_fail += test_meta(dev, GGML_TYPE_F32,  256,  v, 2, parts, false);
     }
