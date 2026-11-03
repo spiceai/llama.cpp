@@ -1639,9 +1639,15 @@ void ggml_compute_forward_argmax_part(
 
     const ggml_tensor * src0 = dst->src[0];
 
+    // what ggml_argmax_part builds, which a node deserialized by an RPC server need not be: one row of pairs per source
+    // row, each pair two F32s, so that the pairs written below fit the destination
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
-    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_is_matrix(src0));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_matrix(dst) && ggml_is_contiguous(dst));
+    GGML_ASSERT(dst->ne[0] >= 2 && dst->ne[0] % 2 == 0);
+    GGML_ASSERT(dst->ne[1] == src0->ne[1]);
 
     if (params->ith != 0) {
         return;
@@ -1690,8 +1696,14 @@ void ggml_compute_forward_argmax_merge(
 
     const ggml_tensor * src0 = dst->src[0];
 
+    // what ggml_argmax_merge builds, which a node deserialized by an RPC server need not be: rows of (value, index) pairs,
+    // and one I32 pick per row, so that the picks written below fit the destination
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_matrix(src0) && src0->ne[0] % 2 == 0);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_vector(dst) && ggml_is_contiguous(dst));
+    GGML_ASSERT(dst->ne[0] == src0->ne[1]);
 
     if (params->ith != 0) {
         return;
