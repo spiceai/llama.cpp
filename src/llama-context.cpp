@@ -2224,14 +2224,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // the argmax output: one pick per output row, when every ubatch with outputs computed them (a split head), in which
     // case those ubatches computed no logits. The picks of the previous decode may still be on their way into argmax_buf
-    // when nothing read them, so it is reassigned only after they land. With the argmax output on, neither the picks nor
-    // the logits are readable until the decode has succeeded, so a failed decode exposes no stale logits from an
-    // earlier one
+    // when nothing read them, so it is reassigned only after they land. Neither the picks nor the logits become readable
+    // here: with the argmax output on, both wait until the decode has succeeded, and with it off, logits an earlier
+    // argmax-output decode left unreadable stay so until this one has succeeded. A failed decode thus exposes no logits
+    // older than the last decode that succeeded
     if (argmax_copies_pending) {
         synchronize();
     }
     argmax_ready = false;
-    logits_ready = !cparams.argmax_output;
+    logits_ready = logits_ready && !cparams.argmax_output;
     bool argmax_all = cparams.argmax_output;
     bool logits_all = true;
     argmax_buf.assign(n_outputs_all, LLAMA_TOKEN_NULL);
