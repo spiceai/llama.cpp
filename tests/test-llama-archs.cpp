@@ -922,6 +922,10 @@ static bool check_causal_attn_toggle(
     return ok;
 }
 
+static bool abort_always(void * /*data*/) {
+    return true;
+}
+
 // the greedy sampler's pick over a row: token 0 when the first logit is a NaN, else the first largest
 static llama_token row_first_max(const float * row, uint32_t n) {
     if (n == 0 || std::isnan(row[0])) {
@@ -946,7 +950,10 @@ static llama_token row_first_max(const float * row, uint32_t n) {
 //   sampling allows), and llama_get_argmax_ith refuses the row it sampled;
 // - with the head split, an embedding context (pooling NONE) whose scheduler was reserved with the mode on computes the
 //   logits once the mode is off again (a whole head computes its logits either way), and a pooled embedding context
-//   (pooling MEAN) computes the same embeddings with the mode on as off.
+//   (pooling MEAN) computes the same embeddings with the mode on as off;
+// - with the head split, a decode with the mode off that an abort callback stops after an argmax-output decode leaves no
+//   logits readable (the buffer holds logits from before the argmax-output decode), and the next decode that succeeds
+//   makes them readable again.
 static bool check_argmax_output(llama_model * model, const llama_context_params & cparams, const std::vector<llama_token> & tokens,
         bool & split, std::string & why) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -1107,6 +1114,42 @@ static bool check_argmax_output(llama_model * model, const llama_context_params 
         }
         if (pooled[0] != pooled[1]) {
             return fail("pooled embedding context: the embedding differs with the mode on");
+        }
+    }
+
+    if (split) {
+        if (!first_maxes(4, want)) {
+            return fail("the reference decode with the mode off failed");
+        }
+        llama_context_ptr lctx(llama_init_from_model(model, cparams));
+        if (!lctx) {
+            return fail("no context");
+        }
+        if (decode(lctx.get(), 4) != 0 || llama_get_logits(lctx.get()) == nullptr) {
+            return fail("failed decode: the first decode, the mode off, has no logits");
+        }
+        llama_set_argmax_output(lctx.get(), true);
+        if (decode(lctx.get(), 4) != 0) {
+            return fail("failed decode: the argmax-output decode failed");
+        }
+        llama_set_argmax_output(lctx.get(), false);
+        llama_set_abort_callback(lctx.get(), abort_always, nullptr);
+        const int32_t rc = decode(lctx.get(), 4);
+        llama_set_abort_callback(lctx.get(), nullptr, nullptr);
+        if (rc != 2) {
+            return fail("failed decode: an abort callback did not stop the decode (returned " + std::to_string(rc) + ")");
+        }
+        if (llama_get_logits(lctx.get()) != nullptr) {
+            return fail("failed decode: logits from before the argmax-output decode are readable after the aborted one");
+        }
+        if (decode(lctx.get(), 4) != 0) {
+            return fail("failed decode: the decode after the aborted one failed");
+        }
+        for (uint32_t i = n_tokens - 4; i < n_tokens; i++) {
+            const float * row = llama_get_logits_ith(lctx.get(), i);
+            if (row == nullptr || row_first_max(row, n_vocab) != want[i]) {
+                return fail("failed decode, row " + std::to_string(i) + ": no logits, or a first max unlike the reference, after recovery");
+            }
         }
     }
     return true;
