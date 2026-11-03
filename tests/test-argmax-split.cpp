@@ -564,6 +564,100 @@ static int test_meta_view_of_rows(ggml_backend_dev_t dev, const std::vector<int6
     return n_fail;
 }
 
+// tensors named "*split0" are split along axis 0 into the element counts userdata holds, everything else is mirrored
+static ggml_backend_meta_split_state split0_state(const ggml_tensor * tensor, void * userdata) {
+    const std::vector<int64_t> & ne = *(const std::vector<int64_t> *) userdata;
+    const std::string name = tensor->name;
+    if (name.size() >= 6 && name.compare(name.size() - 6, 6, "split0") == 0) {
+        ggml_backend_meta_split_state ss = {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+        for (size_t j = 0; j < ne.size(); j++) {
+            ss.ne[j] = ne[j];
+        }
+        return ss;
+    }
+    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+}
+
+// a quantized rows view flattened to one dimension: split along its only axis, each device's part starts at its elements'
+// bytes, a whole number of blocks, not at its element count times a block's bytes. The flattened view is copied to F32,
+// into a destination split as it is (a copy's kernel reads as many elements as its destination holds), and gathered: it
+// must equal the dequantized matrix value for value.
+static int test_meta_flat_quantized_rows(ggml_backend_dev_t dev, ggml_type type, const std::vector<int64_t> & parts) {
+    const int     n_parts = (int) parts.size();
+    const int64_t k = 64, v = 1000;
+    std::vector<ggml_backend_dev_t> devs(n_parts, dev);
+    std::vector<int64_t> parts_elems;
+    for (int64_t p : parts) {
+        parts_elems.push_back(p*k);
+    }
+    ggml_backend_t backend = ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), split0_state, &parts_elems), nullptr);
+    GGML_ASSERT(backend != nullptr);
+    std::string layout;
+    for (int64_t p : parts) {
+        layout += (layout.empty() ? "" : "/") + std::to_string(p);
+    }
+
+    std::mt19937 rng(21);
+    std::normal_distribution<float> nd;
+    std::vector<float> wf(k*v);
+    for (int64_t r = 0; r < v; r++) {
+        for (int64_t i = 0; i < k; i++) {
+            wf[r*k + i] = (float) r + 0.25f*nd(rng); // each row near its own index, so a row read from elsewhere shows
+        }
+    }
+    ggml_init_params wp = { ggml_tensor_overhead()*2, nullptr, true };
+    ggml_context * ctx_w = ggml_init(wp);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx_w, type, k, v);
+    ggml_tensor * dq = ggml_new_tensor_1d(ctx_w, GGML_TYPE_F32, k*v);
+    ggml_set_name(dq, "dq_split0");
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+    GGML_ASSERT(wbuf != nullptr);
+    std::vector<uint8_t> wq(ggml_nbytes(w));
+    ggml_quantize_chunk(type, wf.data(), wq.data(), 0, v, k, nullptr);
+    ggml_backend_tensor_set(w, wq.data(), 0, wq.size());
+    std::vector<float> ref(k*v); // the matrix as stored
+    if (type == GGML_TYPE_F32) {
+        memcpy(ref.data(), wq.data(), wq.size());
+    } else {
+        ggml_get_type_traits(type)->to_float(wq.data(), ref.data(), k*v);
+    }
+
+    ggml_init_params gp = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(gp);
+    ggml_tensor * flat = ggml_reshape_1d(ctx, ggml_backend_meta_rows(ctx, w, n_parts, parts.data()), k*v);
+    ggml_tensor * f32  = ggml_cpy(ctx, flat, dq);
+    ggml_tensor * gath = ggml_backend_meta_gather(ctx, f32);
+    ggml_set_output(gath);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, gath);
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+    GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+
+    std::vector<float> g(k*v);
+    ggml_backend_tensor_get(gath, g.data(), 0, ggml_nbytes(gath));
+    int64_t n_diff = 0, first = -1;
+    for (int64_t i = 0; i < k*v; i++) {
+        if (!(g[i] == ref[i])) {
+            n_diff++;
+            first = first < 0 ? i : first;
+        }
+    }
+    printf("  %s %s rows view flattened, parts %s: %lld of %lld values differ from the matrix", ggml_backend_dev_name(dev),
+        ggml_type_name(type), layout.c_str(), (long long) n_diff, (long long) (k*v));
+    if (first >= 0) {
+        printf(" (first in row %lld: %g, want %g)", (long long) (first / k), g[first], ref[first]);
+    }
+    printf(" %s\n", n_diff == 0 ? "ok" : "FAIL");
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(ctx_w);
+    ggml_backend_free(backend);
+    return n_diff != 0;
+}
+
 // a rows view of a mirrored matrix that is itself a view at a row offset: each device's rows start after the offset
 static int test_meta_offset_view(ggml_backend_dev_t dev, const std::vector<int64_t> & parts) {
     const int     n_parts = (int) parts.size();
@@ -829,6 +923,9 @@ int main() {
         n_fail += test_meta_nan(dev, even_parts(1000, n_parts));
         n_fail += test_meta_offset_view(dev, even_parts(1000, n_parts));
         n_fail += test_meta_view_of_rows(dev, even_parts(1000, n_parts));
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+            n_fail += test_meta_flat_quantized_rows(dev, type, even_parts(1000, n_parts));
+        }
         n_fail += test_meta_whole_rows(dev, n_parts);
     }
     for (int n_parts : {2, 3}) {
