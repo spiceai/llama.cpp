@@ -1492,9 +1492,12 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             for (size_t jj = 0; jj < j; jj++) {
                 lp += split_state.ne[jj];
             }
-            // along axis 0, lp counts elements and nb[0] is the size of a block of a quantized type: the bytes of lp
-            // elements (a whole number of blocks, which ggml_row_size asserts), as for a quantized row flattened to a vector
-            t_ij->view_offs = tensor->view_offs + (split_dim == 0 ? ggml_row_size(tensor->type, lp) : lp*tensor->nb[split_dim]);
+            // along axis 0, lp counts elements and nb[0] is the stride of a block of blck_size elements: the size of a block
+            // of a quantized row flattened to a vector, the matrix's row stride in a transposed F32 rows view. A quantized
+            // type's blocks are only addressable along axis 0 when they are contiguous there.
+            const int64_t blck = split_dim == 0 ? ggml_blck_size(tensor->type) : 1;
+            GGML_ASSERT(lp % blck == 0 && (blck == 1 || tensor->nb[0] == ggml_type_size(tensor->type)));
+            t_ij->view_offs = tensor->view_offs + (lp/blck)*tensor->nb[split_dim];
         }
         if (t_ij->view_src != nullptr && ggml_backend_buffer_is_meta(t_ij->view_src->buffer)) {
             t_ij->view_src = ggml_backend_meta_buffer_simple_tensor(tensor->view_src, j);
