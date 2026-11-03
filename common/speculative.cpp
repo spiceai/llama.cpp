@@ -1577,7 +1577,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
     // call to pair with, so it's stashed here until that next call fires.
+    // pending_pos is the position p whose hidden state pending_h holds (-1: none). A batch
+    // whose first token is not at pending_pos + 1 (a new request on the sequence, or a cache
+    // cut back to a shorter prefix) has no hidden state before it here: at position 0 none
+    // exists, as on a fresh context; elsewhere the caller restores the one it saved with
+    // get_state() (e.g. with a prompt checkpoint) before the batch, or the token pairs with
+    // zeros, as at position 0.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
+    std::vector<llama_pos>          pending_pos; // [n_seq]
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1586,6 +1593,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
+    std::vector<llama_pos> verify_pos_first; // [n_seq] the position of verify_h's row 0
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
@@ -1657,6 +1665,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_pos.assign(n_seq, -1);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1664,6 +1673,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        verify_pos_first.assign(n_seq, -1);
+    }
+
+    // the hidden state that precedes position `pos` in sequence `seq_id`: pending_h when it is the target's state at
+    // pos - 1, else zeros, as before a sequence's first token
+    void pending_for(llama_seq_id seq_id, llama_pos pos) {
+        if (pending_pos[seq_id] + 1 == pos) {
+            return;
+        }
+        if (pos > 0) {
+            SPC_DBG("seq %d: no hidden state before position %d (it holds one for %d); the token pairs with zeros\n",
+                    (int) seq_id, (int) pos, (int) pending_pos[seq_id]);
+        }
+        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        pending_pos[seq_id] = pos - 1;
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1744,6 +1768,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] >= 0) {
+                    pending_for(seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0]);
+                }
+            }
+
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
 
@@ -1809,9 +1839,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            verify_pos_first[seq_id] = batch_in.tokens[i_batch_beg[seq_id]].pos[0];
+            pending_pos[seq_id]      = batch_in.tokens[i_batch_end[seq_id]].pos[0];
         }
 
         return true;
+    }
+
+    // the sequence's pending hidden state and its position, to restore with set_state() when the caller cuts the
+    // cache back to pos + 1 (e.g. restoring a prompt checkpoint saved with it)
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos[seq_id] < 0) {
+            return false;
+        }
+        const llama_pos pos = pending_pos[seq_id];
+        const int32_t   n   = n_embd;
+        data.resize(sizeof(pos) + sizeof(n) + (size_t) n_embd * sizeof(float));
+        std::memcpy(data.data(), &pos, sizeof(pos));
+        std::memcpy(data.data() + sizeof(pos), &n, sizeof(n));
+        std::memcpy(data.data() + sizeof(pos) + sizeof(n), pending_h[seq_id].data(), (size_t) n_embd * sizeof(float));
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        llama_pos pos = -1;
+        int32_t   n   = 0;
+        if (data.size() != sizeof(pos) + sizeof(n) + (size_t) n_embd * sizeof(float)) {
+            SPC_WRN("seq %d: a saved state of %zu bytes does not fit this head (n_embd %d); not restored\n",
+                    (int) seq_id, data.size(), (int) n_embd);
+            return;
+        }
+        std::memcpy(&pos, data.data(), sizeof(pos));
+        std::memcpy(&n, data.data() + sizeof(pos), sizeof(n));
+        if (n != n_embd || pos < 0) {
+            SPC_WRN("seq %d: a saved state for n_embd %d at position %d does not fit this head (n_embd %d); not restored\n",
+                    (int) seq_id, (int) n, (int) pos, (int) n_embd);
+            return;
+        }
+        pending_pos[seq_id] = pos;
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(pos) + sizeof(n), (size_t) n_embd * sizeof(float));
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
@@ -1847,6 +1916,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_reset(smpls[seq_id].get());
             }
 
+            pending_for(seq_id, dp.pos0);
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
 
@@ -1993,6 +2063,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        pending_pos[seq_id] = verify_pos_first[seq_id] + i_h;
     }
 };
 
