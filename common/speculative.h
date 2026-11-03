@@ -99,6 +99,10 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
+// moves the positions [p0, p1) of sequence seq_id by delta, as llama_memory_seq_add does to the KV cache, so that
+// per-sequence state held for a position follows its token; call it with the same arguments (e.g. on a context shift)
+void common_speculative_seq_add(common_speculative * spec, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 

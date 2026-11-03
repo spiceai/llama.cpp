@@ -216,6 +216,9 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // (optional) follow a move of the sequence's positions [p0, p1) by delta (see common_speculative_seq_add).
+    virtual void seq_add(llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/, llama_pos /*delta*/) {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1883,6 +1886,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(pos) + sizeof(n), (size_t) n_embd * sizeof(float));
     }
 
+    // a context shift moves the tokens at [p0, p1) by delta; pending_h still holds the same token's hidden state, so its
+    // position moves with it and the next token after the shift still pairs with it
+    void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        const auto moves = [&](llama_pos pos) { return pos >= 0 && pos >= p0 && (p1 < 0 || pos < p1); };
+        if (moves(pending_pos[seq_id])) {
+            pending_pos[seq_id] += delta;
+        }
+        if (moves(verify_pos_first[seq_id])) {
+            verify_pos_first[seq_id] += delta;
+        }
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
@@ -3257,6 +3275,16 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
+    }
+}
+
+void common_speculative_seq_add(common_speculative * spec, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->seq_add(seq_id, p0, p1, delta);
     }
 }
 
