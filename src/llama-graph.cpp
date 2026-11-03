@@ -4536,6 +4536,17 @@ void llm_graph_context::build_sampling() const {
     */
 }
 
+bool llama_dev_runs_argmax_split(ggml_backend_dev_t dev, int64_t n_vocab, int64_t n_rows, int n_parts) {
+    ggml_init_params params = { 3*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    GGML_ASSERT(ctx != nullptr);
+    ggml_tensor * part  = ggml_argmax_part(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, n_rows), n_parts);
+    ggml_tensor * merge = ggml_argmax_merge(ctx, part);
+    const bool ok = ggml_backend_dev_supports_op(dev, part) && ggml_backend_dev_supports_op(dev, merge);
+    ggml_free(ctx);
+    return ok;
+}
+
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {
     // TODO move to hparams if a T5 variant appears that uses a different value
     const int64_t max_distance = 128;

@@ -454,20 +454,6 @@ static dspark_block_params dspark_get_block_params(const llama_model & model) {
     return { block_size, it_anchor == model.gguf_kv.end() || it_anchor->second == "true" };
 }
 
-// Whether dev runs ggml_argmax_part and ggml_argmax_merge over n_blocks rows of n_vocab logits split n_parts ways. A meta
-// device asks each of its devices, and an RPC device answers from its server's HELLO, which says whether the server's
-// backends run them.
-static bool dspark_runs_argmax_split(ggml_backend_dev_t dev, int64_t n_vocab, int64_t n_blocks, int n_parts) {
-    ggml_init_params params = { 3*ggml_tensor_overhead(), nullptr, true };
-    ggml_context * ctx = ggml_init(params);
-    GGML_ASSERT(ctx != nullptr);
-    ggml_tensor * part  = ggml_argmax_part(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, n_blocks), n_parts);
-    ggml_tensor * merge = ggml_argmax_merge(ctx, part);
-    const bool ok = ggml_backend_dev_supports_op(dev, part) && ggml_backend_dev_supports_op(dev, merge);
-    ggml_free(ctx);
-    return ok;
-}
-
 // The rows of the DSpark draft's vocabulary each device of a tensor split computes, as llama_meta_device_get_split_state
 // shares out a split output head (by tensor_split, evenly when it is unset): each device then computes the output head and
 // the Markov transition for its rows only, and the draft chain takes each position's argmax from one (value, index) pair
@@ -521,7 +507,7 @@ static std::vector<int64_t> dspark_vocab_parts(const llm_graph_context & g, cons
     // (Metal, also behind an RPC server, which says in its HELLO whether its backends run them)
     for (const ggml_tensor * t : { output, (const ggml_tensor *) model.dspark_markov_w2 }) {
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
-        if (!dspark_runs_argmax_split(dev, n_vocab, n_blocks, (int) n_devices)) {
+        if (!llama_dev_runs_argmax_split(dev, n_vocab, n_blocks, (int) n_devices)) {
             return {};
         }
     }

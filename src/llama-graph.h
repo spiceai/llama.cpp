@@ -1507,3 +1507,8 @@ struct llm_graph_context {
 
 // TODO: better name
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);
+
+// Whether dev runs ggml_argmax_part and ggml_argmax_merge over n_rows rows of n_vocab logits split n_parts ways, as a head
+// split by vocabulary rows takes its picks. A meta device asks each of its devices, and an RPC device answers from its
+// server's HELLO, which says whether the server's backends run them (Metal does not).
+bool llama_dev_runs_argmax_split(ggml_backend_dev_t dev, int64_t n_vocab, int64_t n_rows, int n_parts);

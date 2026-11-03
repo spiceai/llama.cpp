@@ -1187,7 +1187,12 @@ static llama_token first_max_of(const float * row, int64_t n) {
 }
 
 void llama_context::set_argmax_output(bool on) {
-    // part of the graph parameters (llm_graph_params::allow_reuse), so a change rebuilds the graph
+    // part of the graph parameters (llm_graph_params::allow_reuse), so a change rebuilds the graph. In an embedding
+    // context the reserve also decides from its graph whether the output buffer holds logits (graph_has_logits), so a
+    // change there reserves again
+    if (cparams.argmax_output != on && cparams.embeddings) {
+        sched_need_reserve = true;
+    }
     cparams.argmax_output = on;
 }
 
