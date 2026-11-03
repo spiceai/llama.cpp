@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -14,7 +15,8 @@ struct apple_rdma {
     bool activate(const uint8_t * caps);
 
     bool send(const void * data, size_t size);
-    bool recv(void * data, size_t size);
+    // `deadline`: when set, the receive fails once it has passed, and the connection is broken
+    bool recv(void * data, size_t size, const std::chrono::steady_clock::time_point * deadline = nullptr);
     // Post the trailing partial frame; must be called at every message boundary.
     bool flush();
     // True once the connection has failed; the caller should drop the socket.
