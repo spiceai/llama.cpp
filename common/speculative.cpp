@@ -1895,9 +1895,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const auto moves = [&](llama_pos pos) { return pos >= 0 && pos >= p0 && (p1 < 0 || pos < p1); };
         if (moves(pending_pos[seq_id])) {
             pending_pos[seq_id] += delta;
+            // a position moved below 0 leaves the KV cache, and so does the state held for it: -1 holds zeros
+            if (pending_pos[seq_id] < 0) {
+                std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+                pending_pos[seq_id] = -1;
+            }
         }
         if (moves(verify_pos_first[seq_id])) {
-            verify_pos_first[seq_id] += delta;
+            verify_pos_first[seq_id] = std::max<llama_pos>(verify_pos_first[seq_id] + delta, -1);
         }
     }
 
