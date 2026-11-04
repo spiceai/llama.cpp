@@ -1967,7 +1967,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // a context shift moves the tokens at [p0, p1) by delta; pending_h still holds the same token's hidden state, so its
     // position moves with it and the next token after the shift still pairs with it
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) override {
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+        // a shift by 0 moves nothing, so the state stays as it is
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || delta == 0) {
             return;
         }
         const auto moves = [&](llama_pos pos) { return pos >= 0 && pos >= p0 && (p1 < 0 || pos < p1); };
