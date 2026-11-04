@@ -57,6 +57,7 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
     bool logits_gather;      // gather a split output head whole onto every device, see llama_tensor_logits_gather
+    bool argmax_output = false; // output each row's first max instead of its logits where the head splits, see llama_set_argmax_output
 
     size_t moe_cache_size;
 

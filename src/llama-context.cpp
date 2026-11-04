@@ -971,6 +971,7 @@ void llama_context::synchronize() {
 
     const int64_t t_sync0 = g_decode_timing.on ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
+    argmax_copies_pending = false;
     if (g_decode_timing.on) {
         g_decode_timing.sync_us += ggml_time_us() - t_sync0;
     }
@@ -1114,7 +1115,8 @@ enum llama_pooling_type llama_context::pooling_type() const {
 float * llama_context::get_logits() {
     output_reorder();
 
-    return logits.data;
+    // the argmax output replaced the last decode's logits: there are none to return
+    return logits_ready ? logits.data : nullptr;
 }
 
 int64_t llama_context::output_resolve_row(int32_t i) const {
@@ -1149,11 +1151,15 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
 float * llama_context::get_logits_ith(int32_t i) {
     output_reorder();
 
+    // the argmax output replaced the last decode's logits (llama_set_argmax_output): there are none to return
+    if (!logits_ready) {
+        return nullptr;
+    }
+
     try {
         if (logits.data == nullptr) {
             throw std::runtime_error("no logits");
         }
-
         const int64_t j = output_resolve_row(i);
         return logits.data + j*model.vocab.n_tokens();
     } catch (const std::exception & err) {
@@ -1163,6 +1169,52 @@ float * llama_context::get_logits_ith(int32_t i) {
 #else
         return nullptr;
 #endif
+    }
+}
+
+// the greedy sampler's pick over a row: token 0 when the first logit is a NaN, else the first largest that is not one
+static llama_token first_max_of(const float * row, int64_t n) {
+    if (n == 0 || std::isnan(row[0])) {
+        return 0;
+    }
+    int64_t best = 0;
+    for (int64_t k = 1; k < n; k++) {
+        if (row[k] > row[best]) {
+            best = k;
+        }
+    }
+    return (llama_token) best;
+}
+
+void llama_context::set_argmax_output(bool on) {
+    // part of the graph parameters (llm_graph_params::allow_reuse), so a change rebuilds the graph. In an embedding
+    // context the reserve also decides from its graph whether the output buffer holds logits (graph_has_logits), so a
+    // change there reserves again
+    if (cparams.argmax_output != on && cparams.embeddings) {
+        sched_need_reserve = true;
+    }
+    cparams.argmax_output = on;
+}
+
+llama_token llama_context::get_argmax_ith(int32_t i) {
+    output_reorder();
+    const int64_t n_vocab = model.vocab.n_tokens();
+    try {
+        const int64_t j = output_resolve_row(i);
+        if (argmax_ready) {
+            return argmax_buf.at(j);
+        }
+        if (logits.data == nullptr || !logits_ready) {
+            throw std::runtime_error("no logits");
+        }
+        // a row a backend sampler sampled may have no raw logits copied back: no pick for it (see llama_get_argmax_ith)
+        if (get_sampled_token_ith(i) != LLAMA_TOKEN_NULL || get_sampled_logits_ith(i) != nullptr || get_sampled_probs_ith(i) != nullptr) {
+            return LLAMA_TOKEN_NULL;
+        }
+        return first_max_of(logits.data + j*n_vocab, n_vocab);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid output id %d, reason: %s\n", __func__, i, err.what());
+        return LLAMA_TOKEN_NULL;
     }
 }
 
@@ -2175,6 +2227,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // the argmax output: one pick per output row, when every ubatch with outputs computed them (a split head), in which
+    // case those ubatches computed no logits. The picks of the previous decode may still be on their way into argmax_buf
+    // when nothing read them, so it is reassigned only after they land. Neither the picks nor the logits become readable
+    // here: with the argmax output on, both wait until the decode has succeeded, and with it off, logits an earlier
+    // argmax-output decode left unreadable stay so until this one has succeeded. A failed decode thus exposes no logits
+    // older than the last decode that succeeded
+    if (argmax_copies_pending) {
+        synchronize();
+    }
+    argmax_ready = false;
+    logits_ready = logits_ready && !cparams.argmax_output;
+    bool argmax_all = cparams.argmax_output;
+    bool logits_all = true;
+    argmax_buf.assign(n_outputs_all, LLAMA_TOKEN_NULL);
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -2254,6 +2321,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+            }
+        }
+
+        // extract the picks of the argmax output
+        {
+            auto * t_argmax = res->get_argmax();
+            // a ubatch without outputs computes no head either way
+            if (t_argmax == nullptr) {
+                argmax_all = argmax_all && n_outputs == 0;
+            } else if (n_outputs > 0) {
+                logits_all = logits_all && t_logits != nullptr;
+                argmax_copies_pending = true;
+                ggml_backend_t backend_am = ggml_backend_sched_get_tensor_backend(sched.get(), t_argmax);
+                GGML_ASSERT(backend_am != nullptr);
+                GGML_ASSERT(n_outputs_prev + n_outputs <= (int64_t) argmax_buf.size());
+                ggml_backend_tensor_get_async(backend_am, t_argmax, argmax_buf.data() + n_outputs_prev, 0, n_outputs*sizeof(int32_t));
             }
         }
 
@@ -2410,6 +2493,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
     }
+
+    argmax_ready = argmax_all;
+    logits_ready = logits_all;
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
@@ -2625,7 +2711,8 @@ void llama_context::output_reorder() {
         const uint64_t i0 = output_swaps[s].i0;
         const uint64_t i1 = output_swaps[s].i1;
 
-        if (logits.size > 0) {
+        // after an argmax-output decode the buffer holds no logits of it, so only the picks move
+        if (logits.size > 0 && logits_ready) {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
             }
@@ -2635,6 +2722,10 @@ void llama_context::output_reorder() {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd.data[i0*n_embd_out + k], embd.data[i1*n_embd_out + k]);
             }
+        }
+
+        if (argmax_ready && i0 < argmax_buf.size() && i1 < argmax_buf.size()) {
+            std::swap(argmax_buf[i0], argmax_buf[i1]);
         }
 
         if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
@@ -4468,6 +4559,15 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     }
 
     return res;
+}
+
+void llama_set_argmax_output(llama_context * ctx, bool on) {
+    ctx->set_argmax_output(on);
+}
+
+llama_token llama_get_argmax_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+    return ctx->get_argmax_ith(i);
 }
 
 float * llama_get_unsampled_logits_ith(llama_context * ctx, int32_t i) {

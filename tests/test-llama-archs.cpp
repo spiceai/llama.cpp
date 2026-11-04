@@ -772,13 +772,7 @@ static llama_model_ptr get_model(
     return model;
 }
 
-static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
-        struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
-        const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
-    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides);
-
+static llama_context_params get_ctx_params(bool encode, size_t moe_cache_size) {
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
@@ -792,8 +786,17 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         ctx_params.moe_cache_size = moe_cache_size;
         ctx_params.n_ubatch = 2;
     }
+    return ctx_params;
+}
 
-    llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+        struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
+        const std::vector<ggml_backend_dev_t> & devs,
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
+    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides);
+
+    llama_context_ptr lctx(llama_init_from_model(model.get(), get_ctx_params(encode, moe_cache_size)));
     if (!lctx) {
         throw std::runtime_error("failed to create llama context");
     }
@@ -917,6 +920,239 @@ static bool check_causal_attn_toggle(
     }
 
     return ok;
+}
+
+static bool abort_always(void * /*data*/) {
+    return true;
+}
+
+// the greedy sampler's pick over a row: token 0 when the first logit is a NaN, else the first largest
+static llama_token row_first_max(const float * row, uint32_t n) {
+    if (n == 0 || std::isnan(row[0])) {
+        return 0;
+    }
+    uint32_t best = 0;
+    for (uint32_t k = 1; k < n; k++) {
+        if (row[k] > row[best]) {
+            best = k;
+        }
+    }
+    return (llama_token) best;
+}
+
+// The argmax output (llama_set_argmax_output) of a tensor split, on new contexts over the model, each pick against the
+// first max of the logits a context with the mode off computes for the same batch:
+// - every output row's pick, for a batch with every token an output (two ubatches) and for one with the last four (a
+//   verification batch); with the head split the decode's logits are not readable (llama_get_logits_ith returns NULL),
+//   and `split` says whether it was;
+// - with the head split (so the logits are mirrored, as backend sampling needs), with a greedy backend sampler attached
+//   (when LLAMA_TENSOR_BACKEND_SAMPLING is on), the sampler still samples the output row (one per sequence, as backend
+//   sampling allows), and llama_get_argmax_ith refuses the row it sampled;
+// - with the head split, an embedding context (pooling NONE) whose scheduler was reserved with the mode on computes the
+//   logits once the mode is off again (a whole head computes its logits either way), and a pooled embedding context
+//   (pooling MEAN) computes the same embeddings with the mode on as off;
+// - with the head split, a decode with the mode off that an abort callback stops after an argmax-output decode leaves no
+//   logits readable (the buffer holds logits from before the argmax-output decode), and the next decode that succeeds
+//   makes them readable again.
+static bool check_argmax_output(llama_model * model, const llama_context_params & cparams, const std::vector<llama_token> & tokens,
+        bool & split, std::string & why) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_tokens = tokens.size();
+    GGML_ASSERT(n_tokens >= 4);
+    // decode every token, the last n_out with an output
+    auto decode = [&](llama_context * lctx, uint32_t n_out) {
+        llama_memory_clear(llama_get_memory(lctx), true);
+        common_batch batch(lctx);
+        for (uint32_t pos = 0; pos < n_tokens; pos++) {
+            batch.add(tokens[pos], pos, 0, pos >= n_tokens - n_out);
+        }
+        return llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+    };
+    // the first max of each output row's logits, the mode off, for the batch with the last n_out tokens as outputs
+    auto first_maxes = [&](uint32_t n_out, std::vector<llama_token> & out) {
+        llama_context_ptr lctx(llama_init_from_model(model, cparams));
+        if (!lctx || decode(lctx.get(), n_out) != 0) {
+            return false;
+        }
+        out.assign(n_tokens, LLAMA_TOKEN_NULL);
+        for (uint32_t i = n_tokens - n_out; i < n_tokens; i++) {
+            const float * row = llama_get_logits_ith(lctx.get(), i);
+            if (row == nullptr) {
+                return false;
+            }
+            out[i] = row_first_max(row, n_vocab);
+        }
+        return true;
+    };
+    auto fail = [&](const std::string & what) {
+        why = what;
+        return false;
+    };
+
+    split = false;
+    std::vector<llama_token> want;
+    for (const uint32_t n_out : { n_tokens, 4u }) {
+        if (!first_maxes(n_out, want)) {
+            return fail("the reference decode with the mode off failed");
+        }
+        llama_context_ptr lctx(llama_init_from_model(model, cparams));
+        if (!lctx) {
+            return fail("no context");
+        }
+        llama_set_argmax_output(lctx.get(), true);
+        if (decode(lctx.get(), n_out) != 0) {
+            return fail("decode failed");
+        }
+        const bool split_here = llama_get_logits_ith(lctx.get(), n_tokens - 1) == nullptr;
+        if (n_out == n_tokens) {
+            split = split_here;
+        } else if (split_here != split) {
+            return fail("the head split for one batch and not the other");
+        }
+        for (uint32_t i = n_tokens - n_out; i < n_tokens; i++) {
+            const llama_token pick = llama_get_argmax_ith(lctx.get(), i);
+            if (pick != want[i]) {
+                return fail("row " + std::to_string(i) + " of " + std::to_string(n_out) + " outputs: pick " +
+                    std::to_string(pick) + ", first max " + std::to_string(want[i]));
+            }
+            if ((llama_get_logits_ith(lctx.get(), i) == nullptr) != split) {
+                return fail("row " + std::to_string(i) + ": logits readable unlike the last row");
+            }
+        }
+    }
+
+    // on as llama_tensor_backend_sampling() reads it
+    const char * backend_sampling = getenv("LLAMA_TENSOR_BACKEND_SAMPLING");
+    if (split && backend_sampling != nullptr && atoi(backend_sampling) != 0) {
+        if (!first_maxes(1, want)) {
+            return fail("the reference decode with the mode off failed");
+        }
+        llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+        std::string err;
+        {
+            llama_context_ptr lctx(llama_init_from_model(model, cparams));
+            if (!lctx || !llama_set_sampler(lctx.get(), 0, chain)) {
+                err = "the greedy backend sampler was not attached";
+            } else {
+                llama_set_argmax_output(lctx.get(), true);
+                if (decode(lctx.get(), 1) != 0) {
+                    err = "decode with a backend sampler failed";
+                }
+                const uint32_t i = n_tokens - 1;
+                if (err.empty()) {
+                    const llama_token sampled = llama_get_sampled_token_ith(lctx.get(), i);
+                    if (sampled != want[i]) {
+                        err = "backend sampler, row " + std::to_string(i) + ": sampled " + std::to_string(sampled) +
+                            ", first max " + std::to_string(want[i]);
+                    } else if (llama_get_argmax_ith(lctx.get(), i) != LLAMA_TOKEN_NULL) {
+                        err = "backend sampler, row " + std::to_string(i) + ": a pick for a sampled row";
+                    }
+                }
+                llama_set_sampler(lctx.get(), 0, nullptr);
+            }
+        }
+        llama_sampler_free(chain);
+        if (!err.empty()) {
+            return fail(err);
+        }
+    }
+
+    if (split) {
+        if (!first_maxes(4, want)) {
+            return fail("the reference decode with the mode off failed");
+        }
+        llama_context_params cp = cparams;
+        cp.embeddings   = true;
+        cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        llama_context_ptr lctx(llama_init_from_model(model, cp));
+        if (!lctx) {
+            return fail("no embedding context");
+        }
+        llama_set_argmax_output(lctx.get(), true);
+        // toggling embeddings has the next decode reserve the scheduler, with the mode on
+        llama_set_embeddings(lctx.get(), false);
+        llama_set_embeddings(lctx.get(), true);
+        if (decode(lctx.get(), 4) != 0) {
+            return fail("embedding context: decode with the mode on failed");
+        }
+        llama_set_argmax_output(lctx.get(), false);
+        if (decode(lctx.get(), 4) != 0) {
+            return fail("embedding context: decode with the mode off failed");
+        }
+        for (uint32_t i = n_tokens - 4; i < n_tokens; i++) {
+            const float * row = llama_get_logits_ith(lctx.get(), i);
+            if (row == nullptr) {
+                return fail("embedding context, row " + std::to_string(i) + ": no logits with the mode off");
+            }
+            if (row_first_max(row, n_vocab) != want[i]) {
+                return fail("embedding context, row " + std::to_string(i) + ": first max " +
+                    std::to_string(row_first_max(row, n_vocab)) + ", want " + std::to_string(want[i]));
+            }
+        }
+    }
+
+    if (split) {
+        llama_context_params cp = cparams;
+        cp.embeddings   = true;
+        cp.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+        std::vector<float> pooled[2];
+        for (const bool on : { false, true }) {
+            llama_context_ptr lctx(llama_init_from_model(model, cp));
+            if (!lctx) {
+                return fail("no pooled embedding context");
+            }
+            llama_set_argmax_output(lctx.get(), on);
+            if (decode(lctx.get(), n_tokens) != 0) {
+                return fail(std::string("pooled embedding context: decode with the mode ") + (on ? "on" : "off") + " failed");
+            }
+            const float * e = llama_get_embeddings_seq(lctx.get(), 0);
+            if (e == nullptr) {
+                return fail("pooled embedding context: no embedding");
+            }
+            pooled[on].assign(e, e + llama_model_n_embd_out(model));
+        }
+        if (pooled[0] != pooled[1]) {
+            return fail("pooled embedding context: the embedding differs with the mode on");
+        }
+    }
+
+    if (split) {
+        if (!first_maxes(4, want)) {
+            return fail("the reference decode with the mode off failed");
+        }
+        llama_context_ptr lctx(llama_init_from_model(model, cparams));
+        if (!lctx) {
+            return fail("no context");
+        }
+        if (decode(lctx.get(), 4) != 0 || llama_get_logits(lctx.get()) == nullptr) {
+            return fail("failed decode: the first decode, the mode off, has no logits");
+        }
+        llama_set_argmax_output(lctx.get(), true);
+        if (decode(lctx.get(), 4) != 0) {
+            return fail("failed decode: the argmax-output decode failed");
+        }
+        llama_set_argmax_output(lctx.get(), false);
+        llama_set_abort_callback(lctx.get(), abort_always, nullptr);
+        const int32_t rc = decode(lctx.get(), 4);
+        llama_set_abort_callback(lctx.get(), nullptr, nullptr);
+        if (rc != 2) {
+            return fail("failed decode: an abort callback did not stop the decode (returned " + std::to_string(rc) + ")");
+        }
+        if (llama_get_logits(lctx.get()) != nullptr) {
+            return fail("failed decode: logits from before the argmax-output decode are readable after the aborted one");
+        }
+        if (decode(lctx.get(), 4) != 0) {
+            return fail("failed decode: the decode after the aborted one failed");
+        }
+        for (uint32_t i = n_tokens - 4; i < n_tokens; i++) {
+            const float * row = llama_get_logits_ith(lctx.get(), i);
+            if (row == nullptr || row_first_max(row, n_vocab) != want[i]) {
+                return fail("failed decode, row " + std::to_string(i) + ": no logits, or a first max unlike the reference, after recovery");
+            }
+        }
+    }
+    return true;
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -1259,15 +1495,15 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         max_arch_name_length = std::max(max_arch_name_length, strlen(llama_arch_name(arch)));
     }
 
-    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|%15s|\n";
+    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|%15s|%13s|\n";
     const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|";
-    const std::string template_row_res = "%15s %10s|%20s|%15s %10s|\n";
+    const std::string template_row_res = "%15s %10s|%20s|%15s %10s|%24s|\n";
 
     bool all_ok = true;
     size_t n_tests = 0;
     size_t n_failed = 0;
     common_log_flush(common_log_main());
-    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Mixed batch");
+    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Mixed batch", "Argmax out.");
     LOG("|");
     for (size_t i = 0; i < max_arch_name_length; i++) {
         LOG("-");
@@ -1276,7 +1512,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     for (size_t i = 0; i < max_device_label_length; i++) {
         LOG("-");
     }
-    LOG("|------|---------------|---------|---------------|\n");
+    LOG("|------|---------------|---------|---------------|-------------|\n");
     for (const llm_arch & arch : llama_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -1321,6 +1557,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 std::string status_mixed     = "\033[1;33mSKIP\033[0m";
+                std::string status_argmax    = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
                 char mixed_str[12] = {0};
 
@@ -1386,6 +1623,20 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             }
                             test_ok = false;
                         }
+
+                        // on contexts of its own
+                        if (!encode && dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && llama_get_memory(lctx_dev) != nullptr) {
+                            bool split = false;
+                            std::string why;
+                            if (check_argmax_output(model_and_ctx_dev.first.get(), get_ctx_params(encode, dc.moe_cache_size), tokens,
+                                    split, why)) {
+                                status_argmax = std::string("\033[1;32mOK\033[0m (") + (split ? "split)" : "whole)");
+                            } else {
+                                LOG_ERR("argmax output: %s\n", why.c_str());
+                                status_argmax = "\033[1;31mFAIL\033[0m";
+                                test_ok = false;
+                            }
+                        }
                     }
 
                     if (llama_arch_supports_save(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
@@ -1427,7 +1678,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 }
 
                 // log the results for this test case
-                LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_mixed.c_str(), mixed_str);
+                LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_mixed.c_str(), mixed_str,
+                    status_argmax.c_str());
             }
         }
     }

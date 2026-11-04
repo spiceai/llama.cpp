@@ -1198,10 +1198,23 @@ extern "C" {
     LLAMA_API uint32_t      llama_get_sampled_candidates_count_ith(struct llama_context * ctx, int32_t i);
 
     // The full logits of the ith token, one per vocabulary token, when no backend sampler sampled it.
-    // Returns NULL when one did (the host then has only its candidates).
+    // Returns NULL when one did (the host then has only its candidates), and when the argmax output
+    // (llama_set_argmax_output) replaced the decode's logits with picks.
     // An invalid id is handled as in llama_get_logits_ith: NULL when NDEBUG is defined, an abort otherwise.
     // Synchronizes once; checking with the getters above and then calling llama_get_logits_ith synchronizes in each.
     LLAMA_API float * llama_get_unsampled_logits_ith(struct llama_context * ctx, int32_t i);
+
+    // The argmax output: with it on, a model whose output head a tensor split can split by rows (DeepSeek-V4.1 today)
+    // computes each output row's first max on the devices, the greedy sampler's pick (the lowest index on a tie, token 0
+    // when the row's first logit is a NaN), instead of the row's logits, and llama_get_argmax_ith returns it. The logits
+    // of such a decode are not computed: llama_get_logits, llama_get_logits_ith and llama_get_unsampled_logits_ith
+    // return NULL for them. For any other model, or without a tensor split, the logits are computed as usual and
+    // llama_get_argmax_ith takes their first max. The pick is the raw logits' first max: no sampler bias (suppressed
+    // tokens, a logit bias) applies. llama_get_argmax_ith returns LLAMA_TOKEN_NULL for a row a backend sampler sampled
+    // (it has no raw logits; read the backend sampler's token) and for an invalid id. Changing the mode rebuilds the
+    // graph.
+    LLAMA_API void        llama_set_argmax_output(struct llama_context * ctx, bool on);
+    LLAMA_API llama_token llama_get_argmax_ith(struct llama_context * ctx, int32_t i);
 
     //
     // Vocab

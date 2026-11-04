@@ -83,6 +83,8 @@ struct llama_context {
 
     float * get_logits();
     float * get_logits_ith(int32_t i);
+    void        set_argmax_output(bool on);
+    llama_token get_argmax_ith(int32_t i);
 
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
@@ -363,6 +365,13 @@ private:
     };
 
     std::vector<swap_info> output_swaps;
+
+    // the argmax output (llama_set_argmax_output): one pick per output row of the last decode, valid when argmax_ready
+    // (every ubatch with outputs computed them); logits_ready is false when those ubatches computed no logits
+    std::vector<llama_token> argmax_buf;
+    bool argmax_ready = false;
+    bool logits_ready = true;
+    bool argmax_copies_pending = false; // picks copied asynchronously since the last synchronize
 
     ggml_backend_sched_ptr sched;
     // LLAMA_GRAPH_SLOTS=2: the scheduler of the graph slot not in use, swapped with sched when the slot changes
