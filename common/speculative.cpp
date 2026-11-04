@@ -1588,6 +1588,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // zeros, as at position 0.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
     std::vector<llama_pos>          pending_pos; // [n_seq]
+    // prev_h holds the target's state at prev_pos, the position before pending_pos (-1: none). A caller that restores
+    // a state and then replays its last token (llama-server resumes a sliding-window checkpoint at its pos_max) pairs
+    // that token with the state before it.
+    std::vector<std::vector<float>> prev_h;   // [n_seq][n_embd]
+    std::vector<llama_pos>          prev_pos; // [n_seq]
+    // whether the token at pending_pos is an image token. An M-RoPE image's tokens share pos[0], and the text after it
+    // advances by the image's height or width, so positions across an image do not step by one.
+    std::vector<bool>               pending_embd; // [n_seq]
+    // the state that the first token of the last process() batch paired with: the one before verify_pos_first
+    std::vector<std::vector<float>> verify_prev_h;   // [n_seq][n_embd]
+    std::vector<llama_pos>          verify_prev_pos; // [n_seq]
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
@@ -1669,6 +1680,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
         pending_pos.assign(n_seq, -1);
+        prev_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        prev_pos.assign(n_seq, -1);
+        pending_embd.assign(n_seq, false);
+        verify_prev_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        verify_prev_pos.assign(n_seq, -1);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1679,10 +1695,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_pos_first.assign(n_seq, -1);
     }
 
-    // the hidden state that precedes position `pos` in sequence `seq_id`: pending_h when it is the target's state at
-    // pos - 1, else zeros, as before a sequence's first token
-    void pending_for(llama_seq_id seq_id, llama_pos pos) {
+    // the hidden state that precedes position `pos` in sequence `seq_id`, for a token that is an image token when
+    // `embd`: pending_h when it is the target's state at pos - 1, or across an image's tokens; prev_h when the caller
+    // replays the token at pending_pos; else zeros, as before a sequence's first token
+    void pending_for(llama_seq_id seq_id, llama_pos pos, bool embd = false) {
         if (pending_pos[seq_id] + 1 == pos) {
+            return;
+        }
+        // a prompt never resumes inside an image, so next to an image token a position that does not go back
+        // continues the same prompt
+        if ((pending_embd[seq_id] || embd) && pending_pos[seq_id] >= 0 && pos >= pending_pos[seq_id]) {
+            return;
+        }
+        if (prev_pos[seq_id] >= 0 && prev_pos[seq_id] + 1 == pos) {
+            pending_h[seq_id].swap(prev_h[seq_id]);
+            pending_pos[seq_id]  = prev_pos[seq_id];
+            pending_embd[seq_id] = false;
+            prev_pos[seq_id]     = -1;
             return;
         }
         if (pos > 0) {
@@ -1690,7 +1719,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     (int) seq_id, (int) pos, (int) pending_pos[seq_id]);
         }
         std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
-        pending_pos[seq_id] = pos - 1;
+        pending_pos[seq_id]  = pos - 1;
+        pending_embd[seq_id] = false;
+        prev_pos[seq_id]     = -1;
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1773,7 +1804,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (i_batch_beg[seq_id] >= 0) {
-                    pending_for(seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0]);
+                    const auto & t0 = batch_in.tokens[i_batch_beg[seq_id]];
+                    pending_for(seq_id, t0.pos[0], t0.id == LLAMA_TOKEN_NULL);
                 }
             }
 
@@ -1840,27 +1872,46 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
+            // the state the batch's first token paired with, and the state before the batch's last token
+            verify_prev_h[seq_id]   = pending_h[seq_id];
+            verify_prev_pos[seq_id] = pending_pos[seq_id];
+            if (n_rows >= 2) {
+                std::memcpy(prev_h[seq_id].data(),
+                        verify_h[seq_id].data() + (size_t) (n_rows - 2) * n_embd, row_bytes);
+                prev_pos[seq_id] = batch_in.tokens[i_batch_end[seq_id] - 1].pos[0];
+            } else {
+                prev_h[seq_id]   = pending_h[seq_id];
+                prev_pos[seq_id] = pending_pos[seq_id];
+            }
+
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
             verify_pos_first[seq_id] = batch_in.tokens[i_batch_beg[seq_id]].pos[0];
             pending_pos[seq_id]      = batch_in.tokens[i_batch_end[seq_id]].pos[0];
+            pending_embd[seq_id]     = batch_in.tokens[i_batch_end[seq_id]].id == LLAMA_TOKEN_NULL;
         }
 
         return true;
     }
 
-    // the sequence's pending hidden state and its position, to restore with set_state() when the caller cuts the
-    // cache back to pos + 1 (e.g. restoring a prompt checkpoint saved with it)
+    // the sequence's pending hidden state and its position, with the state before it, to restore with set_state()
+    // when the caller cuts the cache back to pos + 1, or to pos to replay its last token (e.g. restoring a prompt
+    // checkpoint saved with it)
     bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos[seq_id] < 0) {
             return false;
         }
-        const llama_pos pos = pending_pos[seq_id];
-        const int32_t   n   = n_embd;
-        data.resize(sizeof(pos) + sizeof(n) + (size_t) n_embd * sizeof(float));
-        std::memcpy(data.data(), &pos, sizeof(pos));
-        std::memcpy(data.data() + sizeof(pos), &n, sizeof(n));
-        std::memcpy(data.data() + sizeof(pos) + sizeof(n), pending_h[seq_id].data(), (size_t) n_embd * sizeof(float));
+        const llama_pos pos  = pending_pos[seq_id];
+        const int32_t   n    = n_embd;
+        const llama_pos prev = prev_pos[seq_id] + 1 == pos ? prev_pos[seq_id] : -1;
+        const size_t    row  = (size_t) n_embd * sizeof(float);
+        data.resize(sizeof(pos) + sizeof(n) + row + sizeof(prev) + row);
+        uint8_t * out = data.data();
+        std::memcpy(out, &pos, sizeof(pos));                      out += sizeof(pos);
+        std::memcpy(out, &n, sizeof(n));                          out += sizeof(n);
+        std::memcpy(out, pending_h[seq_id].data(), row);          out += row;
+        std::memcpy(out, &prev, sizeof(prev));                    out += sizeof(prev);
+        std::memcpy(out, prev_h[seq_id].data(), row);
         return true;
     }
 
@@ -1868,22 +1919,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
-        llama_pos pos = -1;
-        int32_t   n   = 0;
-        if (data.size() != sizeof(pos) + sizeof(n) + (size_t) n_embd * sizeof(float)) {
+        llama_pos    pos  = -1;
+        int32_t      n    = 0;
+        llama_pos    prev = -1;
+        const size_t row  = (size_t) n_embd * sizeof(float);
+        if (data.size() != sizeof(pos) + sizeof(n) + row + sizeof(prev) + row) {
             SPC_WRN("seq %d: a saved state of %zu bytes does not fit this head (n_embd %d); not restored\n",
                     (int) seq_id, data.size(), (int) n_embd);
             return;
         }
-        std::memcpy(&pos, data.data(), sizeof(pos));
-        std::memcpy(&n, data.data() + sizeof(pos), sizeof(n));
-        if (n != n_embd || pos < 0) {
-            SPC_WRN("seq %d: a saved state for n_embd %d at position %d does not fit this head (n_embd %d); not restored\n",
-                    (int) seq_id, (int) n, (int) pos, (int) n_embd);
+        const uint8_t * in = data.data();
+        std::memcpy(&pos, in, sizeof(pos));
+        std::memcpy(&n, in + sizeof(pos), sizeof(n));
+        std::memcpy(&prev, in + sizeof(pos) + sizeof(n) + row, sizeof(prev));
+        if (n != n_embd || pos < 0 || (prev != -1 && prev + 1 != pos)) {
+            SPC_WRN("seq %d: a saved state for n_embd %d at position %d (before it %d) does not fit this head (n_embd %d); not restored\n",
+                    (int) seq_id, (int) n, (int) pos, (int) prev, (int) n_embd);
             return;
         }
-        pending_pos[seq_id] = pos;
-        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(pos) + sizeof(n), (size_t) n_embd * sizeof(float));
+        pending_pos[seq_id]  = pos;
+        pending_embd[seq_id] = false;
+        prev_pos[seq_id]     = prev;
+        std::memcpy(pending_h[seq_id].data(), in + sizeof(pos) + sizeof(n), row);
+        std::memcpy(prev_h[seq_id].data(), in + sizeof(pos) + sizeof(n) + row + sizeof(prev), row);
     }
 
     // a context shift moves the tokens at [p0, p1) by delta; pending_h still holds the same token's hidden state, so its
@@ -1900,6 +1958,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
                 pending_pos[seq_id] = -1;
             }
+        }
+        if (moves(prev_pos[seq_id])) {
+            prev_pos[seq_id] += delta;
+        }
+        // the state before pending_pos stays only while it is still right before it
+        if (prev_pos[seq_id] < 0 || prev_pos[seq_id] + 1 != pending_pos[seq_id]) {
+            prev_pos[seq_id] = -1;
         }
         if (moves(verify_pos_first[seq_id])) {
             verify_pos_first[seq_id] = std::max<llama_pos>(verify_pos_first[seq_id] + delta, -1);
@@ -2085,8 +2150,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (i_h >= 1) {
+            std::memcpy(prev_h[seq_id].data(), verify_h[seq_id].data() + (size_t) (i_h - 1) * n_embd, row_bytes);
+            prev_pos[seq_id] = verify_pos_first[seq_id] + i_h - 1;
+        } else {
+            prev_h[seq_id]   = verify_prev_h[seq_id];
+            prev_pos[seq_id] = verify_prev_pos[seq_id];
+        }
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
-        pending_pos[seq_id] = verify_pos_first[seq_id] + i_h;
+        pending_pos[seq_id]  = verify_pos_first[seq_id] + i_h;
+        pending_embd[seq_id] = false;
     }
 };
 
