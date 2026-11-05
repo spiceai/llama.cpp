@@ -425,6 +425,8 @@ struct ggml_backend_meta_simple_tensor_container {
     bool                                       can_spill = false;
     ggml_init_params                           params    = {};
     std::vector<std::vector<ggml_context_ptr>> spill;
+    // how many times the container has been reset: a split that points into it is valid only while this is unchanged
+    uint64_t                                   generation = 0;
 
     ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple, bool can_spill = false)
         : can_spill(can_spill), params(params), spill(n_simple) {
@@ -456,6 +458,7 @@ struct ggml_backend_meta_simple_tensor_container {
             s.clear();
         }
         simple_tensors.clear();
+        generation++;
     }
 };
 
@@ -2090,6 +2093,14 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
+    // a meta buffer's compute container that a split's simple tensors are in, and that container's generation when the
+    // split was built
+    struct split_container {
+        ggml_backend_buffer_t buffer;
+        int                   index;
+        uint64_t              generation;
+    };
+
     // the split of a graph that is not the active one, and the simple tensor clones its subgraphs point at
     struct graph_slot {
         std::vector<std::vector<cgraph_config>> cgraphs; // per backend
@@ -2103,9 +2114,11 @@ struct ggml_backend_meta_context {
         size_t                                  n_subgraphs   = 0;
         uint64_t                                uid           = 0;
         bool                                    cloned        = false;
+        std::vector<split_container>            containers;
     };
     ggml_context_ptr ctx_clones;
     bool             cloned = false; // the active split points only at slot-owned clones, weights and graph tensors
+    std::vector<split_container> split_containers; // the containers the active split points into, unless it is cloned
 
     // A context that alternates between two schedulers (llama.cpp's LLAMA_GRAPH_SLOTS=2) computes graphs allocated in
     // two compute buffers here. A scheduler reuses only the graph it allocated last, so one split is kept per compute
@@ -2136,6 +2149,7 @@ struct ggml_backend_meta_context {
         std::swap(n_subgraphs,   s.n_subgraphs);
         std::swap(uid,           s.uid);
         std::swap(cloned,        s.cloned);
+        std::swap(split_containers, s.containers);
     }
 
     // drops what is kept for a compute buffer that is being freed: its parked split, or the active split's claim
@@ -2454,7 +2468,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     // A split built before graphs came from several buffers points into the rotating compute containers, so while they
     // do it is rebuilt from clones.
-    const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid) ||
+    // A split reused without a rebuild points at the simple tensors of its graph's views as they were when it was built,
+    // in each buffer's compute container of the time. Another backend whose graphs view the same buffer (a drafter that
+    // views the target's output head) rotates that buffer's containers when its own graphs are rebuilt, and its second
+    // rebuild resets the container this split points into and gives the memory to its own views. Such a split is rebuilt,
+    // which makes its views again. A split built from clones points into no container.
+    bool containers_reset = false;
+    if (!backend_ctx->cloned && cgraph->uid != 0 && cgraph->uid == backend_ctx->uid) {
+        for (const auto & sc : backend_ctx->split_containers) {
+            const auto * buf_ctx = (const ggml_backend_meta_buffer_context *) sc.buffer->context;
+            if (buf_ctx->stc_compute[sc.index].generation != sc.generation) {
+                containers_reset = true;
+                break;
+            }
+        }
+    }
+
+    const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid) || containers_reset ||
                                (graph_slots && !backend_ctx->cloned);
 
     bool max_nnodes_raised = false;
@@ -2486,6 +2516,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
             ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
             stc.reset();
+        }
+        // The split's subgraphs point at the simple tensors of its nodes and of their sources, which are found, or made
+        // again, in each buffer's current container unless they are static. A source can be a view made in an earlier
+        // graph of the scheduler's (a split's graph has no leafs), in a buffer none of this graph's nodes is in. The
+        // buffers recorded are those holding such a tensor outside their static container. They are buffers of the
+        // graph with this uid, so they outlive every compute of it.
+        {
+            std::set<ggml_backend_buffer_t> transient;
+            auto note = [&](const ggml_tensor * t) {
+                if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
+                    return;
+                }
+                const auto * buf_ctx = (const ggml_backend_meta_buffer_context *) t->buffer->context;
+                if (buf_ctx->stc_static.simple_tensors.find(t) == buf_ctx->stc_static.simple_tensors.end()) {
+                    transient.insert(t->buffer);
+                }
+            };
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                const ggml_tensor * node = cgraph->nodes[i];
+                note(node);
+                for (int k = 0; k < GGML_MAX_SRC; k++) {
+                    note(node->src[k]);
+                }
+            }
+            backend_ctx->split_containers.clear();
+            for (ggml_backend_buffer_t buf : transient) {
+                const auto * buf_ctx = (const ggml_backend_meta_buffer_context *) buf->context;
+                backend_ctx->split_containers.push_back(
+                    {buf, buf_ctx->stc_compute_index, buf_ctx->stc_compute[buf_ctx->stc_compute_index].generation});
+            }
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;

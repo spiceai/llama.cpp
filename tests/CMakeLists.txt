@@ -359,6 +359,9 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # drives the meta backend's graph slots from two backends on two threads; a race detector is its real judge
     llama_build_and_test(test-meta-graph-slots.cpp LINK ggml)
     target_include_directories(test-meta-graph-slots PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    # a graph a meta backend computes again must keep its own views of a buffer another backend's graphs also view
+    llama_build_and_test(test-meta-shared-views.cpp LINK ggml)
+    target_include_directories(test-meta-shared-views PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     # reads tensors split in segments across two slices of the CPU device, including a slice with no data
     llama_build_and_test(test-meta-async-read.cpp LINK ggml)
     target_include_directories(test-meta-async-read PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
