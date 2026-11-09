@@ -3288,13 +3288,18 @@ static void rpc_comm_mesh_share(int64_t ne, uint32_t world, uint32_t r, int64_t 
     count = std::min<int64_t>(ne, first + per) - first;
 }
 
-// A reduce-scatter, then an all-gather: rank r receives every peer's floats of its own share (rpc_comm_mesh_share), sums
-// them with its own in rank order, ((p0 + p1) + p2) + ..., and sends that sum to every peer, while it receives the sum of
-// every other share from the rank it belongs to. Every rank ends with the same bits as when each sums every partial
-// whole, in the same order, but each sends, receives and sums a share instead of the whole partial. Both phases go as
-// pieces of at most RPC_COMM_MESH_EAGER_BYTES, each sent to every peer before any is received, as the chunked exchange
-// does, so a link never holds more than two unread pieces. Every piece goes behind the partial's rpc_comm_part_hdr, so
-// a peer on another all-reduce, or with a partial of another size, fails at its first piece.
+// A reduce-scatter, then an all-gather: rank r receives every peer's floats of its own share (rpc_comm_mesh_share),
+// sums them with its own in rank order, ((p0 + p1) + p2) + ..., and sends that sum to every peer, while it receives the
+// sum of every other share from the rank it belongs to. Every rank ends with the same bits as when each sums every
+// partial whole, in the same order, but each sends, receives and sums a share instead of the whole partial. Both phases
+// go as pieces of at most RPC_COMM_MESH_EAGER_BYTES, each sent to every peer before any is received, as the chunked
+// exchange does. A link then holds at most two unread pieces, as there, plus one more where the shares differ in their
+// number of pieces: a rank with nothing to receive in a phase's last round sends that round's pieces and goes on to
+// send the first piece of the next phase, or of the next all-reduce, before its peers have read either. That extra
+// piece is the difference between two shares, under 17 x world floats, so a link holds at most 12 messages (5 for each
+// full piece behind its header, 2 for the short one) of the 24 the RDMA transport keeps posted. Every piece goes behind
+// the partial's rpc_comm_part_hdr, so a peer on another all-reduce, or with a partial of another size, fails at its
+// first piece.
 static bool rpc_comm_mesh_scatter_gather(const std::vector<socket_ptr> & peers, uint32_t rank, uint32_t world,
                                          const rpc_comm_part_hdr & hdr, const float * own,
                                          std::vector<std::vector<uint8_t>> & parts, float * sum, bool defer) {
