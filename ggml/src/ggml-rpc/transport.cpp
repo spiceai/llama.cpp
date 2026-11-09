@@ -69,7 +69,7 @@ using rdma_gid_t = std::array<uint8_t, RDMA_GID_SIZE>;
 static constexpr size_t RDMA_CHUNK    = 256 * 1024;   // 256 KiB per send/recv; a connection registers 28, 7 MiB
 static constexpr int    RDMA_RX_DEPTH = 24;            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
 // send buffers of RDMA_CHUNK each: a message longer than one chunk keeps this many in flight instead of waiting for each
-// chunk's completion before copying the next, so the link stays busy while the next chunk is copied. 4 × 256 KiB holds a
+// chunk's completion before copying the next, so the link stays busy while the next chunk is copied. 4 x 256 KiB holds a
 // whole RPC_COMM_MESH_EAGER_BYTES piece, so a rank posts a piece to every peer before any of them has acknowledged it.
 static constexpr int    RDMA_TX_DEPTH = 4;
 // keep polling the CQ for this long after the last activity, then sleep until the next completion
@@ -85,7 +85,7 @@ struct rdma_conn {
 
     std::chrono::steady_clock::time_point last_active; // last completion or posted send
 
-    void          * tx_buf = nullptr; // RDMA_TX_DEPTH × RDMA_CHUNK contiguous
+    void          * tx_buf = nullptr; // RDMA_TX_DEPTH x RDMA_CHUNK contiguous
     struct ibv_mr * tx_mr  = nullptr;
 
     void          * rx_buf = nullptr; // RDMA_RX_DEPTH × RDMA_CHUNK contiguous
