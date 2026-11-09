@@ -183,15 +183,19 @@ int main(int argc, char ** argv) {
         return 2;
     }
     int failures = run(endpoints, 1234);
-    // the two-rank comms are of the first two endpoints, so they keep only GGML_RPC_COMM_HOSTS's entries for rank 1: a
-    // map of where every rank reaches the others names ranks a two-rank mesh does not have, and the mesh refuses it
+    // the two-rank comms are of the first two endpoints, so they drop GGML_RPC_COMM_HOSTS's entries for ranks 2 and up: a
+    // map of where every rank reaches the others names ranks a two-rank mesh does not have, and the mesh refuses it. An
+    // entry is read as rpc_comm_mesh_hosts reads it; one that does not parse stays, so the comm reports it as before.
     if (const char * hosts = getenv("GGML_RPC_COMM_HOSTS")) {
         std::string kept;
         const std::string all = hosts;
         for (size_t start = 0; start <= all.size();) {
             const size_t end   = std::min(all.find(',', start), all.size());
             const std::string entry = all.substr(start, end - start);
-            if (entry.rfind("1:", 0) == 0) {
+            unsigned i = 0, j = 0;
+            int consumed = 0;
+            const bool other_rank = sscanf(entry.c_str(), "%u:%u=%n", &i, &j, &consumed) == 2 && consumed > 0 && i >= 2;
+            if (!entry.empty() && !other_rank) {
                 kept += (kept.empty() ? "" : ",") + entry;
             }
             start = end + 1;
