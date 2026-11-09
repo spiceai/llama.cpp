@@ -66,8 +66,12 @@ using rdma_gid_t = std::array<uint8_t, RDMA_GID_SIZE>;
 #endif // GGML_RPC_RDMA
 
 #if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
-static constexpr size_t RDMA_CHUNK    = 256 * 1024;   // 256 KiB per send/recv (fits default 8 MiB memlock)
+static constexpr size_t RDMA_CHUNK    = 256 * 1024;   // 256 KiB per send/recv; a connection registers 28, 7 MiB
 static constexpr int    RDMA_RX_DEPTH = 24;            // pre-posted recv ring: 24 × 256 KiB = 6 MiB
+// send buffers of RDMA_CHUNK each: a message longer than one chunk keeps this many in flight instead of waiting for each
+// chunk's completion before copying the next, so the link stays busy while the next chunk is copied. 4 × 256 KiB holds a
+// whole RPC_COMM_MESH_EAGER_BYTES piece, so a rank posts a piece to every peer before any of them has acknowledged it.
+static constexpr int    RDMA_TX_DEPTH = 4;
 // keep polling the CQ for this long after the last activity, then sleep until the next completion
 static constexpr auto   RDMA_SPIN_TIME = std::chrono::milliseconds(100);
 
@@ -81,7 +85,7 @@ struct rdma_conn {
 
     std::chrono::steady_clock::time_point last_active; // last completion or posted send
 
-    void          * tx_buf = nullptr;
+    void          * tx_buf = nullptr; // RDMA_TX_DEPTH × RDMA_CHUNK contiguous
     struct ibv_mr * tx_mr  = nullptr;
 
     void          * rx_buf = nullptr; // RDMA_RX_DEPTH × RDMA_CHUNK contiguous
@@ -90,16 +94,22 @@ struct rdma_conn {
 
     uint32_t        max_inline = 0;
 
-    // sends posted by send_data_deferred and not yet completed, oldest first; completions of one queue pair arrive in
-    // order, so the oldest pending send is the one the next send completion retires
-    static constexpr int MAX_PENDING = 4;      // the queue pair's max_send_wr
-    bool            pend_tx[MAX_PENDING] = {}; // whether that send reads tx_buf
+    // posted sends not yet completed, oldest first; completions of one queue pair arrive in order, so the oldest pending
+    // send is the one the next send completion retires. Send buffers are taken in posting order and freed in completion
+    // order, so the oldest buffer in use is always the one the oldest pending copied send reads.
+    static constexpr int MAX_PENDING = 2 * RDMA_TX_DEPTH; // the queue pair's max_send_wr
+    bool            pend_tx[MAX_PENDING] = {}; // whether that send reads a send buffer (inline sends do not)
     int             pend_head  = 0;
     int             pend_count = 0;
-    bool            tx_busy    = false;        // a pending send still reads tx_buf
+    int             tx_next    = 0;            // the send buffer the next copied send takes
+    int             tx_used    = 0;            // send buffers pending sends still read
 
     uint8_t * rx_slot(int i) const {
         return static_cast<uint8_t *>(rx_buf) + static_cast<size_t>(i) * RDMA_CHUNK;
+    }
+
+    uint8_t * tx_slot(int i) const {
+        return static_cast<uint8_t *>(tx_buf) + static_cast<size_t>(i) * RDMA_CHUNK;
     }
 
     bool post_rx(int i) {
@@ -170,6 +180,7 @@ struct socket_t::impl {
     bool rdma_probe();
     bool rdma_send(const void * data, size_t size);
     bool rdma_send_deferred(const void * data, size_t size);
+    bool rdma_post_chunk(const void * data, size_t size);
     bool rdma_reap_send();
     bool rdma_recv(void * data, size_t size);
     bool tcp_peer_closed();
@@ -431,7 +442,7 @@ bool socket_t::impl::rdma_probe() {
 
     // without a completion channel rdma_poll() spins all the time, as before
     rdma->ch  = ibv_create_comp_channel(ibctx);
-    rdma->scq = ibv_create_cq(ibctx, 16, nullptr, rdma->ch, 0);
+    rdma->scq = ibv_create_cq(ibctx, 2 * rdma_conn::MAX_PENDING, nullptr, rdma->ch, 0);
     rdma->rcq = ibv_create_cq(ibctx, RDMA_RX_DEPTH + 4, nullptr, rdma->ch, 0);
     if (!rdma->scq || !rdma->rcq) return false;
 
@@ -439,7 +450,7 @@ bool socket_t::impl::rdma_probe() {
     qia.send_cq = rdma->scq;
     qia.recv_cq = rdma->rcq;
     qia.qp_type = IBV_QPT_RC;
-    qia.cap.max_send_wr     = 4;
+    qia.cap.max_send_wr     = rdma_conn::MAX_PENDING;
     qia.cap.max_recv_wr     = RDMA_RX_DEPTH + 4;
     qia.cap.max_send_sge    = 1;
     qia.cap.max_recv_sge    = 1;
@@ -449,11 +460,11 @@ bool socket_t::impl::rdma_probe() {
     if (!rdma->qp) return false;
     rdma->max_inline = qia.cap.max_inline_data;
 
-    rdma->tx_buf = aligned_alloc(4096, RDMA_CHUNK);
+    rdma->tx_buf = aligned_alloc(4096, static_cast<size_t>(RDMA_TX_DEPTH) * RDMA_CHUNK);
     rdma->rx_buf = aligned_alloc(4096, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK);
     if (!rdma->tx_buf || !rdma->rx_buf) return false;
 
-    rdma->tx_mr = ibv_reg_mr(rdma->pd, rdma->tx_buf, RDMA_CHUNK, IBV_ACCESS_LOCAL_WRITE);
+    rdma->tx_mr = ibv_reg_mr(rdma->pd, rdma->tx_buf, static_cast<size_t>(RDMA_TX_DEPTH) * RDMA_CHUNK, IBV_ACCESS_LOCAL_WRITE);
     rdma->rx_mr = ibv_reg_mr(rdma->pd, rdma->rx_buf, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK,
                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!rdma->tx_mr || !rdma->rx_mr) return false;
@@ -622,27 +633,25 @@ bool socket_t::impl::rdma_poll(struct ibv_cq * cq, struct ibv_wc * wc,
     }
 }
 
-// retires the oldest deferred send: waits for its completion
+// retires the oldest pending send: waits for its completion
 bool socket_t::impl::rdma_reap_send() {
     rdma_conn * c = rdma.get();
     struct ibv_wc wc;
     if (!rdma_poll(c->scq, &wc)) return false;
     if (c->pend_tx[c->pend_head]) {
-        c->tx_busy = false;
+        c->tx_used--;
     }
     c->pend_head = (c->pend_head + 1) % rdma_conn::MAX_PENDING;
     c->pend_count--;
     return true;
 }
 
-// posts one message and returns before it completes; the completion is waited for when the queue or tx_buf is needed
-// again, or by the next blocking send. A failure of the posted send is reported by that later wait.
-bool socket_t::impl::rdma_send_deferred(const void * data, size_t size) {
+// posts one message of at most RDMA_CHUNK bytes and returns before it completes: inline when it fits, else copied into
+// the next free send buffer, waiting for the oldest pending send only when the send queue or every send buffer is taken
+bool socket_t::impl::rdma_post_chunk(const void * data, size_t size) {
     rdma_conn * c = rdma.get();
-    if (size > RDMA_CHUNK) {
-        return rdma_send(data, size);
-    }
-    while (c->pend_count >= rdma_conn::MAX_PENDING) {
+    const bool inline_send = size <= c->max_inline;
+    while (c->pend_count >= rdma_conn::MAX_PENDING || (!inline_send && c->tx_used >= RDMA_TX_DEPTH)) {
         if (!rdma_reap_send()) return false;
     }
     struct ibv_sge sge = {};
@@ -651,64 +660,48 @@ bool socket_t::impl::rdma_send_deferred(const void * data, size_t size) {
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.send_flags = IBV_SEND_SIGNALED;
-    const bool inline_send = size <= c->max_inline;
     if (inline_send) {
         sge.addr   = (uintptr_t)data;
         sge.length = size;
         wr.send_flags |= IBV_SEND_INLINE;
     } else {
-        while (c->tx_busy) {
-            if (!rdma_reap_send()) return false;
-        }
-        memcpy(c->tx_buf, data, size);
-        sge.addr   = (uintptr_t)c->tx_buf;
+        uint8_t * buf = c->tx_slot(c->tx_next);
+        memcpy(buf, data, size);
+        sge.addr   = (uintptr_t)buf;
         sge.length = size;
         sge.lkey   = c->tx_mr->lkey;
-        c->tx_busy = true;
     }
     if (ibv_post_send(c->qp, &wr, &bad) != 0) return false;
+    if (!inline_send) {
+        c->tx_next = (c->tx_next + 1) % RDMA_TX_DEPTH;
+        c->tx_used++;
+    }
     c->last_active = std::chrono::steady_clock::now();
     c->pend_tx[(c->pend_head + c->pend_count) % rdma_conn::MAX_PENDING] = !inline_send;
     c->pend_count++;
     return true;
 }
 
-bool socket_t::impl::rdma_send(const void * data, size_t size) {
-    rdma_conn * c = rdma.get();
-    // a deferred send's completion would otherwise be taken for this one's
-    while (c->pend_count > 0) {
-        if (!rdma_reap_send()) return false;
-    }
+// posts a message, as messages of at most RDMA_CHUNK bytes, and returns before they complete; the completions are waited
+// for when the send queue or the send buffers are needed again, or by the next blocking send. A failure of a posted send
+// is reported by that later wait.
+bool socket_t::impl::rdma_send_deferred(const void * data, size_t size) {
     const uint8_t * src = (const uint8_t *)data;
-    size_t rem = size;
-    while (rem > 0) {
-        size_t chunk = std::min(rem, RDMA_CHUNK);
-
-        struct ibv_sge sge = {};
-        struct ibv_send_wr wr = {}, * bad = nullptr;
-        wr.opcode  = IBV_WR_SEND;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-
-        if (chunk <= c->max_inline) {
-            sge.addr   = (uintptr_t)src;
-            sge.length = chunk;
-            wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
-        } else {
-            memcpy(c->tx_buf, src, chunk);
-            sge.addr   = (uintptr_t)c->tx_buf;
-            sge.length = chunk;
-            sge.lkey   = c->tx_mr->lkey;
-            wr.send_flags = IBV_SEND_SIGNALED;
-        }
-
-        if (ibv_post_send(c->qp, &wr, &bad) != 0) return false;
-        c->last_active = std::chrono::steady_clock::now();
-        struct ibv_wc wc;
-        if (!rdma_poll(c->scq, &wc)) return false;
-
+    for (size_t rem = size; rem > 0; ) {
+        const size_t chunk = std::min(rem, RDMA_CHUNK);
+        if (!rdma_post_chunk(src, chunk)) return false;
         src += chunk;
         rem -= chunk;
+    }
+    return true;
+}
+
+// posts a message as rdma_send_deferred does, keeping up to RDMA_TX_DEPTH chunks in flight, then waits until every send
+// posted on this connection has completed, so that a failure is reported here
+bool socket_t::impl::rdma_send(const void * data, size_t size) {
+    if (!rdma_send_deferred(data, size)) return false;
+    while (rdma->pend_count > 0) {
+        if (!rdma_reap_send()) return false;
     }
     return true;
 }
