@@ -1,6 +1,7 @@
 // The all-reduce between RPC servers, over every endpoint given (a mesh when there are more than two) and then over the
 // first two (the pairwise comm): every rank must end with the same bits, the F32 sum of the partials in rank order, for
-// a single float, a decode-sized partial, one above the mesh's eager threshold, and one larger than a socket's buffers.
+// a single float, a decode-sized partial, one above the mesh's eager threshold, one whose reduce-scatter shares go as
+// different numbers of pieces, and one larger than a socket's buffers.
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -34,7 +35,9 @@ static int run(const std::vector<const char *> & endpoints, uint32_t seed) {
         return 1;
     }
 
-    const int64_t sizes[] = { 1, 7168, 300007, 4000037 };
+    // 786448 floats over three ranks: shares of 262160, 262160 and 262128 floats, so a reduce-scatter sends the first two
+    // shares as two pieces and the last as one
+    const int64_t sizes[] = { 1, 7168, 300007, 786448, 4000037 };
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> dist(-1000.0f, 1000.0f);
     int failures = 0;
