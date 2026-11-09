@@ -136,6 +136,12 @@ struct llama_model_loader {
 
     size_t size_done = 0;
     size_t size_data = 0;
+
+    // F32 matrix weights whose values are all BF16 values, created as BF16 and narrowed as they load:
+    // a matmul reads half the bytes and multiplies the same weights. Only for buffers this loader
+    // copies into, never for tensors that point into a mapping of the file.
+    std::set<std::string> bf16_narrowed;
+    size_t bf16_narrowed_bytes = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -221,6 +227,10 @@ struct llama_model_loader {
     const llama_tensor_weight * get_weight(const char * name) const;
 
     const llama_tensor_weight & require_weight(const char * name) const;
+
+    // whether the F32 weight t_meta, used with op and placed in buft, loads as BF16: every value is
+    // a BF16 value, buft is not a host buffer, and buft serves op at BF16
+    bool narrow_to_bf16(const llama_hparams & hparams, const ggml_tensor & t_meta, ggml_op op, ggml_backend_buffer_type_t buft, const llama_tensor_weight & w);
 
     struct ggml_tensor * get_tensor_meta(const char * name) const;
 
