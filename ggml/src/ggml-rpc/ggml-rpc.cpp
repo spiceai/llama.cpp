@@ -1948,6 +1948,7 @@ private:
         uint64_t                          seq = 0;
         bool                              mesh_eager = false; // every link is RDMA: small partials go to all peers at once
         bool                              mesh_chunked = false; // every rank agreed to send large partials in pieces
+        bool                              mesh_scatter = false; // and to reduce them by a reduce-scatter and an all-gather
         // GGML_RPC_COMM_ASYNC: the all-reduces queued on the backend's stream, exchanged by a thread of their own
         std::unique_ptr<struct rpc_comm_async, rpc_comm_async_deleter> async;
     };
@@ -3267,17 +3268,137 @@ static bool rpc_comm_mesh_chunked() {
     return mode != "0";
 }
 
+// GGML_RPC_COMM_SCATTER (on unless "0"): whether this rank wants a partial larger than RPC_COMM_MESH_EAGER_BYTES reduced
+// by a reduce-scatter and an all-gather (rpc_comm_mesh_scatter_gather) instead of every rank receiving and summing every
+// partial whole. It needs the pieces (rpc_comm_mesh_chunked), and like them it changes what goes on the wire, so the
+// ranks agree on it when the mesh forms. Only a tensor split's all-reduce reaches it.
+static bool rpc_comm_mesh_scatter() {
+    static const bool on = [] {
+        const char * e = std::getenv("GGML_RPC_COMM_SCATTER");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    return on;
+}
+
+// The floats of an all-reduce of `ne` that rank `r` of `world` sums in a reduce-scatter: [first, first + count). Every
+// rank derives the same split from the partial's size alone; each share starts on a 64-byte boundary.
+static void rpc_comm_mesh_share(int64_t ne, uint32_t world, uint32_t r, int64_t & first, int64_t & count) {
+    const int64_t per = ((ne + world - 1) / world + 15) / 16 * 16;
+    first = std::min<int64_t>(ne, (int64_t) r * per);
+    count = std::min<int64_t>(ne, first + per) - first;
+}
+
+// A reduce-scatter, then an all-gather: rank r receives every peer's floats of its own share (rpc_comm_mesh_share), sums
+// them with its own in rank order, ((p0 + p1) + p2) + ..., and sends that sum to every peer, while it receives the sum of
+// every other share from the rank it belongs to. Every rank ends with the same bits as when each sums every partial
+// whole, in the same order, but each sends, receives and sums a share instead of the whole partial. Both phases go as
+// pieces of at most RPC_COMM_MESH_EAGER_BYTES, each sent to every peer before any is received, as the chunked exchange
+// does, so a link never holds more than two unread pieces. Every piece goes behind the partial's rpc_comm_part_hdr, so
+// a peer on another all-reduce, or with a partial of another size, fails at its first piece.
+static bool rpc_comm_mesh_scatter_gather(const std::vector<socket_ptr> & peers, uint32_t rank, uint32_t world,
+                                         const rpc_comm_part_hdr & hdr, const float * own,
+                                         std::vector<std::vector<uint8_t>> & parts, float * sum, bool defer) {
+    const int64_t ne    = (int64_t) (hdr.nbytes / sizeof(float));
+    const int64_t piece = (int64_t) (RPC_COMM_MESH_EAGER_BYTES / sizeof(float));
+    std::vector<int64_t> first(world), count(world);
+    for (uint32_t r = 0; r < world; r++) {
+        rpc_comm_mesh_share(ne, world, r, first[r], count[r]);
+    }
+    auto lost = [&](uint32_t j) {
+        LOG_ERROR("[%s] rank %u lost rank %u during all-reduce %" PRIu64 "\n", __func__, rank, j, hdr.seq);
+        return false;
+    };
+    auto send = [&](uint32_t j, const float * src, int64_t n) {
+        return defer ? peers[j]->send_data_deferred(&hdr, sizeof(hdr)) && peers[j]->send_data_deferred(src, n * sizeof(float)) &&
+                           peers[j]->flush()
+                     : peers[j]->send_data(&hdr, sizeof(hdr)) && peers[j]->send_data(src, n * sizeof(float)) && peers[j]->flush();
+    };
+    auto recv = [&](uint32_t j, float * dst, int64_t n) {
+        rpc_comm_part_hdr got;
+        if (!peers[j]->recv_data(&got, sizeof(got))) {
+            return lost(j);
+        }
+        if (got.seq != hdr.seq || got.nbytes != hdr.nbytes) {
+            LOG_ERROR("[%s] rank %u expected a piece of all-reduce %" PRIu64 " of %" PRIu64 " bytes from rank %u, got one "
+                      "of all-reduce %" PRIu64 " of %" PRIu64 " bytes\n", __func__, rank, hdr.seq, hdr.nbytes, j, got.seq,
+                      got.nbytes);
+            return false;
+        }
+        return peers[j]->recv_data(dst, n * sizeof(float)) || lost(j);
+    };
+    auto wait_sends = [&]() {
+        for (uint32_t j = 0; defer && j < world; j++) {
+            if (j != rank && !peers[j]->wait_sends()) {
+                return lost(j);
+            }
+        }
+        return true;
+    };
+    // the floats of a share at piece offset `off`
+    auto piece_of = [&](uint32_t r, int64_t off) { return std::max<int64_t>(0, std::min(piece, count[r] - off)); };
+    const int64_t longest = count[0];
+    // reduce-scatter: each peer's floats of this rank's share into parts[peer], at the share's own offset
+    for (int64_t off = 0; off < longest; off += piece) {
+        for (uint32_t j = 0; j < world; j++) {
+            if (j != rank && piece_of(j, off) > 0 && !send(j, own + first[j] + off, piece_of(j, off))) {
+                return lost(j);
+            }
+        }
+        for (uint32_t j = 0; j < world; j++) {
+            if (j != rank && piece_of(rank, off) > 0 &&
+                !recv(j, (float *) parts[j].data() + first[rank] + off, piece_of(rank, off))) {
+                return false;
+            }
+        }
+        if (!wait_sends()) {
+            return false;
+        }
+    }
+    float * mine = sum + first[rank];
+    for (uint32_t j = 0; j < world; j++) {
+        const float * part = (j == rank ? own : (const float *) parts[j].data()) + first[rank];
+        if (j == 0) {
+            memcpy(mine, part, count[rank] * sizeof(float));
+            continue;
+        }
+        for (int64_t k = 0; k < count[rank]; k++) {
+            mine[k] += part[k];
+        }
+    }
+    // all-gather: this rank's summed share to every peer, every other share's sum from its rank into `sum`
+    for (int64_t off = 0; off < longest; off += piece) {
+        for (uint32_t j = 0; j < world; j++) {
+            if (j != rank && piece_of(rank, off) > 0 && !send(j, mine + off, piece_of(rank, off))) {
+                return lost(j);
+            }
+        }
+        for (uint32_t j = 0; j < world; j++) {
+            if (j != rank && piece_of(j, off) > 0 && !recv(j, sum + first[j] + off, piece_of(j, off))) {
+                return false;
+            }
+        }
+        if (!wait_sends()) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // `eager`: every link is RDMA (rpc_comm_mesh_eager), so a partial up to RPC_COMM_MESH_EAGER_BYTES may be sent to every
 // peer before any is received; `chunked`: every rank of the mesh agreed (rpc_comm_mesh_agree) to send a larger one
-// piece by piece the same way
+// piece by piece the same way; `scatter`: every rank also agreed to reduce a larger one by a reduce-scatter and an
+// all-gather (rpc_comm_mesh_scatter_gather)
 static bool rpc_comm_mesh_exchange(const std::vector<socket_ptr> & peers, uint32_t rank, uint32_t world, uint64_t seq,
                                    size_t nbytes, const uint8_t * own, std::vector<std::vector<uint8_t>> & parts, float * sum,
-                                   bool eager, bool chunked) {
+                                   bool eager, bool chunked, bool scatter) {
     const rpc_comm_part_hdr hdr = { seq, (uint64_t) nbytes };
     for (auto & part : parts) {
         if (part.size() < nbytes) {
             part.resize(nbytes);
         }
+    }
+    if (chunked && scatter && nbytes > RPC_COMM_MESH_EAGER_BYTES) {
+        return rpc_comm_mesh_scatter_gather(peers, rank, world, hdr, (const float *) own, parts, sum, rpc_comm_send_defer());
     }
     // the header first: a peer on another all-reduce, or with a partial of another size, fails here instead of being
     // read as this partial
@@ -3445,6 +3566,7 @@ struct rpc_comm_async {
     uint32_t rank = 0, world = 0;
     bool     eager = false;
     bool     chunked = false;
+    bool     scatter = false;
     bool     links_cut = false;                   // the exchange thread shut the links down after a failure
 
     ~rpc_comm_async() {
@@ -3533,7 +3655,7 @@ struct rpc_comm_async {
                 memset(out, 0, j.nbytes);
             }
             if (broken.load(std::memory_order_relaxed) ||
-                !rpc_comm_mesh_exchange(*peers, rank, world, j.seq, j.nbytes, out, *parts, in, eager, chunked)) {
+                !rpc_comm_mesh_exchange(*peers, rank, world, j.seq, j.nbytes, out, *parts, in, eager, chunked, scatter)) {
                 // the stream is released either way, so it drains; what it copies back is NaN rather than an older
                 // sum, and the server drops the client before it returns any result
                 broken.store(true, std::memory_order_release);
@@ -3583,19 +3705,28 @@ static bool rpc_comm_async_enabled() {
 static constexpr int RPC_COMM_MESH_INIT_TIMEOUT_MS = 30000;
 
 // What a rank sends every peer once the mesh has formed: whether it wants partials over RPC_COMM_MESH_EAGER_BYTES
-// exchanged in pieces. Shaped as a rpc_comm_part_hdr of sequence 0, which no all-reduce uses. A peer of a build that
-// sends none fails the agreement once the mesh's deadline passes, which bounds the receive over RDMA as over TCP.
-static constexpr uint64_t RPC_COMM_MESH_AGREE_MAGIC  = 0x434855'4e4b0000ull; // "CHUNK" in the high bytes
-static constexpr uint64_t RPC_COMM_MESH_AGREE_CHUNKS = 1u;
+// exchanged in pieces, and whether it wants them reduced by a reduce-scatter and an all-gather. Shaped as a
+// rpc_comm_part_hdr of sequence 0, which no all-reduce uses. A peer of a build that sends none fails the agreement once
+// the mesh's deadline passes, which bounds the receive over RDMA as over TCP; a peer of a build that knows no
+// RPC_COMM_MESH_AGREE_SCATTER answers its bit as something else, so a mesh of such builds fails to form instead of
+// exchanging partials two ways.
+static constexpr uint64_t RPC_COMM_MESH_AGREE_MAGIC   = 0x434855'4e4b0000ull; // "CHUNK" in the high bytes
+static constexpr uint64_t RPC_COMM_MESH_AGREE_CHUNKS  = 1u;
+static constexpr uint64_t RPC_COMM_MESH_AGREE_SCATTER = 2u;
 
-// Whether every rank of the mesh exchanges partials over RPC_COMM_MESH_EAGER_BYTES in pieces: only when each wants to,
-// which a rank does when every one of its links is RDMA and GGML_RPC_COMM_CHUNKED allows it. Every rank hears from
-// every other, so all of them reach the same answer. Pair by pair in rank order, the lower rank sending first, as the
-// pair-by-pair exchange does. Sets `agreed`; false when a peer does not answer in time or answers something else.
-static bool rpc_comm_mesh_agree(const std::vector<socket_ptr> & peers, uint32_t rank, uint32_t world, bool want,
-                                std::chrono::steady_clock::time_point deadline, bool & agreed) {
-    const rpc_comm_part_hdr mine = { 0, RPC_COMM_MESH_AGREE_MAGIC | (want ? RPC_COMM_MESH_AGREE_CHUNKS : 0) };
-    agreed = want;
+// Whether every rank of the mesh exchanges partials over RPC_COMM_MESH_EAGER_BYTES in pieces, and whether it reduces them
+// by a reduce-scatter and an all-gather: each only when every rank wants it. A rank wants the pieces when every one of
+// its links is RDMA and GGML_RPC_COMM_CHUNKED allows it, and the reduce-scatter when it wants the pieces and
+// GGML_RPC_COMM_SCATTER allows it. Every rank hears from every other, so all of them reach the same answer. Pair by pair
+// in rank order, the lower rank sending first, as the pair-by-pair exchange does. Sets `chunked` and `scatter`; false
+// when a peer does not answer in time or answers something else.
+static bool rpc_comm_mesh_agree(const std::vector<socket_ptr> & peers, uint32_t rank, uint32_t world, bool want_chunks,
+                                bool want_scatter, std::chrono::steady_clock::time_point deadline, bool & chunked,
+                                bool & scatter) {
+    const rpc_comm_part_hdr mine = { 0, RPC_COMM_MESH_AGREE_MAGIC | (want_chunks ? RPC_COMM_MESH_AGREE_CHUNKS : 0) |
+                                            (want_chunks && want_scatter ? RPC_COMM_MESH_AGREE_SCATTER : 0) };
+    chunked = want_chunks;
+    scatter = want_chunks && want_scatter;
     for (uint32_t j = 0; j < world; j++) {
         if (j == rank) {
             continue;
@@ -3611,12 +3742,14 @@ static bool rpc_comm_mesh_agree(const std::vector<socket_ptr> & peers, uint32_t 
                       "initialized; every rank must run a build that agrees on it\n", __func__, rank, j);
             return false;
         }
-        if (theirs.seq != 0 || (theirs.nbytes & ~RPC_COMM_MESH_AGREE_CHUNKS) != RPC_COMM_MESH_AGREE_MAGIC) {
+        if (theirs.seq != 0 ||
+                (theirs.nbytes & ~(RPC_COMM_MESH_AGREE_CHUNKS | RPC_COMM_MESH_AGREE_SCATTER)) != RPC_COMM_MESH_AGREE_MAGIC) {
             LOG_ERROR("[%s] rank %u: rank %u answered the mesh's agreement with something else, so the mesh comm is not "
                       "initialized; every rank must run a build that agrees on it\n", __func__, rank, j);
             return false;
         }
-        agreed = agreed && (theirs.nbytes & RPC_COMM_MESH_AGREE_CHUNKS) != 0;
+        chunked = chunked && (theirs.nbytes & RPC_COMM_MESH_AGREE_CHUNKS) != 0;
+        scatter = scatter && (theirs.nbytes & RPC_COMM_MESH_AGREE_SCATTER) != 0;
     }
     return true;
 }
@@ -3774,12 +3907,17 @@ bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_req & request, comm_stat
     state.parts.assign(world, {});
     state.mesh_eager = rpc_comm_mesh_eager(state.peers);
     const bool want_chunks = state.mesh_eager && rpc_comm_mesh_chunked();
-    if (!rpc_comm_mesh_agree(state.peers, rank, world, want_chunks, deadline, state.mesh_chunked)) {
+    if (!rpc_comm_mesh_agree(state.peers, rank, world, want_chunks, rpc_comm_mesh_scatter(), deadline, state.mesh_chunked,
+                             state.mesh_scatter)) {
         state.peers.clear();
         return false;
     }
     LOG_INFO("[%s] device %u joined a %u-rank mesh comm as rank %u\n", __func__, request.device, world, rank);
-    if (state.mesh_chunked) {
+    if (state.mesh_scatter) {
+        LOG_INFO("[%s] device %u: the mesh reduces partials over %zu bytes by a reduce-scatter and an all-gather, in "
+                 "pieces sent to every peer at once; GGML_RPC_COMM_SCATTER=0 on any rank sends every partial whole\n",
+                 __func__, request.device, RPC_COMM_MESH_EAGER_BYTES);
+    } else if (state.mesh_chunked) {
         LOG_INFO("[%s] device %u: the mesh exchanges partials over %zu bytes in pieces sent to every peer at once; "
                  "GGML_RPC_COMM_CHUNKED=0 on any rank exchanges them pair by pair\n", __func__, request.device,
                  RPC_COMM_MESH_EAGER_BYTES);
@@ -3828,7 +3966,7 @@ bool rpc_server::comm_allreduce_mesh(comm_state & state, ggml_backend_t backend,
         ggml_backend_tensor_get(t_dst, own.data(), 0, nbytes);
     }
     if (!rpc_comm_mesh_exchange(state.peers, state.rank, state.world, state.seq, nbytes, own.data(), state.parts,
-                                state.sum.data(), state.mesh_eager, state.mesh_chunked)) {
+                                state.sum.data(), state.mesh_eager, state.mesh_chunked, state.mesh_scatter)) {
         return false;
     }
     ggml_backend_tensor_set(t_dst, state.sum.data(), 0, nbytes);
@@ -3869,6 +4007,7 @@ bool rpc_server::comm_allreduce_mesh_async(comm_state & state, ggml_backend_t ba
         async->world = state.world;
         async->eager = state.mesh_eager;
         async->chunked = state.mesh_chunked;
+        async->scatter = state.mesh_scatter;
         async->start();
         state.async = std::move(async);
         LOG_INFO("[%s] rank %u queues its all-reduces on the device's stream\n", __func__, state.rank);
