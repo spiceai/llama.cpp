@@ -1128,11 +1128,115 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+// the F32 bytes of a narrowed weight read, checked and converted at a time
+static constexpr size_t NARROW_CHUNK_F32 = 16u*1024*1024;
+
+bool llama_model_loader::keeps_bf16(ggml_backend_dev_t dev) {
+    // once per device: the props of a device query its free memory (a round trip for an RPC device)
+    const auto it = bf16_kept.find(dev);
+    if (it != bf16_kept.end()) {
+        return it->second;
+    }
+    bool kept = false;
+    // with mmap, a device that can wrap host memory holds its weights in the mapping of the file (Metal), which has no
+    // BF16 copy to point at
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    const bool maps_file = use_mmap && props.caps.buffer_from_host_ptr;
+    // a backend may store BF16 at another type (OpenCL stores it as F16), and then narrowing would change the weights:
+    // 2^-30 and 2^20 lie outside F16's range, and 1 + 2^-7 needs BF16's last mantissa bit
+    const uint16_t probe[4] = { 0x3080, 0x4980, 0xb080, 0x3f81 };
+    uint16_t       back[4]  = { 0, 0, 0, 0 };
+
+    ggml_init_params params = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx { ggml_init(params) };
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    if (!maps_file && ctx && buft) {
+        ggml_tensor * t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_BF16, 4);
+        ggml_backend_buffer_ptr buf { ggml_backend_buft_alloc_buffer(buft, ggml_backend_buft_get_alloc_size(buft, t)) };
+        if (buf && ggml_backend_tensor_alloc(buf.get(), t, ggml_backend_buffer_get_base(buf.get())) == GGML_STATUS_SUCCESS) {
+            ggml_backend_tensor_set(t, probe, 0, sizeof(probe));
+            ggml_backend_tensor_get(t, back,  0, sizeof(back));
+            kept = memcmp(probe, back, sizeof(probe)) == 0;
+        }
+    }
+    if (maps_file) {
+        LLAMA_LOG_DEBUG("%s: %s holds weights in the mapped file\n", __func__, ggml_backend_dev_name(dev));
+    } else {
+        LLAMA_LOG_DEBUG("%s: %s %s BF16 values as given\n", __func__, ggml_backend_dev_name(dev), kept ? "keeps" : "does not keep");
+    }
+    bf16_kept[dev] = kept;
+    return kept;
+}
+
+bool llama_model_loader::narrow_to_bf16(const llama_hparams & hparams, const ggml_tensor & t_meta, ggml_op op, ggml_backend_buffer_type_t buft, const llama_tensor_weight & w) {
+    static const bool keep_f32 = [] {
+        const char * env = getenv("LLAMA_KEEP_F32_WEIGHTS");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    // a metadata-only load, such as the memory-fit pass, reads no weights, so its sizes stay F32's
+    if (no_alloc || keep_f32 || t_meta.type != GGML_TYPE_F32 || (op != GGML_OP_MUL_MAT && op != GGML_OP_MUL_MAT_ID) ||
+            ggml_n_dims(&t_meta) < 2 || ggml_backend_buft_is_host(buft)) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return false;
+    }
+    // the devices that hold the weight: a meta device's simple devices, each in its default buffer type, or the
+    // device itself, in its default buffer type only (not, for example, a buffer type that splits rows across devices)
+    std::vector<ggml_backend_dev_t> devs;
+    for (size_t i = 0; i < ggml_backend_meta_device_n_devs(dev); i++) {
+        devs.push_back(ggml_backend_meta_device_get_dev(dev, i));
+    }
+    if (devs.empty()) {
+        if (buft != ggml_backend_dev_buffer_type(dev)) {
+            return false;
+        }
+        devs.push_back(dev);
+    }
+    for (ggml_backend_dev_t d : devs) {
+        if (!keeps_bf16(d)) {
+            return false;
+        }
+    }
+    // the buffer type must still serve the weight's op at BF16 (an RPC device asks its server)
+    ggml_tensor bf16 = t_meta;
+    bf16.type  = GGML_TYPE_BF16;
+    bf16.nb[0] = ggml_type_size(GGML_TYPE_BF16);
+    bf16.nb[1] = ggml_row_size(GGML_TYPE_BF16, bf16.ne[0]);
+    for (int dim = 2; dim < GGML_MAX_DIMS; dim++) {
+        bf16.nb[dim] = bf16.nb[dim-1]*bf16.ne[dim-1];
+    }
+    if (!weight_buft_supported(hparams, &bf16, op, buft, dev)) {
+        return false;
+    }
+    // every value must be a BF16 value already: the low 16 bits of each float are zero; read in bounded chunks, up to
+    // the first value that is not
+    const size_t n = ggml_nbytes(&t_meta);
+    const auto & file = files.at(w.idx);
+    std::vector<uint8_t> data(std::min(n, NARROW_CHUNK_F32));
+    for (size_t done = 0; done < n; ) {
+        const size_t len = std::min(data.size(), n - done);
+        file->seek(w.offs + done, SEEK_SET);
+        file->read_raw(data.data(), len);
+        for (size_t i = 0; i < len; i += 4) {
+            if (data[i] != 0 || data[i + 1] != 0) {
+                return false;
+            }
+        }
+        done += len;
+    }
+    return true;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
+    // the op the weight is used with, set by buft_for_tensor()
+    ggml_op weight_op = GGML_OP_NONE;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         const ctx_key key { buft, is_lazy };
@@ -1211,6 +1315,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         } else {
             op = info.op;
         }
+        weight_op = op;
 
         // sanity checks
         if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
@@ -1388,6 +1493,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return nullptr;
     }
 
+    if (!is_lazy && !(flags & TENSOR_DUPLICATED) && narrow_to_bf16(hparams, t_meta, weight_op, buft, require_weight(tn.str().c_str()))) {
+        t_meta.type = GGML_TYPE_BF16;
+        t_meta.nb[0] = ggml_type_size(GGML_TYPE_BF16);
+        t_meta.nb[1] = ggml_row_size(GGML_TYPE_BF16, t_meta.ne[0]);
+        for (int dim = 2; dim < GGML_MAX_DIMS; dim++) {
+            t_meta.nb[dim] = t_meta.nb[dim-1]*t_meta.ne[dim-1];
+        }
+        if (bf16_narrowed.insert(tn.str()).second) {
+            bf16_narrowed_bytes += ggml_nbytes(&t_meta);
+        }
+    }
+
     ggml_context * ctx = ctx_for_buft(buft);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
@@ -1422,6 +1539,10 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
         }
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
                 __func__, n_created, n_tensors);
+    }
+    if (!bf16_narrowed.empty()) {
+        LLAMA_LOG_INFO("%s: %zu F32 weights hold only BF16 values and load as BF16 (%.1f MiB instead of %.1f MiB); set LLAMA_KEEP_F32_WEIGHTS=1 to keep them F32\n",
+            __func__, bf16_narrowed.size(), bf16_narrowed_bytes/1024.0/1024.0, 2*bf16_narrowed_bytes/1024.0/1024.0);
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
@@ -1705,6 +1826,8 @@ bool llama_model_loader::load_all_data(
 
     // staging buffer for non-host buffers without async uploads, reused because a fresh allocation per tensor page faults on every load
     std::vector<no_init<uint8_t>> read_buf;
+    // the chunks of weights narrowed to BF16 as they load
+    std::vector<no_init<uint8_t>> narrow_buf;
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1719,6 +1842,49 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // an F32 weight created as BF16 (narrow_to_bf16): a tensor of the same name may be another, F32 instance of it,
+        // so the tensor's own type decides
+        if (cur->type == GGML_TYPE_BF16 && weight->tensor->type == GGML_TYPE_F32) {
+            GGML_ASSERT(cur->buffer != nullptr && !ggml_backend_buffer_is_host(cur->buffer));
+            const size_t    f32_size = 2*n_size;
+            const uint8_t * mapped   = use_mmap ? (const uint8_t *) mappings.at(weight->idx)->addr() + weight->offs : nullptr;
+            // the high half of each float: the F32 is read a bounded chunk at a time, and the BF16 is uploaded a chunk at
+            // a time too, except to a meta (split) buffer, which takes only whole slices along the split axis, so there
+            // the tensor is converted whole and uploaded once
+            const ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer));
+            const bool   whole      = dev != nullptr && ggml_backend_meta_device_n_devs(dev) > 0;
+            const size_t bf16_space = whole ? n_size : NARROW_CHUNK_F32/2;
+            narrow_buf.resize(bf16_space + (mapped ? 0 : NARROW_CHUNK_F32));
+            uint8_t * bf16_buf = (uint8_t *) narrow_buf.data();
+            uint8_t * f32_read = bf16_buf + bf16_space;
+            for (size_t done = 0; done < f32_size; ) {
+                const size_t len = std::min(NARROW_CHUNK_F32, f32_size - done);
+                const uint8_t * f32 = mapped ? mapped + done : f32_read;
+                if (!mapped) {
+                    const auto & file = files.at(weight->idx);
+                    file->seek(weight->offs + done, SEEK_SET);
+                    file->read_raw(f32_read, len);
+                }
+                uint8_t * bf16 = whole ? bf16_buf + done/2 : bf16_buf;
+                for (size_t i = 0, j = 0; i < len; i += 4, j += 2) {
+                    bf16[j]     = f32[i + 2];
+                    bf16[j + 1] = f32[i + 3];
+                }
+                if (check_tensors && !ggml_validate_row_data(cur->type, bf16, len/2)) {
+                    throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                }
+                if (!whole) {
+                    ggml_backend_tensor_set(cur, bf16, done/2, len/2);
+                }
+                done += len;
+            }
+            if (whole) {
+                ggml_backend_tensor_set(cur, bf16_buf, 0, n_size);
+            }
+            size_done += f32_size;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 

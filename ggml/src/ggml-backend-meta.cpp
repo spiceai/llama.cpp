@@ -217,6 +217,14 @@ static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t me
     return meta_dev_ctx->simple_devs[index];
 }
 
+size_t ggml_backend_meta_device_n_devs(ggml_backend_dev_t dev) {
+    return ggml_backend_dev_is_meta(dev) ? ggml_backend_meta_dev_n_devs(dev) : 0;
+}
+
+ggml_backend_dev_t ggml_backend_meta_device_get_dev(ggml_backend_dev_t dev, size_t index) {
+    return ggml_backend_meta_dev_simple_dev(dev, index);
+}
+
 ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) {
     GGML_ASSERT(n_devs <= GGML_BACKEND_META_MAX_DEVICES);
