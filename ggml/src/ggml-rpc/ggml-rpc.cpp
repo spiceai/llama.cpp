@@ -143,6 +143,8 @@ struct rpc_msg_hello_req {
 enum rpc_op_cap : uint8_t {
     // GGML_OP_ARGMAX_PART and GGML_OP_ARGMAX_MERGE over F32 with contiguous elements
     RPC_OP_CAP_ARGMAX_SPLIT = 1 << 0,
+    // GGML_OP_MUL_MAT and GGML_OP_MUL_MAT_ID with BF16 weights and F32 activations
+    RPC_OP_CAP_BF16_MUL_MAT = 1 << 1,
 };
 
 struct rpc_msg_hello_rsp {
@@ -1981,11 +1983,25 @@ static bool rpc_backends_run_argmax_split(const std::vector<ggml_backend_t> & ba
     });
 }
 
+static bool rpc_backends_run_bf16_mul_mat(const std::vector<ggml_backend_t> & backends) {
+    ggml_init_params params = { 16*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * mm = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 64, 2), ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 1));
+    ggml_tensor * mm_id = ggml_mul_mat_id(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_BF16, 64, 2, 2),
+        ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 64, 1, 1), ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1));
+    return !backends.empty() && std::all_of(backends.begin(), backends.end(), [&](ggml_backend_t backend) {
+        return ggml_backend_supports_op(backend, mm) && ggml_backend_supports_op(backend, mm_id);
+    });
+}
+
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major   = RPC_PROTO_MAJOR_VERSION;
     response.minor   = RPC_PROTO_MINOR_VERSION;
     response.patch   = RPC_PROTO_PATCH_VERSION;
-    response.op_caps = rpc_backends_run_argmax_split(backends) ? RPC_OP_CAP_ARGMAX_SPLIT : 0;
+    response.op_caps = (rpc_backends_run_argmax_split(backends) ? RPC_OP_CAP_ARGMAX_SPLIT : 0) |
+                       (rpc_backends_run_bf16_mul_mat(backends) ? RPC_OP_CAP_BF16_MUL_MAT : 0);
     LOG_DBG("[%s] version: %d.%d.%d, op caps: 0x%02x\n", __func__, response.major, response.minor, response.patch, response.op_caps);
 }
 
@@ -4659,6 +4675,10 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
             // a server whose backend lacks them aborts on them (Metal: "unsupported op"), so ask its HELLO
             return (ctx->op_caps & RPC_OP_CAP_ARGMAX_SPLIT) != 0 &&
                 op->src[0]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float);
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            // a server whose backend has no BF16 matmul aborts on one (Metal with GGML_METAL_BF16_DISABLE), so ask its HELLO
+            return op->src[0]->type != GGML_TYPE_BF16 || (ctx->op_caps & RPC_OP_CAP_BF16_MUL_MAT) != 0;
         default:
             //TODO: call the remote backend and cache the results
             return true;
