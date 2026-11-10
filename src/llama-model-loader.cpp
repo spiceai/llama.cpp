@@ -1170,12 +1170,8 @@ bool llama_model_loader::keeps_bf16(ggml_backend_dev_t dev) {
 }
 
 bool llama_model_loader::narrow_to_bf16(const llama_hparams & hparams, const ggml_tensor & t_meta, ggml_op op, ggml_backend_buffer_type_t buft, const llama_tensor_weight & w) {
-    // Narrowing is opt-in: LLAMA_NARROW_F32_TO_BF16=1 turns it on, and LLAMA_KEEP_F32_WEIGHTS=1 still forces it off.
-    // The tradeoff: these weights take half the memory and each pass reads them at two bytes a value, but a matrix
-    // multiply with BF16 weights runs other kernels, so greedy replies change on some prompts, and a changed reply can
-    // accept fewer drafted tokens per pass. DeepSeek-V4.1-Flash split across three DGX Sparks with its MTP head saved
-    // 150 MiB while its slowest 200-token request went from 5.21-5.42 s to 5.89-6.05 s, so the default stays F32 and
-    // a pin bump never changes numerics or decode speed on its own.
+    // opt-in (LLAMA_NARROW_F32_TO_BF16=1; LLAMA_KEEP_F32_WEIGHTS=1 still wins): BF16 halves these weights' memory, but
+    // BF16 matmul kernels change numerics, which can change replies and lower speculative-decoding acceptance
     static const bool narrow = [] {
         const char * keep = getenv("LLAMA_KEEP_F32_WEIGHTS");
         if (keep != nullptr && atoi(keep) != 0) {
