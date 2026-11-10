@@ -1170,12 +1170,22 @@ bool llama_model_loader::keeps_bf16(ggml_backend_dev_t dev) {
 }
 
 bool llama_model_loader::narrow_to_bf16(const llama_hparams & hparams, const ggml_tensor & t_meta, ggml_op op, ggml_backend_buffer_type_t buft, const llama_tensor_weight & w) {
-    static const bool keep_f32 = [] {
-        const char * env = getenv("LLAMA_KEEP_F32_WEIGHTS");
+    // Narrowing is opt-in: LLAMA_NARROW_F32_TO_BF16=1 turns it on, and LLAMA_KEEP_F32_WEIGHTS=1 still forces it off.
+    // The tradeoff: these weights take half the memory and each pass reads them at two bytes a value, but a matrix
+    // multiply with BF16 weights runs other kernels, so greedy replies change on some prompts, and a changed reply can
+    // accept fewer drafted tokens per pass. DeepSeek-V4.1-Flash split across three DGX Sparks with its MTP head saved
+    // 150 MiB while its slowest 200-token request went from 5.21-5.42 s to 5.89-6.05 s, so the default stays F32 and
+    // a pin bump never changes numerics or decode speed on its own.
+    static const bool narrow = [] {
+        const char * keep = getenv("LLAMA_KEEP_F32_WEIGHTS");
+        if (keep != nullptr && atoi(keep) != 0) {
+            return false;
+        }
+        const char * env = getenv("LLAMA_NARROW_F32_TO_BF16");
         return env != nullptr && atoi(env) != 0;
     }();
     // a metadata-only load, such as the memory-fit pass, reads no weights, so its sizes stay F32's
-    if (no_alloc || keep_f32 || t_meta.type != GGML_TYPE_F32 || (op != GGML_OP_MUL_MAT && op != GGML_OP_MUL_MAT_ID) ||
+    if (no_alloc || !narrow || t_meta.type != GGML_TYPE_F32 || (op != GGML_OP_MUL_MAT && op != GGML_OP_MUL_MAT_ID) ||
             ggml_n_dims(&t_meta) < 2 || ggml_backend_buft_is_host(buft)) {
         return false;
     }
@@ -1541,7 +1551,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
                 __func__, n_created, n_tensors);
     }
     if (!bf16_narrowed.empty()) {
-        LLAMA_LOG_INFO("%s: %zu F32 weights hold only BF16 values and load as BF16 (%.1f MiB instead of %.1f MiB); set LLAMA_KEEP_F32_WEIGHTS=1 to keep them F32\n",
+        LLAMA_LOG_INFO("%s: %zu F32 weights hold only BF16 values and load as BF16 (%.1f MiB instead of %.1f MiB); LLAMA_NARROW_F32_TO_BF16=1 turned this on\n",
             __func__, bf16_narrowed.size(), bf16_narrowed_bytes/1024.0/1024.0, 2*bf16_narrowed_bytes/1024.0/1024.0);
     }
     if (n_tensors_moved > 0) {
