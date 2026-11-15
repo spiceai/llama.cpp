@@ -10,8 +10,6 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
-#include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
-
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -1045,6 +1043,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
+    // inject target features from the target's device buffer instead of host copies (env LLAMA_DFLASH_DEV=0 disables)
+    bool use_dev_features = false;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -1163,6 +1164,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        // the device buffer keeps layers in ascending id order, the fc input expects target_layer_ids order
+        {
+            const char * env = getenv("LLAMA_DFLASH_DEV");
+            const bool ascending = std::adjacent_find(target_layer_ids, target_layer_ids + target_layer_ids_n,
+                    [](int32_t a, int32_t b) { return a >= b; }) == target_layer_ids + target_layer_ids_n;
+
+            use_dev_features = !is_lilicorr && ascending && (env == nullptr || atoi(env) != 0);
+            if (use_dev_features) {
+                llama_set_embeddings_layer_inp_dev(ctx_tgt, true);
+                use_dev_features = llama_supports_embd_row(ctx_dft);
+                if (!use_dev_features) {
+                    llama_set_embeddings_layer_inp_dev(ctx_tgt, false);
+                }
+            }
+            LOG_INF("%s: DFlash target features via %s\n", __func__, use_dev_features ? "device buffer" : "host copies");
+        }
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -1254,6 +1272,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+
+                if (use_dev_features) {
+                    // the features are the target batch rows in the target's device buffer
+                    batch_inject.clear();
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const int32_t   row        = i_batch_beg[seq_id] + offset + i;
+                        const llama_pos p          = batch_in.tokens[row].pos[0];
+                        const llama_pos pos_arr[4] = { p, p, p, 0 };
+                        batch_inject.add_embd_row(row, pos_arr, seq_id, false);
+                    }
+
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
+                    continue;
+                }
 
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
@@ -1614,6 +1651,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // target h rows on the device (llama_set_embeddings_nextn_dev): the catch-up in process() reads row k - 1 of the last
+    // target decode in place, and row n_batch_tgt + seq_id for the first token of seq_id, uploaded from pending_h
+    // pending_h stays on the host: process() and accept() fetch it before the next target decode overwrites the rows
+    bool    dev_rows    = false;
+    int32_t n_batch_tgt = 0;
+    std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
+    std::vector<float>   rows_tmp;    // two device rows read at once: the state before a token and the token's
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1664,11 +1709,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
-
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+
+        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ is_mem_shared);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1697,6 +1742,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
         verify_pos_first.assign(n_seq, -1);
+        n_batch_tgt = (int32_t) llama_n_batch(ctx_tgt);
+        verify_row0.assign(n_seq, -1);
+
+        // shared memory and chained heads keep the host rows
+        if (!is_mem_shared && !chain_heads) {
+            dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_ctx_state_src(ctx_dft, ctx_tgt);
+            if (!dev_rows) {
+                llama_set_ctx_state_src(ctx_dft, nullptr);
+                llama_set_embeddings_nextn_dev(ctx_tgt, false);
+            }
+        }
+        SPC_TRC("- target h rows on the device: %s\n", dev_rows ? "yes" : "no");
     }
 
     // the hidden state that precedes position `pos` in sequence `seq_id`, for a token that is an image token when
@@ -1731,6 +1788,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     ~common_speculative_impl_draft_mtp() override {
         auto * ctx_dft = this->params.ctx_dft;
+        if (dev_rows) {
+            llama_set_ctx_state_src(ctx_dft, nullptr);
+            llama_set_embeddings_nextn_dev(this->params.ctx_tgt, false);
+        }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
                 continue;
@@ -1813,7 +1874,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            if (dev_rows) {
+                GGML_ASSERT(n_tokens <= n_batch_tgt && "the target batch exceeds the h_nextn device buffer");
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] >= 0) {
+                        llama_set_embeddings_nextn_rows(ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
+                    }
+                }
+            }
+
+            const float * h_tgt = dev_rows ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
 
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
@@ -1824,6 +1894,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const int32_t idx = t.id != LLAMA_TOKEN_NULL
                     ? batch.add(t.id, t.pos[0], seq_id, false)
                     : batch.add_embd(t.embd, t.pos.data(), seq_id, false);
+
+                if (dev_rows) {
+                    batch.set_embd_state_row(idx, k == i_batch_beg[seq_id] ? n_batch_tgt + seq_id : k - 1);
+                    continue;
+                }
 
                 const float * h_row = k == i_batch_beg[seq_id]
                     ? pending_h[seq_id].data()
@@ -1870,35 +1945,77 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-            verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
-
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+            if (is_mem_shared && !batch_in.tokens[i_batch_end[seq_id]].output) {
+                verify_h_rows[seq_id] = 0;
+                continue;
             }
 
-            // the state the batch's first token paired with, and the state before the batch's last token
-            verify_prev_h[seq_id]    = pending_h[seq_id];
-            verify_prev_pos[seq_id]  = pending_pos[seq_id];
-            verify_prev_embd[seq_id] = pending_embd[seq_id];
-            if (n_rows >= 2) {
+            const bool all_rows_output = std::all_of(
+                    batch_in.tokens.begin() + i_batch_beg[seq_id],
+                    batch_in.tokens.begin() + i_batch_end[seq_id] + 1,
+                    [](const common_batch::token & token) { return token.output; });
+            const int32_t h_rows = is_mem_shared && !all_rows_output ? 1 : n_rows;
+            const int32_t h_offset = is_mem_shared && !all_rows_output ? i_batch_end[seq_id] : i_batch_beg[seq_id];
+
+            verify_h_rows[seq_id] = h_rows;
+
+            // the state before verify row 0: the one the batch's first token paired with when row 0 is that token, else
+            // none, as its row before was not output
+            verify_pos_first[seq_id] = batch_in.tokens[h_offset].pos[0];
+            if (h_offset == i_batch_beg[seq_id]) {
+                verify_prev_h[seq_id]    = pending_h[seq_id];
+                verify_prev_pos[seq_id]  = pending_pos[seq_id];
+                verify_prev_embd[seq_id] = pending_embd[seq_id];
+            } else {
+                verify_prev_pos[seq_id]  = -1;
+                verify_prev_embd[seq_id] = false;
+            }
+
+            // the state before the batch's last token: its row before the last when that row was output, the state the
+            // first token paired with when the batch is that one token, else none
+            const auto & t_last = batch_in.tokens[i_batch_end[seq_id]];
+            if (h_rows >= 2) {
                 const auto & t_prev = batch_in.tokens[i_batch_end[seq_id] - 1];
-                std::memcpy(prev_h[seq_id].data(),
-                        verify_h[seq_id].data() + (size_t) (n_rows - 2) * n_embd, row_bytes);
                 prev_pos[seq_id]  = t_prev.pos[0];
                 prev_embd[seq_id] = t_prev.id == LLAMA_TOKEN_NULL;
-            } else {
+            } else if (n_rows == 1) {
                 prev_h[seq_id]    = pending_h[seq_id];
                 prev_pos[seq_id]  = pending_pos[seq_id];
                 prev_embd[seq_id] = pending_embd[seq_id];
+            } else {
+                prev_pos[seq_id]  = -1;
+                prev_embd[seq_id] = false;
+            }
+            pending_pos[seq_id]  = t_last.pos[0];
+            pending_embd[seq_id] = t_last.id == LLAMA_TOKEN_NULL;
+
+            if (dev_rows) {
+                // the rows stay on the device until the next target decode; only the last row, and the one before it
+                // when it was output, come to the host
+                verify_row0[seq_id] = h_offset;
+                if (h_rows >= 2) {
+                    rows_tmp.resize(2 * (size_t) n_embd);
+                    llama_get_embeddings_nextn_rows(ctx_tgt, h_offset + h_rows - 2, 2, rows_tmp.data());
+                    std::memcpy(prev_h[seq_id].data(), rows_tmp.data(), row_bytes);
+                    std::memcpy(pending_h[seq_id].data(), rows_tmp.data() + n_embd, row_bytes);
+                } else {
+                    llama_get_embeddings_nextn_rows(ctx_tgt, h_offset + h_rows - 1, 1, pending_h[seq_id].data());
+                }
+                continue;
             }
 
+            verify_h[seq_id].resize((size_t) h_rows * n_embd);
+
+            for (int32_t i = 0; i < h_rows; ++i) {
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, h_offset + i);
+                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+            }
+
+            if (h_rows >= 2) {
+                std::memcpy(prev_h[seq_id].data(), verify_h[seq_id].data() + (size_t) (h_rows - 2) * n_embd, row_bytes);
+            }
             std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
-            verify_pos_first[seq_id] = batch_in.tokens[i_batch_beg[seq_id]].pos[0];
-            pending_pos[seq_id]      = batch_in.tokens[i_batch_end[seq_id]].pos[0];
-            pending_embd[seq_id]     = batch_in.tokens[i_batch_end[seq_id]].id == LLAMA_TOKEN_NULL;
+                    verify_h[seq_id].data() + (size_t) (h_rows - 1) * n_embd, row_bytes);
         }
 
         return true;
@@ -2175,8 +2292,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (dev_rows) {
+            // process() already fetched the last row and the one before it
+            if (i_h != n_rows - 1) {
+                if (i_h >= 1) {
+                    rows_tmp.resize(2 * (size_t) n_embd);
+                    llama_get_embeddings_nextn_rows(params.ctx_tgt, verify_row0[seq_id] + i_h - 1, 2, rows_tmp.data());
+                    std::memcpy(prev_h[seq_id].data(), rows_tmp.data(), row_bytes);
+                    std::memcpy(pending_h[seq_id].data(), rows_tmp.data() + n_embd, row_bytes);
+                } else {
+                    llama_get_embeddings_nextn_rows(params.ctx_tgt, verify_row0[seq_id], 1, pending_h[seq_id].data());
+                }
+            }
+        }
         if (i_h >= 1) {
-            std::memcpy(prev_h[seq_id].data(), verify_h[seq_id].data() + (size_t) (i_h - 1) * n_embd, row_bytes);
+            if (!dev_rows) {
+                std::memcpy(prev_h[seq_id].data(), verify_h[seq_id].data() + (size_t) (i_h - 1) * n_embd, row_bytes);
+            }
             prev_pos[seq_id]  = verify_pos_first[seq_id] + i_h - 1;
             prev_embd[seq_id] = false;
         } else {
@@ -2184,7 +2316,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             prev_pos[seq_id]  = verify_prev_pos[seq_id];
             prev_embd[seq_id] = verify_prev_embd[seq_id];
         }
-        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        if (!dev_rows) {
+            std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        }
         pending_pos[seq_id]  = verify_pos_first[seq_id] + i_h;
         pending_embd[seq_id] = false;
     }
@@ -2991,7 +3125,7 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
+        llama_model * model_dft = common_model_load(params.speculative.draft.mparams.get_paths(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;

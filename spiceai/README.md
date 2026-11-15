@@ -18,8 +18,7 @@ It also carries these source patches, which each Spice branch must keep until up
 - **Fixes on top of upstream's DeepSeek-V4.1-Flash (`deepseek41`, ggml-org/llama.cpp#31086)**, not upstream. A GGUF
   whose `attention.output_group_count` is 0 fails its load instead of dividing by zero (`src/models/deepseek4.cpp`,
   which `deepseek41` shares), and `deepseek41`'s output projection applies a LoRA adapter on `output.weight`
-  (`src/models/deepseek41.cpp`). `ggml_validate_row_data` rejects MXFP8 blocks with an E4M3 NaN code
-  (`ggml/src/ggml-quants.c`), so `--check-tensors` catches them. `deepseek41v` image preprocessing
+  (`src/models/deepseek41.cpp`). `deepseek41v` image preprocessing
   (`tools/mtmd/mtmd-image.cpp`) counts the tokens of a placeholder bitmap, and pads an image too thin to keep a pixel at
   the planned size with the pad color alone, as Pillow's `ImageOps.pad` does, instead of failing. With
   `convert_hf_to_gguf.py --remote`, `conversion/deepseek41.py` reads the Engram tables by HTTP range instead of from
@@ -47,7 +46,8 @@ It also carries these source patches, which each Spice branch must keep until up
   upstream's. Drop each once upstream has an equivalent.
 
 Each Spice branch is `spiceai-<release>`: the upstream release tag with the Spice commits on top, made by
-merging the tag into the previous Spice branch (`spiceai-b11999` is `spiceai-b11803` with `b11984`, then `b11999`, merged in). Its tip is tagged `<release>-spiceai.<n>`, a name apart from the
+merging the tag into the previous Spice branch (`spiceai-v1.0.0` is `spiceai-b11999` with `v1.0.0` merged in, and
+`spiceai-b11999` is `spiceai-b11803` with `b11984`, then `b11999`, merged in). Its tip is tagged `<release>-spiceai.<n>`, a name apart from the
 branch's so neither is ambiguous, with `<n>` counting re-packagings of one release. To move
 to a new release:
 
