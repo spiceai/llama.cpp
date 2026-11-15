@@ -373,6 +373,14 @@ struct gguf_reader {
         return start_offset;
     }
 
+    // the bytes left from the current position; the source's own end only when ends_at_source_end
+    uint64_t remain() const {
+        return nbytes_remain;
+    }
+
+    // the GGUF is the whole source, so nothing of the source follows its data section
+    bool ends_at_source_end = false;
+
     bool seek(uint64_t absolute_offset) const {
         const uint64_t end_offset = uint64_t(data_offset) + nbytes_remain;
         if (absolute_offset > end_offset) {
@@ -819,6 +827,18 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         }
     }
 
+    // A whole file whose data section runs past its last tensor's padded end holds bytes its tensors' types do not
+    // account for, as when the ggml that wrote a tensor gave its type's number to a type with larger blocks: GGML type
+    // 43 was spiceai/llama.cpp's gather-only MXFP8 before v1.0.0 and is F8_E4M3 since. The offset check above refuses
+    // such a tensor only when another follows it; read last, it would load with the wrong values and no error.
+    if (n_tensors > 0 && gr.ends_at_source_end && gr.remain() > ctx->size) {
+        GGML_LOG_ERROR("%s: the data section holds %" PRIu64 " bytes but its tensors take %zu, so a tensor's type is not "
+            "the one it was written with (GGML type 43 was MXFP8 in spiceai/llama.cpp before v1.0.0, and is F8_E4M3 since). "
+            "Convert the model again with this release\n", __func__, gr.remain(), ctx->size);
+        gguf_free(ctx);
+        return nullptr;
+    }
+
     // load the tensor data only if requested
     if (params.ctx != nullptr) {
         // if the provided gguf_context is no_alloc, then we create "empty" tensors and do not read the binary blob
@@ -963,7 +983,7 @@ static size_t gguf_file_reader_callback(void * userdata, void * output, uint64_t
     return nread;
 }
 
-struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_params params) {
+static struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_params params, bool whole_file) {
     if (!file) {
         return nullptr;
     }
@@ -977,8 +997,14 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
         /*.file   = */ file,
         /*.offset = */ static_cast<uint64_t>(cur),
     };
-    const struct gguf_reader gr(gguf_file_reader_callback, &reader, SIZE_MAX, reader.offset, gguf_reader::file_remain(file));
+    struct gguf_reader gr(gguf_file_reader_callback, &reader, SIZE_MAX, reader.offset, gguf_reader::file_remain(file));
+    gr.ends_at_source_end = whole_file && cur == 0;
     return gguf_init_from_reader(gr, params);
+}
+
+// a FILE may hold a GGUF followed by other data, so only a GGUF opened by its path is taken to end where its file does
+struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_params params) {
+    return gguf_init_from_file_impl(file, params, /*whole_file =*/ false);
 }
 
 struct gguf_buffer_reader {
@@ -1022,7 +1048,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
         return nullptr;
     }
 
-    struct gguf_context * result = gguf_init_from_file_ptr(file, params);
+    struct gguf_context * result = gguf_init_from_file_impl(file, params, /*whole_file =*/ true);
     fclose(file);
     return result;
 }
