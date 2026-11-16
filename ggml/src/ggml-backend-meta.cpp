@@ -562,6 +562,61 @@ static size_t ggml_backend_meta_inner_extent(const struct ggml_tensor * tensor, 
     return extent;
 }
 
+// The bytes along the split axis of src that one repetition of one of its segments takes, when a view of src starts
+// where such a repetition starts within a row and every segment splits between the devices in one ratio; else 0.
+// A conv state that holds the q, k and v windows one after the other is one segment repeated three times: a view of one
+// window is split the way the window is, and each device's share of it, and of the view's offset, is its share of the
+// whole axis.
+static size_t ggml_backend_meta_view_segment_span(const struct ggml_tensor * view, const struct ggml_tensor * src,
+        const struct ggml_backend_meta_split_state & ss, int axis, size_t n_bufs) {
+    if (axis < 0 || axis >= GGML_MAX_DIMS - 1 || (ss.n_segments == 1 && ss.nr[0] == 1)) {
+        return 0;
+    }
+    int64_t total_first = 0;
+    for (size_t j = 0; j < n_bufs; j++) {
+        total_first += ss.ne[j];
+    }
+    if (total_first == 0) {
+        return 0;
+    }
+    for (size_t s = 1; s < ss.n_segments; s++) {
+        int64_t total = 0;
+        for (size_t j = 0; j < n_bufs; j++) {
+            total += ss.ne[s*n_bufs + j];
+        }
+        for (size_t j = 0; j < n_bufs; j++) {
+            if (ss.ne[s*n_bufs + j] * total_first != ss.ne[j] * total) {
+                return 0;
+            }
+        }
+    }
+    const int64_t blck    = axis == 0 ? ggml_blck_size(src->type) : 1;
+    const size_t  nb_axis = src->nb[axis];
+    const size_t  nb_next = src->nb[axis + 1];
+    if (view->view_offs < src->view_offs) {
+        return 0;
+    }
+    const size_t offs = (view->view_offs - src->view_offs) % nb_next;
+    size_t start = 0;
+    for (size_t s = 0; s < ss.n_segments; s++) {
+        int64_t total = 0;
+        for (size_t j = 0; j < n_bufs; j++) {
+            total += ss.ne[s*n_bufs + j];
+        }
+        if (total % blck != 0) {
+            return 0;
+        }
+        const size_t extent = (size_t) (total / blck) * nb_axis;
+        for (uint32_t r = 0; r < ss.nr[s]; r++) {
+            if (start == offs) {
+                return extent;
+            }
+            start += extent;
+        }
+    }
+    return 0;
+}
+
 // the view dim that holds the split axis of src, or -1
 // all other dims of src and view must stay inside one slab of that axis
 static int ggml_backend_meta_view_slab_dim(const struct ggml_tensor * view, const struct ggml_tensor * src, int axis) {
@@ -877,12 +932,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             GGML_ABORT("fatal error");
         }
-        // permuted view: split the view dim that spans the src split axis, other dims must be inside one element of it or outside the span
+        // permuted view: split the view dim that spans the src split axis, other dims must be inside one element of it or outside the span.
+        // The dim may also span one repetition of one segment of src, from where it starts, when all segments split in one ratio
+        // (a rollback slot of one of the q, k and v windows of a conv state).
         if (ggml_is_permuted(tensor) && !ggml_is_permuted(tensor->src[0]) && axis >= 0 && axis < GGML_MAX_DIMS-1) {
             const size_t nb_axis = tensor->src[0]->nb[axis];
             const size_t nb_next = tensor->src[0]->nb[axis+1];
+            const size_t nb_segment = ggml_backend_meta_view_segment_span(tensor, tensor->src[0], src_ss[0], axis, n_bufs);
             for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
-                if (tensor->ne[dim] == 1 || tensor->nb[dim] < nb_axis || tensor->nb[dim]*tensor->ne[dim] != nb_next) {
+                const size_t span = tensor->nb[dim]*tensor->ne[dim];
+                if (tensor->ne[dim] == 1 || tensor->nb[dim] < nb_axis || (span != nb_next && (nb_segment == 0 || span != nb_segment))) {
                     continue;
                 }
                 bool others_ok = true;
