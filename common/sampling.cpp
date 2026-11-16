@@ -606,6 +606,13 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
+    // a backend failed computing the outputs (llama_get_compute_status): no candidates, and no token
+    if (llama_get_compute_status(ctx) != 0) {
+        gsmpl->cur.clear();
+        gsmpl->cur_p = { gsmpl->cur.data(), 0, -1, false };
+        return LLAMA_TOKEN_NULL;
+    }
+
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
 

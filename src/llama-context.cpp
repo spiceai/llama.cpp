@@ -1788,6 +1788,10 @@ bool llama_context::get_h_nextn_rows(int64_t row0, int64_t n_rows, float * out) 
     } else {
         synchronize();
     }
+    // the event orders the read after the decode that wrote the rows, but says nothing of whether it succeeded
+    if (check_backends()) {
+        return false;
+    }
     ggml_backend_tensor_get(h_nextn_dev, out, row0*h_nextn_dev->nb[1], n_rows*h_nextn_dev->nb[1]);
     return true;
 }
@@ -2190,7 +2194,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         switch (status) {
             case GGML_STATUS_ABORTED:      return  2;
             case GGML_STATUS_ALLOC_FAILED: return -2;
-            case GGML_STATUS_FAILED:       return -3;
+            case GGML_STATUS_FAILED:       check_backends(); return -3; // a backend that failed fails the context
             case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
         }
     }
@@ -2589,6 +2593,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         } else {
             inject_src->synchronize();
         }
+        // the rows this decode reads are what the source computed only if its backends did not fail it
+        if (inject_src->check_backends()) {
+            LLAMA_LOG_ERROR("%s: the context whose layer inputs this decode reads failed computing them\n", __func__);
+            return -3;
+        }
     }
     if (layer_inp_dev && ev_layer_inp_read && ev_layer_inp_read_recorded) {
         // do not overwrite rows the reader has not consumed yet
@@ -2604,6 +2613,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             ggml_backend_event_synchronize(state_src->ev_h_nextn_written.get());
         } else {
             state_src->synchronize();
+        }
+        if (state_src->check_backends()) {
+            LLAMA_LOG_ERROR("%s: the context whose hidden states this decode reads failed computing them\n", __func__);
+            return -3;
         }
     }
     const bool write_h_nextn = cparams.embeddings_nextn_dev && h_nextn_dev != nullptr;
@@ -2660,7 +2673,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             switch (status) {
                 case GGML_STATUS_ABORTED:      return  2;
                 case GGML_STATUS_ALLOC_FAILED: return -2;
-                case GGML_STATUS_FAILED:       return -3;
+                case GGML_STATUS_FAILED:       check_backends(); return -3; // a backend that failed fails the context
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
         }

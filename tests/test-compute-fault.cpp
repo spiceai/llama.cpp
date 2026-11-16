@@ -4,9 +4,11 @@
 // prompt and then one token at a time and checks, at every step, that the read of the outputs either succeeds with the
 // logits a run without the fault computed (--reference, written by --write-reference), bit for bit, or reports the
 // failure: the getters return NULL, llama_get_compute_status returns -3, the sequence's state does not save, and every
-// later decode returns -3. A run whose fault falls within its graphs must see the failure.
+// later decode returns -3, and common's sampler picks no token instead of asserting on the missing logits. A run whose
+// fault falls within its graphs must see the failure.
 
 #include "llama.h"
+#include "sampling.h"
 
 #include <cmath>
 #include <cstdio>
@@ -72,6 +74,15 @@ int main(int argc, char ** argv) {
         return fail("the context does not initialize");
     }
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    common_params_sampling sparams;
+    common_sampler * smpl = common_sampler_init(model, sparams);
+    if (smpl == nullptr) {
+        return fail("common's sampler does not initialize");
+    }
+    // what reads a failed context's outputs through common: it must pick nothing, not abort
+    auto common_picks_nothing = [&]() {
+        return common_sampler_sample(smpl, ctx, -1) == LLAMA_TOKEN_NULL;
+    };
 
     const int n_prompt = 16;
     const int n_steps  = 16;
@@ -106,6 +117,9 @@ int main(int argc, char ** argv) {
             if (llama_get_compute_status(ctx) != -3) {
                 return fail("a decode failed, but the context reports no failure");
             }
+            if (!common_picks_nothing()) {
+                return fail("common's sampler picked a token from a failed decode");
+            }
             printf("step %d: the decode failed (-3)\n", step);
             failed = true;
             continue;
@@ -125,6 +139,9 @@ int main(int argc, char ** argv) {
             std::vector<uint8_t> state(llama_state_seq_get_size(ctx, 0) + 1);
             if (llama_state_seq_get_data(ctx, state.data(), state.size(), 0) != 0) {
                 return fail("the sequence's state saved after the failure");
+            }
+            if (!common_picks_nothing()) {
+                return fail("common's sampler picked a token from a failed decode");
             }
             printf("step %d: the read of the outputs reports the failure (-3)\n", step);
             failed = true;
@@ -148,6 +165,7 @@ int main(int argc, char ** argv) {
         }
     }
     llama_batch_free(batch);
+    common_sampler_free(smpl);
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();

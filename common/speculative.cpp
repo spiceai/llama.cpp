@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <map>
 #include <random>
+#include <stdexcept>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -94,6 +95,16 @@ static std::string common_speculative_get_devices_str(const std::vector<ggml_bac
         result += ggml_backend_dev_name(devices[i]);
     }
     return result.empty() ? "default" : result;
+}
+
+
+// A draft reads the outputs of the target and draft contexts; once a backend failed computing one of them
+// (llama_get_compute_status), those outputs are not the computation's and the getters return none. Drafting stops at the
+// first read after the failure with this exception, which common_speculative's callers turn into a failed draft.
+static void spec_require_computed(const llama_context * ctx) {
+    if (ctx != nullptr && llama_get_compute_status(ctx) != 0) {
+        throw std::runtime_error("a backend failed computing the draft's inputs or outputs, so there is no draft");
+    }
 }
 
 struct common_speculative_config {
@@ -408,6 +419,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                spec_require_computed(ctx_dft);
                 ++i_batch;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -693,6 +705,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k])
                 : llama_get_embeddings_nextn(ctx_tgt);
             if (!layer) {
+                spec_require_computed(ctx_tgt);
                 GGML_ABORT("EAGLE3: target layer %d input not extracted.", target_layer_ids[k]);
             }
             for (int32_t i = 0; i < n_tokens; ++i) {
@@ -727,6 +740,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
             // g_embd has shape [n_chunk, n_embd_dec] in ctx_dft's pre-norm embeddings buffer.
             const float * g_embd_chunk = llama_get_embeddings_nextn(ctx_dft);
+            spec_require_computed(ctx_dft);
             GGML_ASSERT(g_embd_chunk && "EAGLE3 encoder produced no output.");
             std::memcpy(g_embd_buf.data() + (size_t) i * n_embd_dec,
                         g_embd_chunk,
@@ -856,6 +870,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
+                spec_require_computed(ctx_dft);
                 // pre-norm hidden state of this position becomes g_embd for the next step
                 const float * prenorm = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
                 ++i_batch;
@@ -1298,6 +1313,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                     if (!layer) {
+                        spec_require_computed(ctx_tgt);
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
@@ -1324,6 +1340,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (is_lilicorr) {
                     // Ordinary DFlash can write to the KV cache, but LiliCorr needs to store embeddings across sequences.
                     const float * projected = llama_get_embeddings_nextn(ctx_dft);
+                    spec_require_computed(ctx_dft);
                     if (projected) {
                         const size_t seq_offset = (size_t) seq_id * lilicorr_rows;
                         const llama_pos pos_min = std::max(0, batch_inject.tokens.back().pos[0] - block_size);
@@ -1444,6 +1461,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (is_dflash2 || is_lilicorr) {
                 // Both DFlash and LiliCorr greedily walk the candidate lattice.
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+                spec_require_computed(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
                 // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
@@ -1523,6 +1541,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
                 const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                spec_require_computed(ctx_dft);
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
@@ -1537,6 +1556,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     if (id == LLAMA_TOKEN_NULL) {
                         common_sampler_sample(smpl, ctx_dft, idx, true);
+                        spec_require_computed(ctx_dft);
 
                         const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1560,6 +1580,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     common_sampler_sample(smpl, ctx_dft, beg + i, true);
+                    spec_require_computed(ctx_dft);
 
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1884,6 +1905,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             const float * h_tgt = dev_rows ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
+            spec_require_computed(ctx_tgt);
 
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
@@ -1995,11 +2017,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 verify_row0[seq_id] = h_offset;
                 if (h_rows >= 2) {
                     rows_tmp.resize(2 * (size_t) n_embd);
-                    llama_get_embeddings_nextn_rows(ctx_tgt, h_offset + h_rows - 2, 2, rows_tmp.data());
+                    if (!llama_get_embeddings_nextn_rows(ctx_tgt, h_offset + h_rows - 2, 2, rows_tmp.data())) {
+                        spec_require_computed(ctx_tgt);
+                    }
                     std::memcpy(prev_h[seq_id].data(), rows_tmp.data(), row_bytes);
                     std::memcpy(pending_h[seq_id].data(), rows_tmp.data() + n_embd, row_bytes);
                 } else {
-                    llama_get_embeddings_nextn_rows(ctx_tgt, h_offset + h_rows - 1, 1, pending_h[seq_id].data());
+                    if (!llama_get_embeddings_nextn_rows(ctx_tgt, h_offset + h_rows - 1, 1, pending_h[seq_id].data())) {
+                        spec_require_computed(ctx_tgt);
+                    }
                 }
                 continue;
             }
@@ -2195,6 +2221,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                spec_require_computed(ctx_dft);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -2297,11 +2324,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (i_h != n_rows - 1) {
                 if (i_h >= 1) {
                     rows_tmp.resize(2 * (size_t) n_embd);
-                    llama_get_embeddings_nextn_rows(params.ctx_tgt, verify_row0[seq_id] + i_h - 1, 2, rows_tmp.data());
+                    if (!llama_get_embeddings_nextn_rows(params.ctx_tgt, verify_row0[seq_id] + i_h - 1, 2, rows_tmp.data())) {
+                        spec_require_computed(params.ctx_tgt);
+                    }
                     std::memcpy(prev_h[seq_id].data(), rows_tmp.data(), row_bytes);
                     std::memcpy(pending_h[seq_id].data(), rows_tmp.data() + n_embd, row_bytes);
                 } else {
-                    llama_get_embeddings_nextn_rows(params.ctx_tgt, verify_row0[seq_id], 1, pending_h[seq_id].data());
+                    if (!llama_get_embeddings_nextn_rows(params.ctx_tgt, verify_row0[seq_id], 1, pending_h[seq_id].data())) {
+                        spec_require_computed(params.ctx_tgt);
+                    }
                 }
             }
         }

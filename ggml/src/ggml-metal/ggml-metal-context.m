@@ -301,6 +301,20 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
 }
 
 enum ggml_status ggml_metal_get_status(ggml_metal_t ctx) {
+    // a read the backend did not synchronize for (one an event ordered) still sees a failure: a command buffer that
+    // failed keeps its status, read here without waiting for the others
+    for (int cb_idx = 0; cb_idx <= ctx->n_cb && !ctx->has_error; ++cb_idx) {
+        id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
+        if (cmd_buf && [cmd_buf status] == MTLCommandBufferStatusError) {
+            ggml_metal_cmd_buf_failed(ctx, cmd_buf, "graph", cb_idx);
+        }
+    }
+    for (size_t i = 0; i < ctx->cmd_bufs_ext.count && !ctx->has_error; ++i) {
+        id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
+        if ([cmd_buf status] == MTLCommandBufferStatusError) {
+            ggml_metal_cmd_buf_failed(ctx, cmd_buf, "extra", (int) i);
+        }
+    }
     return ctx->has_error ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
 }
 
@@ -632,6 +646,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                         GGML_LOG_INFO("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                     }
 
+                    ctx->has_error = true;
                     res = GGML_STATUS_FAILED;
                 }
             }
@@ -646,6 +661,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                     if (status == MTLCommandBufferStatusError) {
                         GGML_LOG_INFO("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                     }
+                    ctx->has_error = true;
                     res = GGML_STATUS_FAILED;
                     break;
                 }
