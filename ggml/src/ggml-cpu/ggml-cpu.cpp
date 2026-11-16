@@ -429,16 +429,6 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
-    // MXFP8 is a gather-only type: GET_ROWS reads it, nothing else does (and nothing writes it)
-    if (op->type == GGML_TYPE_MXFP8) {
-        return false;
-    }
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
-        if (op->src[i] && op->src[i]->type == GGML_TYPE_MXFP8 && !(op->op == GGML_OP_GET_ROWS && i == 0)) {
-            return false;
-        }
-    }
-
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {
@@ -465,10 +455,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
                 return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;
             }
-            // BF16 in src1 is widened into the F32 work buffer
+            // F16 or BF16 in src1 is widened into the F32 work buffer
             return src1->type == GGML_TYPE_F32 ||
                    src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
-                   (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32);
+                   ((src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16) &&
+                    ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32);
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;

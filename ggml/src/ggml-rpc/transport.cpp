@@ -92,6 +92,11 @@ struct rdma_conn {
     struct ibv_mr * rx_mr  = nullptr;
     int             rx_head = 0;
 
+    // received slot that is only partly consumed, so recv sizes need not match send sizes
+    int             rx_cur  = -1;
+    size_t          rx_off  = 0;
+    size_t          rx_len  = 0;
+
     uint32_t        max_inline = 0;
 
     // posted sends not yet completed, oldest first; completions of one queue pair arrive in order, so the oldest pending
@@ -717,21 +722,24 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
             LOG_ERROR("RDMA recv failed: past its deadline (rem=%zu, size=%zu)\n", rem, size);
             return false;
         }
-        struct ibv_wc wc;
-        if (!rdma_poll(c->rcq, &wc, deadline)) return false;
-
-        int slot = (int)wc.wr_id;
-        size_t got = wc.byte_len;
-        // a message is delivered whole, so one longer than what is left of this read belongs to a read of another size:
-        // copying it would write past the caller's buffer
-        if (got > rem) {
-            LOG_ERROR("RDMA received a %zu-byte message for a read with %zu bytes left\n", got, rem);
-            c->post_rx(slot);
-            return false;
+        // a message may be read by several receives, so the slot of one partly read stays current until it is consumed
+        if (c->rx_cur < 0) {
+            struct ibv_wc wc;
+            if (!rdma_poll(c->rcq, &wc, deadline)) return false;
+            c->rx_cur = (int)wc.wr_id;
+            c->rx_off = 0;
+            c->rx_len = wc.byte_len;
         }
-        memcpy(dst, c->rx_slot(slot), got);
 
-        if (!c->post_rx(slot)) return false;
+        size_t got = std::min(rem, c->rx_len - c->rx_off);
+        memcpy(dst, c->rx_slot(c->rx_cur) + c->rx_off, got);
+        c->rx_off += got;
+
+        // repost the slot only once it is fully consumed
+        if (c->rx_off == c->rx_len) {
+            if (!c->post_rx(c->rx_cur)) return false;
+            c->rx_cur = -1;
+        }
 
         dst += got;
         rem -= got;

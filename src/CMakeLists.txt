@@ -71,7 +71,8 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 # Spice.ai: a failed check while loading a model throws instead of aborting (see llama-impl.h).
 target_compile_definitions(llama PRIVATE GGML_ABORT_THROWS)
 
-target_link_libraries(llama PUBLIC ggml)
+find_package(Threads REQUIRED)
+target_link_libraries(llama PUBLIC ggml PRIVATE Threads::Threads)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

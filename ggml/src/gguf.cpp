@@ -373,6 +373,14 @@ struct gguf_reader {
         return start_offset;
     }
 
+    // the bytes left from the current position; the source's own end only when ends_at_source_end
+    uint64_t remain() const {
+        return nbytes_remain;
+    }
+
+    // the GGUF is the whole source, so nothing of the source follows its data section
+    bool ends_at_source_end = false;
+
     bool seek(uint64_t absolute_offset) const {
         const uint64_t end_offset = uint64_t(data_offset) + nbytes_remain;
         if (absolute_offset > end_offset) {
@@ -819,6 +827,18 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         }
     }
 
+    // A whole file whose data section runs past its last tensor's padded end holds bytes its tensors' types do not
+    // account for, as when the ggml that wrote a tensor gave its type's number to a type with larger blocks: GGML type
+    // 43 was spiceai/llama.cpp's gather-only MXFP8 before v1.0.0 and is F8_E4M3 since. The offset check above refuses
+    // such a tensor only when another follows it; read last, it would load with the wrong values and no error.
+    if (n_tensors > 0 && gr.ends_at_source_end && gr.remain() > ctx->size) {
+        GGML_LOG_ERROR("%s: the data section holds %" PRIu64 " bytes but its tensors take %zu, so a tensor's type is not "
+            "the one it was written with (GGML type 43 was MXFP8 in spiceai/llama.cpp before v1.0.0, and is F8_E4M3 since). "
+            "Convert the model again with this release\n", __func__, gr.remain(), ctx->size);
+        gguf_free(ctx);
+        return nullptr;
+    }
+
     // load the tensor data only if requested
     if (params.ctx != nullptr) {
         // if the provided gguf_context is no_alloc, then we create "empty" tensors and do not read the binary blob
@@ -963,7 +983,7 @@ static size_t gguf_file_reader_callback(void * userdata, void * output, uint64_t
     return nread;
 }
 
-struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_params params) {
+static struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_params params, bool whole_file) {
     if (!file) {
         return nullptr;
     }
@@ -977,8 +997,14 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
         /*.file   = */ file,
         /*.offset = */ static_cast<uint64_t>(cur),
     };
-    const struct gguf_reader gr(gguf_file_reader_callback, &reader, SIZE_MAX, reader.offset, gguf_reader::file_remain(file));
+    struct gguf_reader gr(gguf_file_reader_callback, &reader, SIZE_MAX, reader.offset, gguf_reader::file_remain(file));
+    gr.ends_at_source_end = whole_file && cur == 0;
     return gguf_init_from_reader(gr, params);
+}
+
+// a FILE may hold a GGUF followed by other data, so only a GGUF opened by its path is taken to end where its file does
+struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_params params) {
+    return gguf_init_from_file_impl(file, params, /*whole_file =*/ false);
 }
 
 struct gguf_buffer_reader {
@@ -1022,7 +1048,7 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
         return nullptr;
     }
 
-    struct gguf_context * result = gguf_init_from_file_ptr(file, params);
+    struct gguf_context * result = gguf_init_from_file_impl(file, params, /*whole_file =*/ true);
     fclose(file);
     return result;
 }
@@ -1463,6 +1489,7 @@ struct gguf_writer_base {
     // we bet on devirtualization
     virtual void write(int8_t val) = 0;
     virtual void write(const std::vector<int8_t> & val) = 0;
+    virtual void write(const void * data, size_t size) = 0;
     virtual void write_tensor_data(const struct gguf_tensor_info & info, size_t offset_data, size_t alignment) = 0;
 
     template <typename T>
@@ -1579,21 +1606,31 @@ struct gguf_writer_buf final : public gguf_writer_base {
         written_bytes += val.size();
     }
 
+    void write(const void * data, const size_t size) override {
+        buf.insert(buf.end(), (const int8_t *) data, (const int8_t *) data + size);
+        written_bytes += size;
+    }
+
     void write_tensor_data(const struct gguf_tensor_info & info, const size_t offset_data, const size_t alignment) override {
         GGML_ASSERT(buf.size() - offset_data == info.offset);
 
         GGML_ASSERT(ggml_is_contiguous(&info.t));
-        const size_t offset = buf.size();
         const size_t nbytes = ggml_nbytes(&info.t);
 
-        buf.resize(offset + nbytes);
-        if (info.t.buffer) {
-            ggml_backend_tensor_get(&info.t, buf.data() + offset, 0, nbytes);
+        if (info.t.buffer && ggml_backend_buffer_is_host(info.t.buffer)) {
+            GGML_ASSERT(info.t.data != NULL && "tensor not allocated");
+            write(info.t.data, nbytes);
         } else {
-            GGML_ASSERT(info.t.data);
-            memcpy(buf.data() + offset, info.t.data, nbytes);
+            const size_t offset = buf.size();
+            buf.resize(offset + nbytes);
+            if (info.t.buffer) {
+                ggml_backend_tensor_get(&info.t, buf.data() + offset, 0, nbytes);
+            } else {
+                GGML_ASSERT(info.t.data);
+                memcpy(buf.data() + offset, info.t.data, nbytes);
+            }
+            written_bytes += nbytes;
         }
-        written_bytes += nbytes;
 
         pad(alignment);
     }
@@ -1624,20 +1661,33 @@ struct gguf_writer_file final : public gguf_writer_base {
         }
     }
 
+    void write(const void * data, const size_t size) override {
+        const auto ret = fwrite(data, 1, size, file);
+        written_bytes += size;
+        if (ret != size) {
+            throw std::runtime_error("unexpected fwrite number of bytes written, '" + std::to_string(ret) + "' instead of '" + std::to_string(size) + "'");
+        }
+    }
+
     void write_tensor_data(const struct gguf_tensor_info & info, const size_t offset_data, const size_t alignment) override {
         GGML_ASSERT(written_bytes - offset_data == info.offset);
 
         GGML_ASSERT(ggml_is_contiguous(&info.t));
         const size_t nbytes = ggml_nbytes(&info.t);
 
-        std::vector<int8_t> buf(nbytes);
-        if (info.t.buffer) {
-            ggml_backend_tensor_get(&info.t, buf.data(), 0, nbytes);
+        if (info.t.buffer && ggml_backend_buffer_is_host(info.t.buffer)) {
+            GGML_ASSERT(info.t.data != NULL && "tensor not allocated");
+            write(info.t.data, nbytes);
         } else {
-            GGML_ASSERT(info.t.data);
-            memcpy(buf.data(), info.t.data, nbytes);
+            std::vector<int8_t> buf(nbytes);
+            if (info.t.buffer) {
+                ggml_backend_tensor_get(&info.t, buf.data(), 0, nbytes);
+            } else {
+                GGML_ASSERT(info.t.data);
+                memcpy(buf.data(), info.t.data, nbytes);
+            }
+            write(buf);
         }
-        write(buf);
 
         pad(alignment);
     }

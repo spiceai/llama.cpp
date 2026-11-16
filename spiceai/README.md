@@ -15,11 +15,20 @@ It also carries these source patches, which each Spice branch must keep until up
   process. Everywhere else, and on every other thread, a failed check aborts as upstream: the
   C API functions that reach those checks do not catch exceptions. Spice's `llama-cpp` crate
   tests the load path with crafted and corrupted GGUFs.
+- **A GGUF opened by its path whose data section runs past its tensors fails its load**, `ggml/src/gguf.cpp`, not
+  upstream. GGML type 43 was this fork's gather-only MXFP8 (33 bytes per 32 values) before v1.0.0 and is F8_E4M3 (one
+  byte per value) since. Upstream's offset checks refuse such a tensor only when another tensor follows it; read last,
+  it would load with the wrong values. A GGUF opened from a `FILE` may be followed by other data, so that path is not
+  checked.
+- **The RPC protocol's major is upstream's plus 100** (`ggml/include/ggml-rpc.h`, 110 at v1.0.0), since this branch's
+  ops (`GGML_OP_ARGMAX_PART` and `GGML_OP_ARGMAX_MERGE`, appended after upstream's) and commands differ from
+  upstream's: an upstream peer refuses a peer from this branch at the handshake. The HELLO reply's flags byte carries
+  upstream's `rpc_dispatcher_flags` in its low bits and this branch's `rpc_op_cap` bits in its high bits. Bump it with
+  upstream's, and whenever this branch changes an op or a command.
 - **Fixes on top of upstream's DeepSeek-V4.1-Flash (`deepseek41`, ggml-org/llama.cpp#31086)**, not upstream. A GGUF
   whose `attention.output_group_count` is 0 fails its load instead of dividing by zero (`src/models/deepseek4.cpp`,
   which `deepseek41` shares), and `deepseek41`'s output projection applies a LoRA adapter on `output.weight`
-  (`src/models/deepseek41.cpp`). `ggml_validate_row_data` rejects MXFP8 blocks with an E4M3 NaN code
-  (`ggml/src/ggml-quants.c`), so `--check-tensors` catches them. `deepseek41v` image preprocessing
+  (`src/models/deepseek41.cpp`). `deepseek41v` image preprocessing
   (`tools/mtmd/mtmd-image.cpp`) counts the tokens of a placeholder bitmap, and pads an image too thin to keep a pixel at
   the planned size with the pad color alone, as Pillow's `ImageOps.pad` does, instead of failing. With
   `convert_hf_to_gguf.py --remote`, `conversion/deepseek41.py` reads the Engram tables by HTTP range instead of from
@@ -47,7 +56,8 @@ It also carries these source patches, which each Spice branch must keep until up
   upstream's. Drop each once upstream has an equivalent.
 
 Each Spice branch is `spiceai-<release>`: the upstream release tag with the Spice commits on top, made by
-merging the tag into the previous Spice branch (`spiceai-b11999` is `spiceai-b11803` with `b11984`, then `b11999`, merged in). Its tip is tagged `<release>-spiceai.<n>`, a name apart from the
+merging the tag into the previous Spice branch (`spiceai-v1.0.0` is `spiceai-b11999` with `v1.0.0` merged in, and
+`spiceai-b11999` is `spiceai-b11803` with `b11984`, then `b11999`, merged in). Its tip is tagged `<release>-spiceai.<n>`, a name apart from the
 branch's so neither is ambiguous, with `<n>` counting re-packagings of one release. To move
 to a new release:
 
