@@ -634,6 +634,12 @@ static enum ggml_status ggml_backend_metal_graph_compute(ggml_backend_t backend,
     return ggml_metal_graph_compute(ctx, cgraph);
 }
 
+static enum ggml_status ggml_backend_metal_get_status(ggml_backend_t backend) {
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    return ggml_metal_get_status(ctx);
+}
+
 static void ggml_backend_metal_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
     ggml_metal_event_t ev = (ggml_metal_event_t)event->context;
@@ -685,6 +691,7 @@ static ggml_backend_i ggml_backend_metal_i = {
     /* .event_record            = */ ggml_backend_metal_event_record,
     /* .event_wait              = */ ggml_backend_metal_event_wait,
     /* .graph_optimize          = */ ggml_backend_metal_graph_optimize,
+    /* .get_status              = */ ggml_backend_metal_get_status,
 };
 
 static ggml_guid_t ggml_backend_metal_guid(void) {

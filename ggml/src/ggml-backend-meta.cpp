@@ -2470,6 +2470,18 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
+// a failure on any device fails the split: every device's part of a result is part of the whole
+static enum ggml_status ggml_backend_meta_get_status(ggml_backend_t backend) {
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    for (size_t i = 0; i < n_backends; i++) {
+        const enum ggml_status status = ggml_backend_get_status(ggml_backend_meta_simple_backend(backend, i));
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
 // the meta compute buffer the scheduler allocated cgraph in, or nullptr when no node lives in one
 static ggml_backend_buffer_t ggml_backend_meta_graph_compute_buffer(const struct ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -3212,6 +3224,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .event_record            = */ nullptr,
     /* .event_wait              = */ nullptr,
     /* .graph_optimize          = */ nullptr,
+    /* .get_status              = */ ggml_backend_meta_get_status,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {

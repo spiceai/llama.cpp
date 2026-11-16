@@ -277,6 +277,25 @@ llama_build_and_test(test-speculative-rejection-sampling.cpp ARGS
     -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
 set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQUIRED speculative-model)
 
+# a graph the device fails (GGML_BACKEND_FAULT_TEST skips it and fails its backend, as a GPU fault does) fails the reads
+# of what it computed: at the prompt's graph, at a later decode's, and past the first few
+llama_build(test-compute-fault.cpp)
+set(COMPUTE_FAULT_REFERENCE "${CMAKE_CURRENT_BINARY_DIR}/test-compute-fault-reference.bin")
+llama_test(test-compute-fault NAME test-compute-fault-reference
+    ARGS -m "${SPEC_TARGET_DIR}/llama-dense.gguf" --write-reference "${COMPUTE_FAULT_REFERENCE}")
+set_tests_properties(test-compute-fault-reference PROPERTIES
+    FIXTURES_REQUIRED speculative-model
+    FIXTURES_SETUP    compute-fault-reference
+)
+foreach (fault_at 1 2 3 7)
+    llama_test(test-compute-fault NAME test-compute-fault-${fault_at}
+        ARGS -m "${SPEC_TARGET_DIR}/llama-dense.gguf" --reference "${COMPUTE_FAULT_REFERENCE}")
+    set_tests_properties(test-compute-fault-${fault_at} PROPERTIES
+        FIXTURES_REQUIRED "speculative-model;compute-fault-reference"
+        ENVIRONMENT       "GGML_BACKEND_FAULT_TEST=${fault_at}"
+    )
+endforeach()
+
 # Test context state handling across all architectures, using the generated dummy models
 llama_test(
     test-llama-context

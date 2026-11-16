@@ -1031,6 +1031,22 @@ struct llama_decode_timing {
 // per thread: contexts decoding on different threads would otherwise race on these counters and mix their phases
 static thread_local llama_decode_timing g_decode_timing;
 
+bool llama_context::check_backends() {
+    if (backends_failed) {
+        return true;
+    }
+    for (const auto & backend : backends) {
+        if (ggml_backend_get_status(backend.get()) != GGML_STATUS_SUCCESS) {
+            backends_failed = true;
+            LLAMA_LOG_ERROR("%s: %s failed to compute work this context queued, so the context's outputs and state are not "
+                "the computation's and every later decode fails; free the context and create another\n", __func__,
+                ggml_backend_name(backend.get()));
+            break;
+        }
+    }
+    return backends_failed;
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
@@ -1039,6 +1055,7 @@ void llama_context::synchronize() {
     const int64_t t_sync0 = g_decode_timing.on ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
     argmax_copies_pending = false;
+    check_backends();
     if (g_decode_timing.on) {
         g_decode_timing.sync_us += ggml_time_us() - t_sync0;
     }
@@ -2085,6 +2102,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    if (backends_failed) {
+        LLAMA_LOG_ERROR("%s: a backend failed earlier work of this context; free it and create another\n", __func__);
+        return -3;
+    }
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -2333,6 +2355,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (backends_failed) {
+        LLAMA_LOG_ERROR("%s: a backend failed earlier work of this context; free it and create another\n", __func__);
+        return -3;
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -4988,14 +5015,24 @@ void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
 }
 
+int32_t llama_get_compute_status(const llama_context * ctx) {
+    return ctx->compute_failed() ? -3 : 0;
+}
+
 float * llama_get_logits(llama_context * ctx) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return nullptr;
+    }
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return nullptr;
+    }
 
     float * res = nullptr;
 
@@ -5014,11 +5051,17 @@ void llama_set_argmax_output(llama_context * ctx, bool on) {
 
 llama_token llama_get_argmax_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return LLAMA_TOKEN_NULL;
+    }
     return ctx->get_argmax_ith(i);
 }
 
 float * llama_get_unsampled_logits_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return nullptr;
+    }
 
     if (ctx->get_sampled_token_ith(i) != LLAMA_TOKEN_NULL ||
         ctx->get_sampled_logits_ith(i) != nullptr ||
@@ -5031,18 +5074,27 @@ float * llama_get_unsampled_logits_ith(llama_context * ctx, int32_t i) {
 
 float * llama_get_embeddings(llama_context * ctx) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return nullptr;
+    }
 
     return ctx->get_embeddings();
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return nullptr;
+    }
 
     return ctx->get_embeddings_ith(i);
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return nullptr;
+    }
 
     return ctx->get_embeddings_seq(seq_id);
 }
@@ -5093,18 +5145,27 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return nullptr;
+    }
 
     return ctx->get_embeddings_nextn();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return nullptr;
+    }
 
     return ctx->get_embeddings_nextn_ith(i);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return nullptr;
+    }
 
     return ctx->get_embeddings_layer_inp(lid);
 }
@@ -5115,42 +5176,63 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return LLAMA_TOKEN_NULL;
+    }
 
     return ctx->get_sampled_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return nullptr;
+    }
 
     return ctx->get_sampled_probs_ith(i);
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return nullptr;
+    }
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return nullptr;
+    }
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
 
 uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return 0;
+    }
 
     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
 }
 
 uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return 0;
+    }
 
     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
 }
 
 uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return 0;
+    }
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
 }
@@ -5307,19 +5389,30 @@ size_t llama_state_get_size(llama_context * ctx) {
 
 size_t llama_state_get_data(llama_context * ctx, uint8_t * dst, size_t size) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return 0;
+    }
 
-    return ctx->state_get_data(dst, size);
+    const size_t n = ctx->state_get_data(dst, size);
+    // the state's tensors were read through their backends, which the read waited for
+    return ctx->check_backends() ? 0 : n;
 }
 
 // Sets the state reading from the specified source address
 size_t llama_state_set_data(llama_context * ctx, const uint8_t * src, size_t size) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return 0;
+    }
 
     return ctx->state_set_data(src, size);
 }
 
 bool llama_state_load_file(llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return false;
+    }
 
     try {
         return ctx->state_load_file(path_session, tokens_out, n_token_capacity, n_token_count_out);
@@ -5331,9 +5424,12 @@ bool llama_state_load_file(llama_context * ctx, const char * path_session, llama
 
 bool llama_state_save_file(llama_context * ctx, const char * path_session, const llama_token * tokens, size_t n_token_count) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return false;
+    }
 
     try {
-        return ctx->state_save_file(path_session, tokens, n_token_count);
+        return ctx->state_save_file(path_session, tokens, n_token_count) && !ctx->check_backends();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving session file: %s\n", __func__, err.what());
         return false;
@@ -5358,20 +5454,32 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return 0;
+    }
 
-    return ctx->state_seq_get_data(seq_id, dst, size, flags);
+    const size_t n = ctx->state_seq_get_data(seq_id, dst, size, flags);
+    // the sequence's tensors were read through their backends, which the read waited for
+    return ctx->check_backends() ? 0 : n;
 }
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return 0;
+    }
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return 0;
+    }
 
     try {
-        return ctx->state_seq_save_file(seq_id, filepath, tokens, n_token_count);
+        const size_t n = ctx->state_seq_save_file(seq_id, filepath, tokens, n_token_count);
+        return ctx->check_backends() ? 0 : n;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
         return 0;
@@ -5380,6 +5488,9 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
 
 size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     ctx->synchronize();
+    if (ctx->compute_failed()) {
+        return 0;
+    }
 
     try {
         return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out);

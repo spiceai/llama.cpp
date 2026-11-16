@@ -38,6 +38,15 @@ It also carries these source patches, which each Spice branch must keep until up
 - **DFlash drafters over GLM-5.3-Flash (`glm5-next`)**, `src/models/glm5-next.cpp`, not upstream. The same
   layer-input recording for `glm5-next`, which has no hook for it, so a DFlash draft over it aborts in
   `llm_graph_result::set_outputs` (layer input tensor is null).
+- **A computation the device failed fails what reads its results**, not upstream. A backend may report a failure of
+  queued work that it finds only when waiting for it (`get_status` in `ggml/src/ggml-backend-impl.h`,
+  `ggml_backend_get_status`): Metal reports every command buffer that failed since the last synchronize, a graph's
+  included after the next graph reuses its slot (`ggml/src/ggml-metal/ggml-metal-context.m`), and a tensor split
+  reports its devices'. llama fails the context at the first synchronize that sees one (`llama_get_compute_status`,
+  `include/llama.h`): the output getters return NULL, the state functions 0, every later decode -3, and
+  `llama_sampler_sample` `LLAMA_TOKEN_NULL`, instead of the values the failed work left in the buffers.
+  `GGML_BACKEND_FAULT_TEST=N` (`ggml/src/ggml-backend.cpp`) skips the N-th graph of the process and fails its
+  backend, for tests: `tests/test-compute-fault.cpp` checks each read against a run without it.
 - **`GGML_RPC_COMM_HOST`**, `ggml/src/ggml-rpc/ggml-rpc.cpp`, not upstream, on top of upstream's RPC all-reduce. Rank 1 of
   the pairwise all-reduce reaches rank 0 at this address instead of the one rank 0 serves on, so two
   servers that also share a direct link exchange over that link, and over RDMA when the address is a
