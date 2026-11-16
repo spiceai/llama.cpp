@@ -181,6 +181,7 @@ static void usage(char ** argv) {
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
     LOG("  --rollback               Check a recurrent rollback of 1..n tokens (n from --n-rs-seq, default 3) against a decode\n");
     LOG("                           without them, on the CPU and in tensor split mode\n");
+    LOG("  --graph-reuse            Check that flash attention over K/V rows does not stop one-token decodes reusing their graph (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -2295,6 +2296,148 @@ static int test_rollback(const std::string & arch_filter, const size_t seed, con
     return n_failed == 0 ? 0 : 1;
 }
 
+// a decode of one token per sequence on a unified cache with flash attention reuses the graph of the decode before it as
+// often with flash attention over K/V rows on (the default) as with it off (LLAMA_KV_ROWS_DISABLE): a graph rebuilt every
+// step costs its build, and on a model split across devices its split and, over RPC, sending it to every rank again
+static int test_graph_reuse(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    const uint32_t n_prefix = 12;
+    const int      n_steps  = 6;
+    const std::vector<llama_token> tokens = get_tokens(n_prefix + n_steps, 128, seed);
+
+    size_t max_arch_name_length = 0;
+    for (const llm_arch & arch : llama_arch_all()) {
+        max_arch_name_length = std::max(max_arch_name_length, strlen(llama_arch_name(arch)));
+    }
+    const std::string template_row = "|%" + std::to_string(max_arch_name_length) + "s|%6s|%s\n";
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    common_log_flush(common_log_main());
+    LOG("graphs reused over %d one-token decodes of one sequence (of 2) after its prompt\n", n_steps);
+    LOG(template_row.c_str(), "Model arch.", "Config", "Status");
+
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !arch_supported(arch)) {
+            continue;
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+            continue;
+        }
+        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
+        if (encode) {
+            continue;
+        }
+        for (bool moe : {false, true}) {
+            if (moe && !moe_implemented(arch)) {
+                continue;
+            }
+            if (!moe && moe_mandatory(arch)) {
+                continue;
+            }
+            const char * config_name = moe ? "MoE" : "Dense";
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+
+            std::string status;
+            try {
+                ud.verbosity = LOG_LEVEL_OUTPUT;
+                llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+                ud.verbosity = verbosity;
+                // reused[0] with K/V rows on, reused[1] with them off; the variable is read when the context is created
+                int32_t reused[2] = {-1, -1};
+                // every step's logits, which a reused graph must compute as a new one does
+                std::vector<float> logits[2];
+                const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+                for (int off = 0; off < 2; off++) {
+                    if (off) {
+                        setenv("LLAMA_KV_ROWS_DISABLE", "1", 1);
+                    } else {
+                        unsetenv("LLAMA_KV_ROWS_DISABLE");
+                    }
+                    llama_context_params ctx_params = get_ctx_params(false, 0);
+                    ctx_params.n_seq_max       = 2;
+                    ctx_params.kv_unified      = true;
+                    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+                    ctx_params.no_perf         = false;
+                    ud.verbosity = LOG_LEVEL_OUTPUT;
+                    llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+                    ud.verbosity = verbosity;
+                    unsetenv("LLAMA_KV_ROWS_DISABLE");
+                    if (!lctx || llama_get_memory(lctx.get()) == nullptr) {
+                        break;
+                    }
+                    decode_range(lctx.get(), tokens.data(), n_prefix, 0, 0, false);
+                    const int32_t reused0 = llama_perf_context(lctx.get()).n_reused;
+                    for (int i = 0; i < n_steps; i++) {
+                        decode_range(lctx.get(), tokens.data() + n_prefix + i, 1, n_prefix + i, 0, true);
+                        const float * logits_ith = llama_get_logits_ith(lctx.get(), 0);
+                        logits[off].insert(logits[off].end(), logits_ith, logits_ith + n_vocab);
+                    }
+                    reused[off] = llama_perf_context(lctx.get()).n_reused - reused0;
+                }
+                if (reused[0] < 0 || reused[1] < 0) {
+                    LOG(template_row.c_str(), llama_arch_name(arch), config_name, "\033[1;33mSKIP\033[0m (context)");
+                    continue;
+                }
+                n_tests++;
+                char buf[200];
+                const double nmse_logits = nmse(logits[0], logits[1]);
+                // the first one-token decode follows the prompt's graph, every later one can reuse its predecessor's
+                if (!(nmse_logits <= 1e-4)) {
+                    n_failed++;
+                    snprintf(buf, sizeof(buf), "\033[1;31mFAIL\033[0m (logits differ with K/V rows and without: NMSE %.2e)", nmse_logits);
+                } else if (reused[0] < reused[1]) {
+                    n_failed++;
+                    snprintf(buf, sizeof(buf), "\033[1;31mFAIL\033[0m (%d of %d reused with K/V rows, %d without)", reused[0], n_steps - 1, reused[1]);
+                } else if (reused[1] < n_steps - 1) {
+                    snprintf(buf, sizeof(buf), "\033[1;33mOK\033[0m (%d of %d reused with K/V rows, %d without: never reused either way)", reused[0], n_steps - 1, reused[1]);
+                } else {
+                    snprintf(buf, sizeof(buf), "\033[1;32mOK\033[0m (%d of %d reused with K/V rows and without)", reused[0], n_steps - 1);
+                }
+                status = buf;
+            } catch (const std::exception & err) {
+                ud.verbosity = verbosity;
+                n_tests++;
+                n_failed++;
+                status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
+            }
+            LOG(template_row.c_str(), llama_arch_name(arch), config_name, status.c_str());
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -2310,6 +2453,7 @@ int main(int argc, char ** argv) {
     const char * target_backend = nullptr;
     bool kv_shift = false;
     bool rollback = false;
+    bool graph_reuse = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2397,6 +2541,8 @@ int main(int argc, char ** argv) {
             kv_shift = true;
         } else if (strcmp(argv[i], "--rollback") == 0) {
             rollback = true;
+        } else if (strcmp(argv[i], "--graph-reuse") == 0) {
+            graph_reuse = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -2420,6 +2566,9 @@ int main(int argc, char ** argv) {
         }
         if (rollback) {
             return test_rollback(arch_filter, seed, stdev, verbosity);
+        }
+        if (graph_reuse) {
+            return test_graph_reuse(arch_filter, seed, stdev, verbosity);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {
