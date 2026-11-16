@@ -658,6 +658,127 @@ static int test_meta_flat_quantized_rows(ggml_backend_dev_t dev, ggml_type type,
     return n_diff != 0;
 }
 
+// tensors named "*split1" are split along axis 1 into the element counts userdata holds, everything else is mirrored
+static ggml_backend_meta_split_state split1_state(const ggml_tensor * tensor, void * userdata) {
+    const std::vector<int64_t> & ne = *(const std::vector<int64_t> *) userdata;
+    const std::string name = tensor->name;
+    if (name.size() >= 6 && name.compare(name.size() - 6, 6, "split1") == 0) {
+        ggml_backend_meta_split_state ss = {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        for (size_t j = 0; j < ne.size(); j++) {
+            ss.ne[j] = ne[j];
+        }
+        return ss;
+    }
+    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+}
+
+// The two parts of each head of an MLA query, as Mistral Large 4 builds them: a product whose rows a tensor split divides
+// by whole heads, viewed per head (a view strided by the head size), the rope part starting past the head's other part.
+// Each device's view must start as far into its heads as the whole view starts into the whole query's: made contiguous
+// and gathered, each part must equal the same part of the product on the device alone, bit for bit (a row's dot product
+// does not depend on which device computes it). Scaling the rope part's offset by the device's share of the heads reads
+// the other part of each head instead, or, when the share does not divide the offset, values from an address no value
+// starts at.
+static int test_meta_view_within_heads(ggml_backend_dev_t dev, const std::vector<int64_t> & heads) {
+    const int     n_parts  = (int) heads.size();
+    const int64_t n_embd   = 64;
+    const int64_t d_nope   = 128;
+    const int64_t d_rope   = 64;
+    const int64_t d_head   = d_nope + d_rope;
+    const int64_t n_tokens = 5;
+    int64_t n_head = 0;
+    std::vector<int64_t> rows; // the weight's rows each device holds: whole heads
+    std::string layout;
+    for (int64_t h : heads) {
+        n_head += h;
+        rows.push_back(h*d_head);
+        layout += (layout.empty() ? "" : "/") + std::to_string(h);
+    }
+    std::vector<ggml_backend_dev_t> devs(n_parts, dev);
+
+    std::mt19937 rng(42);
+    std::normal_distribution<float> nd;
+    std::vector<float> wf(n_embd*n_head*d_head);
+    for (int64_t r = 0; r < n_head*d_head; r++) {
+        for (int64_t i = 0; i < n_embd; i++) {
+            wf[r*n_embd + i] = (float) (r % 97) + 0.25f*nd(rng); // rows apart, so a value read from another row shows
+        }
+    }
+    std::vector<float> xf(n_embd*n_tokens);
+    for (float & x : xf) {
+        x = nd(rng);
+    }
+
+    // each part of each head, on the meta device (gathered) or on the device alone
+    auto run = [&](bool split, std::vector<float> & nope, std::vector<float> & pe) {
+        ggml_backend_t backend = split
+            ? ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), split1_state, &rows), nullptr)
+            : ggml_backend_dev_init(dev, nullptr);
+        GGML_ASSERT(backend != nullptr);
+        ggml_init_params wp = { ggml_tensor_overhead()*2, nullptr, true };
+        ggml_context * ctx_w = ggml_init(wp);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd, n_head*d_head);
+        ggml_set_name(w, "attn_q_split1");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+        GGML_ASSERT(wbuf != nullptr);
+        ggml_backend_tensor_set(w, wf.data(), 0, ggml_nbytes(w));
+        ggml_backend_tensor_set(x, xf.data(), 0, ggml_nbytes(x));
+
+        ggml_init_params gp = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(gp);
+        ggml_tensor * q      = ggml_mul_mat(ctx, w, x); // {n_head*d_head, n_tokens}, split by whole heads along axis 0
+        ggml_tensor * q_nope = ggml_cont(ctx, ggml_view_3d(ctx, q, d_nope, n_head, n_tokens, d_head*sizeof(float), q->nb[1], 0));
+        ggml_tensor * q_pe   = ggml_cont(ctx, ggml_view_3d(ctx, q, d_rope, n_head, n_tokens, d_head*sizeof(float), q->nb[1],
+            d_nope*sizeof(float)));
+        if (split) {
+            q_nope = ggml_backend_meta_gather(ctx, q_nope);
+            q_pe   = ggml_backend_meta_gather(ctx, q_pe);
+        }
+        ggml_set_output(q_nope);
+        ggml_set_output(q_pe);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, q_nope);
+        ggml_build_forward_expand(gf, q_pe);
+        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        nope.resize(ggml_nelements(q_nope));
+        pe.resize(ggml_nelements(q_pe));
+        ggml_backend_tensor_get(q_nope, nope.data(), 0, ggml_nbytes(q_nope));
+        ggml_backend_tensor_get(q_pe,   pe.data(),   0, ggml_nbytes(q_pe));
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(ctx_w);
+        ggml_backend_free(backend);
+    };
+    std::vector<float> ref_nope, ref_pe, got_nope, got_pe;
+    run(false, ref_nope, ref_pe);
+    run(true,  got_nope, got_pe);
+
+    int n_fail = 0;
+    for (const auto & [what, ref, got] : {std::tuple<const char *, const std::vector<float> &, const std::vector<float> &>{"other", ref_nope, got_nope},
+                                          std::tuple<const char *, const std::vector<float> &, const std::vector<float> &>{"rope",  ref_pe,   got_pe}}) {
+        int64_t n_diff = 0, first = -1;
+        for (size_t i = 0; i < ref.size(); i++) {
+            if (!same_float(ref[i], got[i])) {
+                n_diff++;
+                first = first < 0 ? (int64_t) i : first;
+            }
+        }
+        printf("  %s MLA query's %s part of each head, heads %s: %lld of %zu values differ from the device alone", ggml_backend_dev_name(dev),
+            what, layout.c_str(), (long long) n_diff, ref.size());
+        if (first >= 0) {
+            printf(" (first at %lld: %g, want %g)", (long long) first, got[first], ref[first]);
+        }
+        printf(" %s\n", n_diff == 0 ? "ok" : "FAIL");
+        n_fail += n_diff != 0;
+    }
+    return n_fail;
+}
+
 // a transposed F32 rows view: its split moves to axis 0, whose stride is still the matrix's row stride, so each device's
 // part starts at its rows times that stride. Made contiguous and gathered, it must equal the transposed matrix.
 static int test_meta_transposed_rows(ggml_backend_dev_t dev, const std::vector<int64_t> & parts) {
@@ -991,6 +1112,10 @@ int main() {
         }
         n_fail += test_meta_transposed_rows(dev, even_parts(1000, n_parts));
         n_fail += test_meta_whole_rows(dev, n_parts);
+    }
+    // the MLA query's parts of each head, whole heads per device: even, and uneven over four devices
+    for (const std::vector<int64_t> & heads : {std::vector<int64_t>{3, 3}, std::vector<int64_t>{2, 2, 2}, std::vector<int64_t>{2, 2, 1, 1}}) {
+        n_fail += test_meta_view_within_heads(dev, heads);
     }
     for (int n_parts : {2, 3}) {
         const std::vector<int64_t> parts = even_parts(v, n_parts);

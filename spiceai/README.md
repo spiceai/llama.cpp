@@ -38,6 +38,13 @@ It also carries these source patches, which each Spice branch must keep until up
 - **DFlash drafters over GLM-5.3-Flash (`glm5-next`)**, `src/models/glm5-next.cpp`, not upstream. The same
   layer-input recording for `glm5-next`, which has no hook for it, so a DFlash draft over it aborts in
   `llm_graph_result::set_outputs` (layer input tensor is null).
+- **A tensor split keeps the offset of a view that picks the same part of every element along the split axis**,
+  `ggml/src/ggml-backend-meta.cpp`, not upstream. Each device's copy of a view of a split tensor starts at the view's
+  offset scaled by the device's share of the split axis, unless the offset lies inside the data split; the check
+  missed a view strided by the element that starts past part of each element, the rope part of each head of an MLA
+  query (Mistral Large 4), so each device's rope read another part of its heads, and from an address no float starts
+  at when its share does not divide the offset (NaN logits on three devices). `tests/test-argmax-split.cpp` checks
+  both parts of each head against one device.
 - **`GGML_RPC_COMM_HOST`**, `ggml/src/ggml-rpc/ggml-rpc.cpp`, not upstream, on top of upstream's RPC all-reduce. Rank 1 of
   the pairwise all-reduce reaches rank 0 at this address instead of the one rank 0 serves on, so two
   servers that also share a direct link exchange over that link, and over RDMA when the address is a
