@@ -43,9 +43,11 @@ It also carries these source patches, which each Spice branch must keep until up
   offset scaled by the device's share of the split axis, unless the offset lies inside the data split; the check
   missed a view strided by the element that starts past part of each element, the rope part of each head of an MLA
   query (Mistral Large 4), so each device's rope read another part of its heads, and from an address no float starts
-  at when its share does not divide the offset (NaN logits on three devices). Views of a gated delta net's result
-  are excluded: its attention output, packed before the states, is split too. `tests/test-argmax-split.cpp` checks
-  both parts of each head, and a gated delta net's new state and a same-stride crop of it, against one device.
+  at when its share does not divide the offset (NaN logits on three devices). The offset is kept only when the
+  source's split is one segment that the view's elements fill; a source that splits something before them
+  independently (a fused prefix in its own segment, a gated delta net's attention output before its states) still
+  scales. `tests/test-argmax-split.cpp` checks both parts of each head, a gated delta net's new state and a
+  same-stride crop of it, and a view of the heads past a segmented prefix, against one device.
 - **`GGML_RPC_COMM_HOST`**, `ggml/src/ggml-rpc/ggml-rpc.cpp`, not upstream, on top of upstream's RPC all-reduce. Rank 1 of
   the pairwise all-reduce reaches rank 0 at this address instead of the one rank 0 serves on, so two
   servers that also share a direct link exchange over that link, and over RDMA when the address is a

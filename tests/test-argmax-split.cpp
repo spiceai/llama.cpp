@@ -918,6 +918,108 @@ static int test_meta_delta_net_state_views(ggml_backend_dev_t dev, const std::ve
     return n_fail;
 }
 
+// tensors named "*seg1" are split along axis 1 in the segments userdata holds (ggml_backend_meta_split_state::ne, one
+// entry per segment and device), everything else is mirrored
+static ggml_backend_meta_split_state seg1_state(const ggml_tensor * tensor, void * userdata) {
+    const ggml_backend_meta_split_state & ss = *(const ggml_backend_meta_split_state *) userdata;
+    const std::string name = tensor->name;
+    if (name.size() >= 4 && name.compare(name.size() - 4, 4, "seg1") == 0) {
+        return ss;
+    }
+    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+}
+
+// A product whose rows are fused: a prefix and then the heads, each its own segment of the split, and a view of the heads
+// strided by the head size whose offset skips the prefix and whose extent below the heads fits in one head. The prefix
+// before each device's heads is that device's share of it, not the whole prefix, so each device's view starts at the
+// offset scaled by its share. Made contiguous and gathered, the view must equal the device alone's, bit for bit.
+static int test_meta_view_past_segmented_prefix(ggml_backend_dev_t dev, int n_parts) {
+    const int64_t n_embd   = 64;
+    const int64_t n_prefix = 96;
+    const int64_t n_head   = 6;
+    const int64_t d_head   = 256;
+    const int64_t d_view   = 16; // the view: [d_view, 4, n_head, n_tokens] of each head's first 64 values
+    const int64_t n_tokens = 5;
+    const int64_t n_rows   = n_prefix + n_head*d_head;
+    GGML_ASSERT(n_prefix % n_parts == 0 && n_head % n_parts == 0);
+    ggml_backend_meta_split_state ss = {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1, 1}, 2};
+    for (int j = 0; j < n_parts; j++) {
+        ss.ne[0*n_parts + j] = n_prefix/n_parts;
+        ss.ne[1*n_parts + j] = n_head/n_parts*d_head;
+    }
+    std::vector<ggml_backend_dev_t> devs(n_parts, dev);
+
+    std::mt19937 rng(42);
+    std::normal_distribution<float> nd;
+    std::vector<float> wf(n_embd*n_rows);
+    for (int64_t r = 0; r < n_rows; r++) {
+        for (int64_t i = 0; i < n_embd; i++) {
+            wf[r*n_embd + i] = (float) (r % 97) + 0.25f*nd(rng); // rows apart, so a value read from another row shows
+        }
+    }
+    std::vector<float> xf(n_embd*n_tokens);
+    for (float & x : xf) {
+        x = nd(rng);
+    }
+
+    auto run = [&](bool split, std::vector<float> & out) {
+        ggml_backend_t backend = split
+            ? ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), seg1_state, &ss), nullptr)
+            : ggml_backend_dev_init(dev, nullptr);
+        GGML_ASSERT(backend != nullptr);
+        ggml_init_params wp = { ggml_tensor_overhead()*2, nullptr, true };
+        ggml_context * ctx_w = ggml_init(wp);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_set_name(w, "attn_fused_seg1");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+        GGML_ASSERT(wbuf != nullptr);
+        ggml_backend_tensor_set(w, wf.data(), 0, ggml_nbytes(w));
+        ggml_backend_tensor_set(x, xf.data(), 0, ggml_nbytes(x));
+
+        ggml_init_params gp = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(gp);
+        ggml_tensor * q = ggml_mul_mat(ctx, w, x); // {n_rows, n_tokens}: the prefix, then the heads
+        ggml_tensor * v = ggml_cont(ctx, ggml_view_4d(ctx, q, d_view, 4, n_head, n_tokens,
+            d_view*sizeof(float), d_head*sizeof(float), q->nb[1], n_prefix*sizeof(float)));
+        if (split) {
+            v = ggml_backend_meta_gather(ctx, v);
+        }
+        ggml_set_output(v);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, v);
+        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        out.resize(ggml_nelements(v));
+        ggml_backend_tensor_get(v, out.data(), 0, ggml_nbytes(v));
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(ctx_w);
+        ggml_backend_free(backend);
+    };
+    std::vector<float> ref, got;
+    run(false, ref);
+    run(true,  got);
+
+    int64_t n_diff = 0, first = -1;
+    for (size_t i = 0; i < ref.size(); i++) {
+        if (!same_float(ref[i], got[i])) {
+            n_diff++;
+            first = first < 0 ? (int64_t) i : first;
+        }
+    }
+    printf("  %s view of the heads past a segmented prefix, %d devices: %lld of %zu values differ from the device alone",
+        ggml_backend_dev_name(dev), n_parts, (long long) n_diff, ref.size());
+    if (first >= 0) {
+        printf(" (first at %lld: %g, want %g)", (long long) first, got[first], ref[first]);
+    }
+    printf(" %s\n", n_diff == 0 ? "ok" : "FAIL");
+    return n_diff != 0;
+}
+
 // a transposed F32 rows view: its split moves to axis 0, whose stride is still the matrix's row stride, so each device's
 // part starts at its rows times that stride. Made contiguous and gathered, it must equal the transposed matrix.
 static int test_meta_transposed_rows(ggml_backend_dev_t dev, const std::vector<int64_t> & parts) {
@@ -1259,6 +1361,10 @@ int main() {
     // a gated delta net's new state and a same-stride crop of it, split by heads: the attention output before them is split too
     for (const std::vector<int64_t> & heads : {std::vector<int64_t>{3, 3}, std::vector<int64_t>{2, 2, 2}}) {
         n_fail += test_meta_delta_net_state_views(dev, heads);
+    }
+    // a view of the heads of a product whose prefix is its own segment of the split
+    for (int n_parts : {2, 3}) {
+        n_fail += test_meta_view_past_segmented_prefix(dev, n_parts);
     }
     for (int n_parts : {2, 3}) {
         const std::vector<int64_t> parts = even_parts(v, n_parts);
