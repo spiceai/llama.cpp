@@ -2085,6 +2085,11 @@ static int test_kv_shift(const std::string & arch_filter, const size_t seed, con
     return n_failed == 0 ? 0 : 1;
 }
 
+// the memory has no snapshot to roll back to: an architecture that keeps none refuses on every device
+struct rollback_refused : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // decodes the prefix, its last n_tail tokens as a batch of their own, as speculative decoding verifies a draft, keeps its
 // first n_keep tokens and returns the logits of the probe decoded after them: removing the last tokens of a recurrent
 // memory rolls its state back to the snapshot it kept of that point of the last ubatch
@@ -2101,7 +2106,7 @@ static std::vector<float> get_logits_rollback(
     }
     decode_range(lctx, prefix.data() + n_head, prefix.size() - n_head, n_head, 0, false);
     if (n_keep < prefix.size() && !llama_memory_seq_rm(mem, 0, n_keep, -1)) {
-        throw std::runtime_error("the memory refused to roll back " + std::to_string(prefix.size() - n_keep) + " token(s)");
+        throw rollback_refused("the memory refused to roll back " + std::to_string(prefix.size() - n_keep) + " token(s)");
     }
     decode_range(lctx, probe.data(), probe.size(), n_keep, 0, true);
 
@@ -2203,7 +2208,11 @@ static int test_rollback(const std::string & arch_filter, const size_t seed, con
             }
 
             std::vector<std::vector<float>> fresh_cpu;
+            bool cpu_refused = false;
             for (const auto & config : configs) {
+                if (cpu_refused) {
+                    break;
+                }
                 const std::string & label = config.first;
                 std::pair<llama_model_ptr, llama_context_ptr> mc;
                 try {
@@ -2255,6 +2264,16 @@ static int test_rollback(const std::string & arch_filter, const size_t seed, con
                         snprintf(buf, sizeof(buf), "\033[1;32mOK\033[0m (%.2e, vs. CPU %.2e, control %.2e)", worst, worst_cpu, control);
                     }
                     status = buf;
+                } catch (const rollback_refused & err) {
+                    if (label == "CPU") {
+                        // the architecture keeps no snapshots, there is nothing to compare a split against
+                        n_tests--;
+                        cpu_refused = true;
+                        status = std::string("\033[1;33mSKIP\033[0m (") + err.what() + ")";
+                    } else {
+                        n_failed++;
+                        status = std::string("\033[1;31mFAIL\033[0m (") + err.what() + ", which the CPU did)";
+                    }
                 } catch (const std::exception & err) {
                     n_failed++;
                     status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
