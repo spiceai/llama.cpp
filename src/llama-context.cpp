@@ -386,11 +386,14 @@ llama_context::llama_context(
         cparams.fused_kv_rows = false;
 
         const char * LLAMA_KV_ROWS_DISABLE = getenv("LLAMA_KV_ROWS_DISABLE");
-        if (!LLAMA_KV_ROWS_DISABLE) {
-            cparams.auto_fkvr = cparams.kv_unified;
-        } else {
+        if (LLAMA_KV_ROWS_DISABLE) {
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
             cparams.auto_fkvr = false;
+        } else if (params.kv_rows_type == LLAMA_KV_ROWS_TYPE_DISABLED) {
+            LLAMA_LOG_INFO("%s: kv_rows_type disabled, attending over every used cell\n", __func__);
+            cparams.auto_fkvr = false;
+        } else {
+            cparams.auto_fkvr = cparams.kv_unified;
         }
     }
 
@@ -4734,6 +4737,7 @@ llama_context_params llama_context_default_params() {
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
         /*.attention_type              =*/ LLAMA_ATTENTION_TYPE_UNSPECIFIED,
         /*.flash_attn_type             =*/ LLAMA_FLASH_ATTN_TYPE_AUTO,
+        /*.kv_rows_type                =*/ LLAMA_KV_ROWS_TYPE_AUTO,
         /*.rope_freq_base              =*/ 0.0f,
         /*.rope_freq_scale             =*/ 0.0f,
         /*.yarn_ext_factor             =*/ -1.0f,

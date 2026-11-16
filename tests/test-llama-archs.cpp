@@ -179,6 +179,7 @@ static void usage(char ** argv) {
     LOG("  --rpc <host:port,...>    Split the tensor split (Meta) config across these RPC servers' devices only\n");
     LOG("  --n-rs-seq <n>           Keep n recurrent-state snapshots per sequence, as speculative decoding does\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
+    LOG("  --kv-rows                Check that kv_rows_type disables flash attention over K/V rows, with the same logits (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -2082,6 +2083,179 @@ static int test_kv_shift(const std::string & arch_filter, const size_t seed, con
     return n_failed == 0 ? 0 : 1;
 }
 
+// whether a computed flash attention reads K/V through rows (ggml_flash_attn_ext_rows)
+struct kv_rows_seen {
+    bool fa   = false;
+    bool rows = false;
+};
+
+static bool kv_rows_seen_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    kv_rows_seen * seen = (kv_rows_seen *) user_data;
+    if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+        seen->fa = true;
+        seen->rows = seen->rows || t->src[5] != nullptr;
+    }
+    return ask ? false : true;
+}
+
+// decodes two sequences of different lengths at once on a unified cache with flash attention, and returns every
+// output's logits: kv_rows_type AUTO may attend over each sequence's own K/V rows, DISABLED attends over every used cell
+static std::vector<float> get_logits_two_seqs(llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens) {
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_a = tokens.size()/2 + 3;
+    llama_memory_clear(llama_get_memory(lctx), true);
+    decode_range(lctx, tokens.data(), n_a, 0, 0, false);
+    decode_range(lctx, tokens.data() + n_a, tokens.size() - n_a, 0, 1, false);
+    // one batch holding one more token of each sequence, so the step attends to both
+    common_batch batch(lctx);
+    batch.add(tokens[0], n_a, 0, true);
+    batch.add(tokens[1], tokens.size() - n_a, 1, true);
+    if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+        throw std::runtime_error("failed to decode batch");
+    }
+    std::vector<float> ret;
+    for (int32_t i = 0; i < 2; i++) {
+        const float * logits_ith = llama_get_logits_ith(lctx, i);
+        ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+    }
+    return ret;
+}
+
+// kv_rows_type: AUTO attends over K/V rows on a unified cache, DISABLED does not, and both give the same logits
+static int test_kv_rows_type(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    const std::vector<llama_token> tokens = get_tokens(24, 128, seed);
+    const double thold = 1e-4;
+
+    size_t max_arch_name_length = 0;
+    for (const llm_arch & arch : llama_arch_all()) {
+        max_arch_name_length = std::max(max_arch_name_length, strlen(llama_arch_name(arch)));
+    }
+    const std::string template_row = "|%" + std::to_string(max_arch_name_length) + "s|%6s|%s\n";
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    common_log_flush(common_log_main());
+    LOG(template_row.c_str(), "Model arch.", "Config", "Status");
+
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !arch_supported(arch)) {
+            continue;
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+            continue;
+        }
+        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
+        if (encode) {
+            continue;
+        }
+        for (bool moe : {false, true}) {
+            if (moe && !moe_implemented(arch)) {
+                continue;
+            }
+            if (!moe && moe_mandatory(arch)) {
+                continue;
+            }
+            const char * config_name = moe ? "MoE" : "Dense";
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+
+            llama_model_ptr model;
+            try {
+                ud.verbosity = LOG_LEVEL_OUTPUT;
+                model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
+                ud.verbosity = verbosity;
+            } catch (const std::exception & err) {
+                ud.verbosity = verbosity;
+                LOG(template_row.c_str(), llama_arch_name(arch), config_name, "\033[1;31mERROR\033[0m (model load)");
+                n_tests++;
+                n_failed++;
+                continue;
+            }
+
+            std::vector<float> logits[2];
+            kv_rows_seen seen[2];
+            bool skip = false;
+            std::string status;
+            try {
+                for (int i = 0; i < 2 && !skip; i++) {
+                    llama_context_params ctx_params = get_ctx_params(false, 0);
+                    ctx_params.n_seq_max       = 2;
+                    ctx_params.kv_unified      = true;
+                    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+                    ctx_params.kv_rows_type    = i == 0 ? LLAMA_KV_ROWS_TYPE_AUTO : LLAMA_KV_ROWS_TYPE_DISABLED;
+                    ctx_params.cb_eval           = kv_rows_seen_cb;
+                    ctx_params.cb_eval_user_data = &seen[i];
+                    ud.verbosity = LOG_LEVEL_OUTPUT;
+                    llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+                    ud.verbosity = verbosity;
+                    if (!lctx || llama_get_memory(lctx.get()) == nullptr) {
+                        skip = true;
+                        break;
+                    }
+                    logits[i] = get_logits_two_seqs(model.get(), lctx.get(), tokens);
+                }
+            } catch (const std::exception & err) {
+                n_tests++;
+                n_failed++;
+                LOG(template_row.c_str(), llama_arch_name(arch), config_name, (std::string("\033[1;31mERROR\033[0m (") + err.what() + ")").c_str());
+                continue;
+            }
+            if (skip || !seen[0].fa) {
+                LOG(template_row.c_str(), llama_arch_name(arch), config_name, "\033[1;33mSKIP\033[0m (no flash attention over a unified cache)");
+                continue;
+            }
+            if (!seen[0].rows && !seen[1].rows) {
+                // the architecture builds its own attention, which takes no K/V rows (e.g. MLA with a sparse selection)
+                LOG(template_row.c_str(), llama_arch_name(arch), config_name, "\033[1;33mSKIP\033[0m (its attention reads no K/V rows)");
+                continue;
+            }
+            n_tests++;
+            const double nmse_logits = nmse(logits[0], logits[1]);
+            char buf[160];
+            if (!seen[0].rows || seen[1].rows || !(nmse_logits <= thold)) {
+                n_failed++;
+                snprintf(buf, sizeof(buf), "\033[1;31mFAIL\033[0m (rows read: auto %d, disabled %d; NMSE %.2e)",
+                    (int) seen[0].rows, (int) seen[1].rows, nmse_logits);
+            } else {
+                snprintf(buf, sizeof(buf), "\033[1;32mOK\033[0m (auto reads rows, disabled does not; NMSE %.2e)", nmse_logits);
+            }
+            LOG(template_row.c_str(), llama_arch_name(arch), config_name, buf);
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -2096,6 +2270,7 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool kv_shift = false;
+    bool kv_rows = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2181,6 +2356,8 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[i], "--kv-shift") == 0) {
             kv_shift = true;
+        } else if (strcmp(argv[i], "--kv-rows") == 0) {
+            kv_rows = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -2201,6 +2378,9 @@ int main(int argc, char ** argv) {
         }
         if (kv_shift) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);
+        }
+        if (kv_rows) {
+            return test_kv_rows_type(arch_filter, seed, stdev, verbosity);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {

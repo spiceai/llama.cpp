@@ -198,6 +198,13 @@ extern "C" {
 
     LLAMA_API const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type);
 
+    // whether flash attention with a unified cache attends over each sequence's own K/V rows only
+    // (ggml_flash_attn_ext_rows) instead of over every used cell with a mask
+    enum llama_kv_rows_type {
+        LLAMA_KV_ROWS_TYPE_AUTO     = -1, // when flash attention is on, the cache is unified and the devices support it
+        LLAMA_KV_ROWS_TYPE_DISABLED = 0,
+    };
+
     enum llama_split_mode {
         LLAMA_SPLIT_MODE_NONE   = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
@@ -380,6 +387,7 @@ extern "C" {
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
         enum llama_attention_type    attention_type;    // attention type to use for embeddings
         enum llama_flash_attn_type   flash_attn_type;   // when to enable Flash Attention
+        enum llama_kv_rows_type      kv_rows_type;      // when to attend over each sequence's own K/V rows [EXPERIMENTAL]
 
         // ref: https://github.com/ggml-org/llama.cpp/pull/2054
         float    rope_freq_base;   // RoPE base frequency, 0 = from model
