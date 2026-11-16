@@ -899,6 +899,12 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
     const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
     const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
 
+    // the getters waited for the decode: when a backend failed it, there is nothing to sample from
+    if (llama_get_compute_status(ctx) != 0) {
+        LLAMA_LOG_ERROR("%s: the context failed computing its outputs, so there is no token to sample\n", __func__);
+        return LLAMA_TOKEN_NULL;
+    }
+
     // If a backend sampler has already sampled a token, return it.
     if (sampled_token != LLAMA_TOKEN_NULL) {
         LLAMA_LOG_DEBUG("%s: Backend sampler selected token for idx %d. Skipping CPU samplers\n", __func__, idx);

@@ -22,6 +22,9 @@
 
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
+
+    // synchronize has read its status since it was queued
+    bool checked;
 };
 
 struct ggml_metal {
@@ -79,8 +82,8 @@ struct ggml_metal {
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
 
-    // error state - set when a command buffer fails during synchronize
-    // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
+    // error state - set when synchronize finds a command buffer that failed (a GPU fault, for one), and reported by
+    // ggml_metal_get_status; once set, graph_compute returns GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
 };
 
@@ -178,7 +181,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         res->gf = nil;
         res->encode_async = nil;
         for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
-            res->cmd_bufs[i].obj = nil;
+            res->cmd_bufs[i].obj     = nil;
+            res->cmd_bufs[i].checked = false;
         }
 
         res->cmd_bufs_ext = [[NSMutableArray alloc] init];
@@ -251,66 +255,83 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
+// a command buffer the queue is done with that did not complete: logs why and sets the context's error state
+static bool ggml_metal_cmd_buf_failed(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf, const char * what, int idx) {
+    const MTLCommandBufferStatus status = [cmd_buf status];
+    if (status == MTLCommandBufferStatusCompleted) {
+        return false;
+    }
+    GGML_LOG_ERROR("%s: error: %s command buffer %d failed with status %d\n", "ggml_metal_synchronize", what, idx, (int) status);
+    if (status == MTLCommandBufferStatusError) {
+        GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+    }
+    ctx->has_error = true;
+    return true;
+}
+
 void ggml_metal_synchronize(ggml_metal_t ctx) {
-    // wait for any backend operations to finish
+    // wait for any backend operations to finish: every command buffer is queued in order, so once the last one is done
+    // the queue is done with all of them
     if (ctx->cmd_buf_last) {
         [ctx->cmd_buf_last waitUntilCompleted];
         ctx->cmd_buf_last = nil;
     }
 
-    // check status of all command buffers
-    {
-        const int n_cb = ctx->n_cb;
-
-        for (int cb_idx = 0; cb_idx <= n_cb; ++cb_idx) {
-            id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
-            if (!cmd_buf) {
-                continue;
-            }
-
-            MTLCommandBufferStatus status = [cmd_buf status];
-            if (status != MTLCommandBufferStatusCompleted) {
-                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, cb_idx, (int) status);
-                if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
-                }
-                ctx->has_error = true;
-                return;
-            }
+    // check the status of every command buffer queued since the last synchronize: the current graph's, and the extra ones,
+    // which hold the earlier graphs' (see ggml_metal_retire_graph_cmd_buf), the async copies and the event signals.
+    // A failure anywhere leaves results that later work read wrong, so it fails the whole backend, not one operation
+    for (int cb_idx = 0; cb_idx <= ctx->n_cb; ++cb_idx) {
+        id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
+        if (cmd_buf && !ctx->cmd_bufs[cb_idx].checked) {
+            ggml_metal_cmd_buf_failed(ctx, cmd_buf, "graph", cb_idx);
+            ctx->cmd_bufs[cb_idx].checked = true;
         }
     }
 
-    // release any completed extra command buffers
-    if (ctx->cmd_bufs_ext.count > 0) {
-        for (size_t i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
-            id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
-
-            MTLCommandBufferStatus status = [cmd_buf status];
-            if (status != MTLCommandBufferStatusCompleted) {
-                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
-                if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
-                }
-
-                // release this and all remaining command buffers before returning
-                for (size_t j = i; j < ctx->cmd_bufs_ext.count; ++j) {
-                    [ctx->cmd_bufs_ext[j] release];
-                }
-                [ctx->cmd_bufs_ext removeAllObjects];
-
-                ctx->has_error = true;
-                return;
-            }
-
-            [cmd_buf release];
-        }
-
-        [ctx->cmd_bufs_ext removeAllObjects];
+    for (size_t i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
+        id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
+        ggml_metal_cmd_buf_failed(ctx, cmd_buf, "extra", (int) i);
+        [cmd_buf release];
     }
+    [ctx->cmd_bufs_ext removeAllObjects];
 
     @autoreleasepool {
         [ctx->buf_refs removeAllObjects];
     }
+}
+
+enum ggml_status ggml_metal_get_status(ggml_metal_t ctx) {
+    // a read the backend did not synchronize for (one an event ordered) still sees a failure: a command buffer that
+    // failed keeps its status, read here without waiting for the others
+    for (int cb_idx = 0; cb_idx <= ctx->n_cb && !ctx->has_error; ++cb_idx) {
+        id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
+        if (cmd_buf && [cmd_buf status] == MTLCommandBufferStatusError) {
+            ggml_metal_cmd_buf_failed(ctx, cmd_buf, "graph", cb_idx);
+        }
+    }
+    for (size_t i = 0; i < ctx->cmd_bufs_ext.count && !ctx->has_error; ++i) {
+        id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
+        if ([cmd_buf status] == MTLCommandBufferStatusError) {
+            ggml_metal_cmd_buf_failed(ctx, cmd_buf, "extra", (int) i);
+        }
+    }
+    return ctx->has_error ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
+}
+
+// a graph's command buffers are reused by the next graph: those synchronize has not checked yet move to the extra command
+// buffers, so that synchronize still sees a failure in a graph an earlier decode or ubatch queued
+static void ggml_metal_retire_graph_cmd_buf(ggml_metal_t ctx, int cb_idx) {
+    id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
+    if (!cmd_buf) {
+        return;
+    }
+    if (ctx->cmd_bufs[cb_idx].checked) {
+        [cmd_buf release];
+    } else {
+        // the extra command buffers hold the array's reference and one of their own, which this one already has
+        [ctx->cmd_bufs_ext addObject:cmd_buf];
+    }
+    ctx->cmd_bufs[cb_idx].obj = nil;
 }
 
 static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_tensor * t) {
@@ -569,10 +590,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
 
-            if (ctx->cmd_bufs[n_cb].obj) {
-                [ctx->cmd_bufs[n_cb].obj release];
-            }
-            ctx->cmd_bufs[n_cb].obj = cmd_buf;
+            ggml_metal_retire_graph_cmd_buf(ctx, n_cb);
+            ctx->cmd_bufs[n_cb].obj     = cmd_buf;
+            ctx->cmd_bufs[n_cb].checked = false;
 
             [cmd_buf enqueue];
 
@@ -588,10 +608,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
 
-            if (ctx->cmd_bufs[cb_idx].obj) {
-                [ctx->cmd_bufs[cb_idx].obj release];
-            }
-            ctx->cmd_bufs[cb_idx].obj = cmd_buf;
+            ggml_metal_retire_graph_cmd_buf(ctx, cb_idx);
+            ctx->cmd_bufs[cb_idx].obj     = cmd_buf;
+            ctx->cmd_bufs[cb_idx].checked = false;
 
             // always enqueue the first two command buffers
             // enqueue all of the command buffers if we don't need to abort
@@ -627,6 +646,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                         GGML_LOG_INFO("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                     }
 
+                    ctx->has_error = true;
                     res = GGML_STATUS_FAILED;
                 }
             }
@@ -641,6 +661,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                     if (status == MTLCommandBufferStatusError) {
                         GGML_LOG_INFO("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                     }
+                    ctx->has_error = true;
                     res = GGML_STATUS_FAILED;
                     break;
                 }

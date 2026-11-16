@@ -45,6 +45,19 @@ It also carries these source patches, which each Spice branch must keep until up
   query (Mistral Large 4), so each device's rope read another part of its heads, and from an address no float starts
   at when its share does not divide the offset (NaN logits on three devices). `tests/test-argmax-split.cpp` checks
   both parts of each head against one device.
+- **A computation the device failed fails what reads its results**, not upstream. A backend may report a failure of
+  queued work that it finds only when waiting for it (`get_status` in `ggml/src/ggml-backend-impl.h`,
+  `ggml_backend_get_status`): Metal reports every command buffer that failed since the last synchronize, a graph's
+  included after the next graph reuses its slot (`ggml/src/ggml-metal/ggml-metal-context.m`), and a tensor split
+  reports its devices'. llama fails the context at the first synchronize that sees one (`llama_get_compute_status`,
+  `include/llama.h`): the output getters return NULL, the state functions 0, every later decode -3, and
+  `llama_sampler_sample` and common's `common_sampler_sample` `LLAMA_TOKEN_NULL`, instead of the values the failed work
+  left in the buffers. A read an event orders (the MTP draft's hidden states, a DFlash drafter's layer inputs) checks the
+  source context too, and common's drafters stop at the first read of a failed context with an exception
+  (`common/speculative.cpp`). A Metal event wait waits on the command buffer that signals it, so a failed one ends the
+  wait instead of aborting after 60 s.
+  `GGML_BACKEND_FAULT_TEST=N` (`ggml/src/ggml-backend.cpp`) skips the N-th graph of the process and fails its
+  backend, for tests: `tests/test-compute-fault.cpp` checks each read against a run without it.
 - **`GGML_RPC_COMM_HOST`**, `ggml/src/ggml-rpc/ggml-rpc.cpp`, not upstream, on top of upstream's RPC all-reduce. Rank 1 of
   the pairwise all-reduce reaches rank 0 at this address instead of the one rank 0 serves on, so two
   servers that also share a direct link exchange over that link, and over RDMA when the address is a
