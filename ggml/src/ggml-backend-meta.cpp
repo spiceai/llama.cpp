@@ -1587,7 +1587,10 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 // view's extent below the split axis fit in one element, so the part starts as far into each device's
                 // elements as into the whole tensor's. Scaling it would read another part of each head, or from an address
                 // no value starts at when the device's share does not divide the offset.
-                if (!split_internal_offset) {
+                // Not for a view of a gated delta net's result: it packs the attention output before the states, and that
+                // output is split too, so a view of the states (even a same-stride crop of the first rows of each head's
+                // state) starts past each device's own output, at the offset scaled by its share.
+                if (!split_internal_offset && tensor->view_src->op != GGML_OP_GATED_DELTA_NET) {
                     size_t extent_below = 0;
                     for (int i = 0; i < GGML_MAX_DIMS; i++) {
                         if (i != split_dim && tensor->ne[i] > 1 && tensor->nb[i] < tensor->nb[split_dim]) {
