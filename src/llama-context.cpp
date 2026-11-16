@@ -2096,6 +2096,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        if (status == GGML_STATUS_FAILED && !backends_failed) {
+            // a backend refused or failed the graph where it was queued; one with no get_status reports it nowhere else,
+            // and what the graph would have written (outputs, memory) is not the computation's
+            backends_failed = true;
+            LLAMA_LOG_ERROR("%s: a backend failed computing this context's graph, so its outputs and state are not the "
+                "computation's and every later decode fails; free the context and create another\n", __func__);
+        }
         ret = status;
         return nullptr;
     }

@@ -5,7 +5,9 @@
 // logits a run without the fault computed (--reference, written by --write-reference), bit for bit, or reports the
 // failure: the getters return NULL, llama_get_compute_status returns -3, the sequence's state does not save, and every
 // later decode returns -3, and common's sampler picks no token instead of asserting on the missing logits. A run whose
-// fault falls within its graphs must see the failure.
+// fault falls within its graphs must see the failure. With GGML_BACKEND_FAULT_TEST_SYNC=1 the backend refuses the graph
+// where it is queued instead (GGML_STATUS_FAILED, as a backend with no get_status reports an inference error) and reports
+// nothing later: the decode that queued it returns -3, and the context must fail all the same.
 
 #include "llama.h"
 #include "sampling.h"
@@ -79,9 +81,20 @@ int main(int argc, char ** argv) {
     if (smpl == nullptr) {
         return fail("common's sampler does not initialize");
     }
-    // what reads a failed context's outputs through common: it must pick nothing, not abort
+    // what reads a failed context's outputs through common: it must pick nothing, not abort, and leave no candidates, which
+    // the sorted read the rejection-sampling verifier takes right after sampling must find empty (not read data[-1])
     auto common_picks_nothing = [&]() {
-        return common_sampler_sample(smpl, ctx, -1) == LLAMA_TOKEN_NULL;
+        if (common_sampler_sample(smpl, ctx, -1) != LLAMA_TOKEN_NULL) {
+            return false;
+        }
+        const llama_token_data_array * cur_p = common_sampler_get_candidates(smpl, true);
+        if (cur_p->size != 0) {
+            return false;
+        }
+        const llama_tokens draft = { 1 };
+        const std::vector<std::vector<llama_token_data>> draft_q = { { { 1, 0.0f, 1.0f } } };
+        const std::vector<llama_token> accepted = common_sampler_sample_and_accept_n_rejection(smpl, ctx, { -1, -1 }, draft, draft_q);
+        return accepted.size() == 1 && accepted[0] == LLAMA_TOKEN_NULL;
     };
 
     const int n_prompt = 16;

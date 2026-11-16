@@ -8,7 +8,9 @@
 extern "C" {
 #endif
 
-    #define GGML_BACKEND_API_VERSION 3
+    // Spice.ai: 4 adds ggml_backend_i::get_status, which moves every later field of struct ggml_backend, so a backend
+    // library built against 3 is refused rather than read through the wrong offsets
+    #define GGML_BACKEND_API_VERSION 4
 
     //
     // Backend buffer type

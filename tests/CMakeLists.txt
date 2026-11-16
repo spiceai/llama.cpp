@@ -295,6 +295,15 @@ foreach (fault_at 1 2 3 7)
         ENVIRONMENT       "GGML_BACKEND_FAULT_TEST=${fault_at}"
     )
 endforeach()
+# the same, from a backend that reports the failure only where the graph is queued (no get_status)
+foreach (fault_at 1 3)
+    llama_test(test-compute-fault NAME test-compute-fault-sync-${fault_at}
+        ARGS -m "${SPEC_TARGET_DIR}/llama-dense.gguf" --reference "${COMPUTE_FAULT_REFERENCE}")
+    set_tests_properties(test-compute-fault-sync-${fault_at} PROPERTIES
+        FIXTURES_REQUIRED "speculative-model;compute-fault-reference"
+        ENVIRONMENT       "GGML_BACKEND_FAULT_TEST=${fault_at};GGML_BACKEND_FAULT_TEST_SYNC=1"
+    )
+endforeach()
 
 # Test context state handling across all architectures, using the generated dummy models
 llama_test(

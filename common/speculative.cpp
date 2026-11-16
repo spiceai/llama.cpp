@@ -2034,6 +2034,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             for (int32_t i = 0; i < h_rows; ++i) {
                 const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, h_offset + i);
+                if (h == nullptr) {
+                    // shared-KV MTP (e.g. Gemma4) reads the target's rows here, so a failed target stops the draft here
+                    spec_require_computed(ctx_tgt);
+                    GGML_ABORT("MTP: the target's hidden state row %d was not extracted", (int) (h_offset + i));
+                }
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 

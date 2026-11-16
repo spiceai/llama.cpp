@@ -383,9 +383,12 @@ const char * ggml_backend_name(ggml_backend_t backend) {
 
 // GGML_BACKEND_FAULT_TEST=N, for tests of what reads the results of a computation the device failed: the N-th graph queued
 // on any backend of the process, counting from 1, is not computed, and that backend fails from then on as after a GPU
-// fault: ggml_backend_get_status reports GGML_STATUS_FAILED and every later graph queued on it fails. Unset or 0: off
+// fault: ggml_backend_get_status reports GGML_STATUS_FAILED and every later graph queued on it fails. Unset or 0: off.
+// With GGML_BACKEND_FAULT_TEST_SYNC=1 that graph is refused where it is queued (GGML_STATUS_FAILED) instead, as by a backend
+// with no get_status, and the backend reports nothing and computes later graphs: the caller must fail on the status alone
 struct ggml_backend_fault_test {
     int64_t                     at;
+    bool                        sync;
     std::atomic<int64_t>        n_graphs{0};
     std::mutex                  mutex;
     std::vector<ggml_backend_t> failed;
@@ -393,6 +396,8 @@ struct ggml_backend_fault_test {
     ggml_backend_fault_test() {
         const char * v = getenv("GGML_BACKEND_FAULT_TEST");
         at = v ? atoll(v) : 0;
+        const char * vs = getenv("GGML_BACKEND_FAULT_TEST_SYNC");
+        sync = vs != nullptr && atoi(vs) != 0;
     }
 
     bool has_failed(ggml_backend_t backend) {
@@ -407,6 +412,11 @@ struct ggml_backend_fault_test {
     bool fail_now(ggml_backend_t backend) {
         if (at <= 0 || n_graphs.fetch_add(1, std::memory_order_relaxed) + 1 != at) {
             return false;
+        }
+        if (sync) {
+            GGML_LOG_WARN("%s: GGML_BACKEND_FAULT_TEST: refusing graph %lld, on %s, where it is queued\n", __func__,
+                (long long) at, ggml_backend_name(backend));
+            return true;
         }
         GGML_LOG_WARN("%s: GGML_BACKEND_FAULT_TEST: not computing graph %lld, on %s, which fails from now on\n", __func__,
             (long long) at, ggml_backend_name(backend));
@@ -874,7 +884,8 @@ enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct
         return GGML_STATUS_FAILED;
     }
     if (fault_test.fail_now(backend)) {
-        return GGML_STATUS_SUCCESS; // queued, as the graph a device fails after accepting it
+        // queued, as the graph a device fails after accepting it; or refused where it is queued (GGML_BACKEND_FAULT_TEST_SYNC)
+        return fault_test.sync ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
     }
     return backend->iface.graph_compute(backend, cgraph);
 }

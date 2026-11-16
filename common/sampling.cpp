@@ -608,8 +608,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // a backend failed computing the outputs (llama_get_compute_status): no candidates, and no token
     if (llama_get_compute_status(ctx) != 0) {
+        // sorted, so a sorted read of the empty array does not look up the selection, which there is none of
         gsmpl->cur.clear();
-        gsmpl->cur_p = { gsmpl->cur.data(), 0, -1, false };
+        gsmpl->cur_p = { gsmpl->cur.data(), 0, -1, true };
         return LLAMA_TOKEN_NULL;
     }
 
@@ -874,7 +875,7 @@ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * g
 
     auto * res = &gsmpl->cur_p;
 
-    if (do_sort && !res->sorted) {
+    if (do_sort && !res->sorted && res->size > 0 && res->selected >= 0) {
         // remember the selected token before sorting
         const llama_token id = res->data[res->selected].id;
 
