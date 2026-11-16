@@ -304,6 +304,23 @@ foreach (fault_at 1 3)
         ENVIRONMENT       "GGML_BACKEND_FAULT_TEST=${fault_at};GGML_BACKEND_FAULT_TEST_SYNC=1"
     )
 endforeach()
+# a K-shift graph the backend fails (graph 2 under --shift), queued and refused where it is queued: a memory update fails
+# the context like a decode does
+set(COMPUTE_FAULT_SHIFT_REFERENCE "${CMAKE_CURRENT_BINARY_DIR}/test-compute-fault-shift-reference.bin")
+llama_test(test-compute-fault NAME test-compute-fault-shift-reference
+    ARGS -m "${SPEC_TARGET_DIR}/llama-dense.gguf" --shift --write-reference "${COMPUTE_FAULT_SHIFT_REFERENCE}")
+set_tests_properties(test-compute-fault-shift-reference PROPERTIES
+    FIXTURES_REQUIRED speculative-model
+    FIXTURES_SETUP    compute-fault-shift-reference
+)
+foreach (fault_sync 0 1)
+    llama_test(test-compute-fault NAME test-compute-fault-shift-2-sync-${fault_sync}
+        ARGS -m "${SPEC_TARGET_DIR}/llama-dense.gguf" --shift --reference "${COMPUTE_FAULT_SHIFT_REFERENCE}")
+    set_tests_properties(test-compute-fault-shift-2-sync-${fault_sync} PROPERTIES
+        FIXTURES_REQUIRED "speculative-model;compute-fault-shift-reference"
+        ENVIRONMENT       "GGML_BACKEND_FAULT_TEST=2;GGML_BACKEND_FAULT_TEST_SYNC=${fault_sync}"
+    )
+endforeach()
 
 # Test context state handling across all architectures, using the generated dummy models
 llama_test(

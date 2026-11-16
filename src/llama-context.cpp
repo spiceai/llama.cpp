@@ -2096,13 +2096,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
-        if (status == GGML_STATUS_FAILED && !backends_failed) {
-            // a backend refused or failed the graph where it was queued; one with no get_status reports it nowhere else,
-            // and what the graph would have written (outputs, memory) is not the computation's
-            backends_failed = true;
-            LLAMA_LOG_ERROR("%s: a backend failed computing this context's graph, so its outputs and state are not the "
-                "computation's and every later decode fails; free the context and create another\n", __func__);
-        }
         ret = status;
         return nullptr;
     }
@@ -2514,6 +2507,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // handle any pending shifts/copies
     memory_update(false);
+    if (backends_failed) {
+        LLAMA_LOG_ERROR("%s: a backend failed updating this context's memory; free it and create another\n", __func__);
+        return -3;
+    }
 
     llama_memory_context_ptr mctx;
 
@@ -2538,7 +2535,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     if (!did_optimize) {
                         did_optimize = true;
 
-                        if (memory_update(true)) {
+                        const bool updated = memory_update(true);
+                        if (backends_failed) {
+                            LLAMA_LOG_ERROR("%s: a backend failed updating this context's memory; free it and create another\n", __func__);
+                            return -3;
+                        }
+                        if (updated) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
 
                             continue;
@@ -3459,6 +3461,14 @@ ggml_status llama_context::graph_compute(
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+        if (status == GGML_STATUS_FAILED && !backends_failed) {
+            // a backend refused or failed the graph where it was queued (a decode's, or a memory update's such as a
+            // K-shift); one with no get_status reports it nowhere else, and what the graph would have written (outputs,
+            // memory) is not the computation's
+            backends_failed = true;
+            LLAMA_LOG_ERROR("%s: a backend failed computing this context's graph, so its outputs and state are not the "
+                "computation's and every later decode fails; free the context and create another\n", __func__);
+        }
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));

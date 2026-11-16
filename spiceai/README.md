@@ -43,7 +43,7 @@ It also carries these source patches, which each Spice branch must keep until up
   `GGML_BACKEND_API_VERSION` to 4 so a backend library built without it is refused, `ggml_backend_get_status`): Metal reports every command buffer that failed since the last synchronize, a graph's
   included after the next graph reuses its slot (`ggml/src/ggml-metal/ggml-metal-context.m`), and a tensor split
   reports its devices'. llama fails the context at the first synchronize that sees one, or at a graph a backend
-  returns `GGML_STATUS_FAILED` for where it is queued (`llama_get_compute_status`,
+  returns `GGML_STATUS_FAILED` for where it is queued, a memory update's (K-shift) included (`llama_get_compute_status`,
   `include/llama.h`): the output getters return NULL, the state functions 0, every later decode -3, and
   `llama_sampler_sample` and common's `common_sampler_sample` `LLAMA_TOKEN_NULL`, instead of the values the failed work
   left in the buffers. A read an event orders (the MTP draft's hidden states, a DFlash drafter's layer inputs) checks the

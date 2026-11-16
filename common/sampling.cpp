@@ -706,6 +706,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        if (id == LLAMA_TOKEN_NULL) {
+            // a failed context (llama_get_compute_status): no token, and nothing for the sampler or grammar to accept
+            result.push_back(id);
+            return result;
+        }
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -720,6 +725,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        if (id == LLAMA_TOKEN_NULL) {
+            result.push_back(id);
+            return result;
+        }
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -759,6 +768,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     for (; i < draft.size(); i++) {
         // leaves the target distribution in the candidate array
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        if (id_tgt == LLAMA_TOKEN_NULL) {
+            // a failed context (llama_get_compute_status): no token, and nothing for the sampler or grammar to accept
+            result.push_back(id_tgt);
+            return result;
+        }
 
         const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
         const auto & q     = draft_q[i];
@@ -838,6 +852,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        if (id == LLAMA_TOKEN_NULL) {
+            result.push_back(id);
+            return result;
+        }
 
         common_sampler_accept(gsmpl, id, true);
 
