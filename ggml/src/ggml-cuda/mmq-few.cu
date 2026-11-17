@@ -815,6 +815,11 @@ static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return 0;
 #endif // GGML_CUDA_FORCE_CUBLAS
+    // lab only: GGML_CUDA_DISABLE_MMQ_FEW takes MMVQ and MMQ for every batch size, as before few-row MMQ
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_MMQ_FEW") != nullptr;
+    if (disabled) {
+        return 0;
+    }
 
     // NVIDIA Ampere to Blackwell
     if (!ampere_mma_available(cc) || cc >= GGML_CUDA_CC_RUBIN) {
