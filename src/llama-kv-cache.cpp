@@ -461,7 +461,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
+        // every cell from used_max_p1() on is empty (position -1), and p0 >= 0, so none of them can match: stopping
+        // there leaves the result as it was, and spares a decode loop that trims rejected drafts every step a scan of
+        // the whole cache (all 131072 cells of a 128k-context unified cache, on every call)
+        const uint32_t n_scan = cells.used_max_p1();
+        for (uint32_t i = 0; i < n_scan; ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
@@ -485,7 +489,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
             uint32_t new_head = cells.size();
 
-            for (uint32_t i = 0; i < cells.size(); ++i) {
+            // as above, the cells from used_max_p1() on are empty and cannot match
+            const uint32_t n_scan = cells.used_max_p1();
+            for (uint32_t i = 0; i < n_scan; ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
                 }
