@@ -179,6 +179,8 @@ static void usage(char ** argv) {
     LOG("  --rpc <host:port,...>    Split the tensor split (Meta) config across these RPC servers' devices only\n");
     LOG("  --n-rs-seq <n>           Keep n recurrent-state snapshots per sequence, as speculative decoding does\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
+    LOG("  --rollback               Check a recurrent rollback of 1..n tokens (n from --n-rs-seq, default 3) against a decode\n");
+    LOG("                           without them, on the CPU and in tensor split mode\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -2083,6 +2085,228 @@ static int test_kv_shift(const std::string & arch_filter, const size_t seed, con
     return n_failed == 0 ? 0 : 1;
 }
 
+// the memory has no snapshot to roll back to: an architecture that keeps none refuses on every device
+struct rollback_refused : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+// decodes the prefix, its last n_tail tokens as a batch of their own, as speculative decoding verifies a draft, keeps its
+// first n_keep tokens and returns the logits of the probe decoded after them: removing the last tokens of a recurrent
+// memory rolls its state back to the snapshot it kept of that point of the last ubatch
+static std::vector<float> get_logits_rollback(
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & prefix, uint32_t n_tail, uint32_t n_keep,
+        const std::vector<llama_token> & probe) {
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    llama_memory_t mem = llama_get_memory(lctx);
+    const uint32_t n_head = prefix.size() > n_tail ? prefix.size() - n_tail : 0;
+
+    llama_memory_clear(mem, true);
+    if (n_head > 0) {
+        decode_range(lctx, prefix.data(), n_head, 0, 0, false);
+    }
+    decode_range(lctx, prefix.data() + n_head, prefix.size() - n_head, n_head, 0, false);
+    if (n_keep < prefix.size() && !llama_memory_seq_rm(mem, 0, n_keep, -1)) {
+        throw rollback_refused("the memory refused to roll back " + std::to_string(prefix.size() - n_keep) + " token(s)");
+    }
+    decode_range(lctx, probe.data(), probe.size(), n_keep, 0, true);
+
+    std::vector<float> ret;
+    ret.reserve(probe.size()*n_vocab);
+    for (uint32_t i = 0; i < probe.size(); i++) {
+        const float * logits_ith = llama_get_logits_ith(lctx, i);
+        ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
+    }
+    return ret;
+}
+
+// a NaN NMSE as infinity, so that a running maximum does not drop it and NaN logits fail as compare_kq() makes them
+static double nmse_or_inf(double nmse_val) {
+    return std::isnan(nmse_val) ? INFINITY : nmse_val;
+}
+
+// a rollback of k tokens is correct if the probe after it gives the logits of a decode that never saw those k tokens,
+// on the CPU and in tensor split mode, where every device holds its own part of each snapshot
+static int test_rollback(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
+    };
+    user_data_t ud(verbosity);
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
+    }, &ud);
+
+    if (n_rs_seq == 0) {
+        n_rs_seq = 3;
+    }
+    // the memory keeps snapshots of a ubatch of at most n_rs_seq + 1 tokens, a draft's verification, so that tail must
+    // be one ubatch; the prefix keeps tokens before the deepest rollback, so no decode starts from an empty one
+    const uint32_t n_ubatch = get_ctx_params(false, 0).n_ubatch;
+    if (n_rs_seq + 1 > n_ubatch) {
+        LOG_ERR("%s: --n-rs-seq %u needs a verification batch of %u tokens, more than the %u of one ubatch this check decodes in\n",
+            __func__, n_rs_seq, n_rs_seq + 1, n_ubatch);
+        return 1;
+    }
+    const uint32_t n_tail   = n_rs_seq + 1;
+    const uint32_t n_prefix = std::max<uint32_t>(24, n_tail + 8);
+    const uint32_t n_probe  = 4;
+    const double   thold    = 1e-4;
+
+    const std::vector<llama_token> tokens = get_tokens(n_prefix + n_probe, 128, seed);
+    const std::vector<llama_token> prefix(tokens.begin(), tokens.begin() + n_prefix);
+    const std::vector<llama_token> probe (tokens.begin() + n_prefix, tokens.end());
+
+    std::vector<ggml_backend_dev_t> devices_meta = rpc_devices;
+    if (devices_meta.empty()) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_buffer_type(dev) != ggml_backend_cpu_buffer_type()) {
+                devices_meta.push_back(dev);
+            }
+        }
+    }
+
+    size_t max_arch_name_length = 0;
+    for (const llm_arch & arch : llama_arch_all()) {
+        max_arch_name_length = std::max(max_arch_name_length, strlen(llama_arch_name(arch)));
+    }
+    const std::string template_row = "|%" + std::to_string(max_arch_name_length) + "s|%6s|%10s|%s\n";
+
+    size_t n_tests  = 0;
+    size_t n_failed = 0;
+    common_log_flush(common_log_main());
+    LOG("rollback of 1..%u token(s): NMSE of the probe's logits against a decode without those tokens, worst of all k\n", n_rs_seq);
+    LOG(template_row.c_str(), "Model arch.", "Config", "Device", "Status");
+
+    for (const llm_arch & arch : llama_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !arch_supported(arch)) {
+            continue;
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+            continue;
+        }
+        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
+        if (encode) {
+            continue;
+        }
+        for (bool moe : {false, true}) {
+            if (moe && !moe_implemented(arch)) {
+                continue;
+            }
+            if (!moe && moe_mandatory(arch)) {
+                continue;
+            }
+            const char * config_name = moe ? "MoE" : "Dense";
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+
+            std::vector<std::pair<std::string, std::pair<std::vector<ggml_backend_dev_t>, llama_split_mode>>> configs = {
+                { "CPU", { {}, LLAMA_SPLIT_MODE_LAYER } },
+            };
+            if (!devices_meta.empty() && llama_arch_supports_sm_tensor(arch)) {
+                configs.push_back({ rpc_devices.empty() ? "Meta" : "Meta (RPC)", { devices_meta, LLAMA_SPLIT_MODE_TENSOR } });
+            }
+
+            std::vector<std::vector<float>> fresh_cpu;
+            bool cpu_refused = false;
+            for (const auto & config : configs) {
+                if (cpu_refused) {
+                    break;
+                }
+                const std::string & label = config.first;
+                std::pair<llama_model_ptr, llama_context_ptr> mc;
+                try {
+                    ud.verbosity = LOG_LEVEL_OUTPUT;
+                    mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, config.second.first, config.second.second);
+                    ud.verbosity = verbosity;
+                } catch (const std::exception & err) {
+                    ud.verbosity = verbosity;
+                    LOG(template_row.c_str(), llama_arch_name(arch), config_name, label.c_str(), "\033[1;31mERROR\033[0m (model load)");
+                    n_tests++;
+                    n_failed++;
+                    break;
+                }
+                llama_model * model = mc.first.get();
+                if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
+                    break;
+                }
+
+                std::string status;
+                n_tests++;
+                try {
+                    double worst = 0.0;
+                    double worst_cpu = 0.0;
+                    double control = 0.0;
+                    for (uint32_t k = 1; k <= n_rs_seq; k++) {
+                        const uint32_t n_keep = n_prefix - k;
+                        const std::vector<llama_token> kept(prefix.begin(), prefix.begin() + n_keep);
+                        const std::vector<float> fresh  = get_logits_rollback(model, mc.second.get(), kept,   n_tail, n_keep, probe);
+                        const std::vector<float> rolled = get_logits_rollback(model, mc.second.get(), prefix, n_tail, n_keep, probe);
+                        worst = std::max(worst, nmse_or_inf(nmse(fresh, rolled)));
+                        if (label == "CPU") {
+                            fresh_cpu.push_back(fresh);
+                        } else if (fresh_cpu.size() >= k) {
+                            worst_cpu = std::max(worst_cpu, nmse_or_inf(nmse(fresh_cpu[k - 1], rolled)));
+                        }
+                        if (k == 1) {
+                            // without the rollback the probe follows the whole prefix: tells if the probe depends on the state
+                            const std::vector<float> kept_all = get_logits_rollback(model, mc.second.get(), prefix, n_tail, n_prefix, probe);
+                            control = nmse(fresh, kept_all);
+                        }
+                    }
+                    char buf[160];
+                    if (!(worst <= thold) || !(worst_cpu <= thold)) {
+                        n_failed++;
+                        snprintf(buf, sizeof(buf), "\033[1;31mFAIL\033[0m (%.2e, vs. CPU %.2e)", worst, worst_cpu);
+                    } else if (!(control > 10*thold)) {
+                        snprintf(buf, sizeof(buf), "\033[1;33mOK\033[0m (%.2e, low sensitivity %.2e)", worst, control);
+                    } else {
+                        snprintf(buf, sizeof(buf), "\033[1;32mOK\033[0m (%.2e, vs. CPU %.2e, control %.2e)", worst, worst_cpu, control);
+                    }
+                    status = buf;
+                } catch (const rollback_refused & err) {
+                    if (label == "CPU" && llama_n_rs_seq(mc.second.get()) == 0) {
+                        // the architecture keeps no snapshots, there is nothing to compare a split against
+                        n_tests--;
+                        cpu_refused = true;
+                        status = std::string("\033[1;33mSKIP\033[0m (") + err.what() + ")";
+                    } else {
+                        n_failed++;
+                        status = std::string("\033[1;31mFAIL\033[0m (") + err.what() + (label == "CPU" ? ")" : ", which the CPU did)");
+                    }
+                } catch (const std::exception & err) {
+                    n_failed++;
+                    status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
+                }
+                LOG(template_row.c_str(), llama_arch_name(arch), config_name, label.c_str(), status.c_str());
+            }
+        }
+    }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -2097,6 +2321,7 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool kv_shift = false;
+    bool rollback = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2182,6 +2407,8 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[i], "--kv-shift") == 0) {
             kv_shift = true;
+        } else if (strcmp(argv[i], "--rollback") == 0) {
+            rollback = true;
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -2202,6 +2429,9 @@ int main(int argc, char ** argv) {
         }
         if (kv_shift) {
             return test_kv_shift(arch_filter, seed, stdev, verbosity);
+        }
+        if (rollback) {
+            return test_rollback(arch_filter, seed, stdev, verbosity);
         }
         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {
