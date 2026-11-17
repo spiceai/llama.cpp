@@ -1582,6 +1582,32 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                         break;
                     }
                 }
+                // A view that picks the same part of every element along the split axis: the rope part of each head of an
+                // MLA query, a view strided by the head size that starts past the head's other part. The offset and the
+                // view's extent below the split axis fit in one element, so the part starts as far into each device's
+                // elements as into the whole tensor's. Scaling it would read another part of each head, or from an address
+                // no value starts at when the device's share does not divide the offset.
+                // Only when the source's split is one segment that the view's elements fill: then each device's part of
+                // the source is whole elements of the view, so what precedes the offset is the device's own first
+                // element. Not when the source splits something before the elements independently (a prefix fused
+                // before the heads, its own segment; a gated delta net's attention output before its states, even under a
+                // same-stride crop of the first rows of each head's state): each device's elements then start past its
+                // own share of it, at the offset scaled by its share.
+                if (!split_internal_offset && tensor->view_src->op != GGML_OP_GATED_DELTA_NET) {
+                    const ggml_backend_meta_split_state src_ss = ggml_backend_meta_get_split_state(tensor->view_src, /*assume_sync =*/ true);
+                    const bool elements_fill_split = src_ss.n_segments == 1 && src_ss.nr[0] == 1 &&
+                        (size_t) tensor->ne[split_dim] * tensor->nb[split_dim] ==
+                            (size_t) tensor->view_src->ne[split_dim_view_src] * tensor->view_src->nb[split_dim_view_src];
+                    if (elements_fill_split) {
+                        size_t extent_below = 0;
+                        for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                            if (i != split_dim && tensor->ne[i] > 1 && tensor->nb[i] < tensor->nb[split_dim]) {
+                                extent_below = std::max(extent_below, (size_t) tensor->ne[i] * tensor->nb[i]);
+                            }
+                        }
+                        split_internal_offset = tensor->view_offs + extent_below <= tensor->nb[split_dim];
+                    }
+                }
                 if (!split_internal_offset) {
                     t_ij->view_offs = t_ij->view_offs * ne[split_dim]/tensor->ne[split_dim];
                 }
