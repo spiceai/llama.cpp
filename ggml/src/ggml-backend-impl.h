@@ -8,7 +8,9 @@
 extern "C" {
 #endif
 
-    #define GGML_BACKEND_API_VERSION 3
+    // Spice.ai: 4 adds ggml_backend_i::get_status, which moves every later field of struct ggml_backend, so a backend
+    // library built against 3 is refused rather than read through the wrong offsets
+    #define GGML_BACKEND_API_VERSION 4
 
     //
     // Backend buffer type
@@ -162,6 +164,12 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) whether the device failed an operation queued on this backend that has finished (a GPU fault, for
+        // one): GGML_STATUS_FAILED from then on, since the results of that operation and of any that read them are not the
+        // computation's. Does not wait; after synchronize it covers every operation queued before it. NULL for a backend
+        // whose operations report their failures where they are queued.
+        enum ggml_status          (*get_status)        (ggml_backend_t backend);
     };
 
     struct ggml_backend {

@@ -38,6 +38,25 @@ It also carries these source patches, which each Spice branch must keep until up
 - **DFlash drafters over GLM-5.3-Flash (`glm5-next`)**, `src/models/glm5-next.cpp`, not upstream. The same
   layer-input recording for `glm5-next`, which has no hook for it, so a DFlash draft over it aborts in
   `llm_graph_result::set_outputs` (layer input tensor is null).
+- **A computation the device failed fails what reads its results**, not upstream. A backend may report a failure of
+  queued work that it finds only when waiting for it (`get_status` in `ggml/src/ggml-backend-impl.h`, which bumps
+  `GGML_BACKEND_API_VERSION` to 4 so a backend library built without it is refused, `ggml_backend_get_status`): Metal reports every command buffer that failed since the last synchronize, a graph's
+  included after the next graph reuses its slot (`ggml/src/ggml-metal/ggml-metal-context.m`), and a tensor split
+  reports its devices'. llama fails the context at the first synchronize that sees one, or at a graph a backend
+  returns `GGML_STATUS_FAILED` for where it is queued, a memory update's (K-shift) included (`llama_get_compute_status`,
+  `include/llama.h`): the output getters return NULL, the state functions 0, every later decode -3, and
+  `llama_sampler_sample` and common's `common_sampler_sample` `LLAMA_TOKEN_NULL`, instead of the values the failed work
+  left in the buffers. A read an event orders (the MTP draft's hidden states, a DFlash drafter's layer inputs) checks the
+  source context too, and common's drafters stop at the first read of a failed context with an exception
+  (`common/speculative.cpp`). common's prompt checkpoint (`common_prompt_checkpoint::update_tgt` and `update_dft`,
+  `common/common.cpp`) returns false and keeps nothing on a failed context instead of aborting on the size mismatch.
+  The callers in tools Spice does not ship (llama-server, llama-completion, the mtmd/TTS/realtime examples) do not
+  handle the failure yet. A Metal event wait waits on the command buffer that signals it, so a failed one ends the
+  wait instead of aborting after 60 s.
+  `GGML_BACKEND_FAULT_TEST=N` (`ggml/src/ggml-backend.cpp`) skips the N-th graph of the process and fails its
+  backend, for tests (with `GGML_BACKEND_FAULT_TEST_SYNC=1` the backend refuses that graph where it is queued and
+  reports nothing later, as one without `get_status`): `tests/test-compute-fault.cpp` checks each read against a run
+  without it.
 - **A tensor split keeps the offset of a view that picks the same part of every element along the split axis**,
   `ggml/src/ggml-backend-meta.cpp`, not upstream. Each device's copy of a view of a split tensor starts at the view's
   offset scaled by the device's share of the split axis, unless the offset lies inside the data split; the check

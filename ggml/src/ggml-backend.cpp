@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -380,11 +381,70 @@ const char * ggml_backend_name(ggml_backend_t backend) {
     return backend->iface.get_name(backend);
 }
 
+// GGML_BACKEND_FAULT_TEST=N, for tests of what reads the results of a computation the device failed: the N-th graph queued
+// on any backend of the process, counting from 1, is not computed, and that backend fails from then on as after a GPU
+// fault: ggml_backend_get_status reports GGML_STATUS_FAILED and every later graph queued on it fails. Unset or 0: off.
+// With GGML_BACKEND_FAULT_TEST_SYNC=1 that graph is refused where it is queued (GGML_STATUS_FAILED) instead, as by a backend
+// with no get_status, and the backend reports nothing and computes later graphs: the caller must fail on the status alone
+struct ggml_backend_fault_test {
+    int64_t                     at;
+    bool                        sync;
+    std::atomic<int64_t>        n_graphs{0};
+    std::mutex                  mutex;
+    std::vector<ggml_backend_t> failed;
+
+    ggml_backend_fault_test() {
+        const char * v = getenv("GGML_BACKEND_FAULT_TEST");
+        at = v ? atoll(v) : 0;
+        const char * vs = getenv("GGML_BACKEND_FAULT_TEST_SYNC");
+        sync = vs != nullptr && atoi(vs) != 0;
+    }
+
+    bool has_failed(ggml_backend_t backend) {
+        if (at <= 0) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        return std::find(failed.begin(), failed.end(), backend) != failed.end();
+    }
+
+    // whether this graph is the one not to compute; its backend has failed from now on
+    bool fail_now(ggml_backend_t backend) {
+        if (at <= 0 || n_graphs.fetch_add(1, std::memory_order_relaxed) + 1 != at) {
+            return false;
+        }
+        if (sync) {
+            GGML_LOG_WARN("%s: GGML_BACKEND_FAULT_TEST: refusing graph %lld, on %s, where it is queued\n", __func__,
+                (long long) at, ggml_backend_name(backend));
+            return true;
+        }
+        GGML_LOG_WARN("%s: GGML_BACKEND_FAULT_TEST: not computing graph %lld, on %s, which fails from now on\n", __func__,
+            (long long) at, ggml_backend_name(backend));
+        std::lock_guard<std::mutex> lock(mutex);
+        failed.push_back(backend);
+        return true;
+    }
+
+    void forget(ggml_backend_t backend) {
+        if (at <= 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        failed.erase(std::remove(failed.begin(), failed.end(), backend), failed.end());
+    }
+};
+
+static ggml_backend_fault_test & ggml_backend_fault_test_get() {
+    static ggml_backend_fault_test fault_test;
+    return fault_test;
+}
+
 void ggml_backend_free(ggml_backend_t backend) {
     if (backend == NULL) {
         return;
     }
 
+    ggml_backend_fault_test_get().forget(backend);
     backend->iface.free(backend);
 }
 
@@ -778,6 +838,18 @@ void ggml_backend_synchronize(ggml_backend_t backend) {
     backend->iface.synchronize(backend);
 }
 
+enum ggml_status ggml_backend_get_status(ggml_backend_t backend) {
+    GGML_ASSERT(backend);
+    if (ggml_backend_fault_test_get().has_failed(backend)) {
+        return GGML_STATUS_FAILED;
+    }
+    if (backend->iface.get_status == NULL) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    return backend->iface.get_status(backend);
+}
+
 ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
     GGML_ASSERT(backend->iface.graph_plan_create != NULL);
@@ -807,6 +879,14 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
 
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
+    ggml_backend_fault_test & fault_test = ggml_backend_fault_test_get();
+    if (fault_test.has_failed(backend)) {
+        return GGML_STATUS_FAILED;
+    }
+    if (fault_test.fail_now(backend)) {
+        // queued, as the graph a device fails after accepting it; or refused where it is queued (GGML_BACKEND_FAULT_TEST_SYNC)
+        return fault_test.sync ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS;
+    }
     return backend->iface.graph_compute(backend, cgraph);
 }
 

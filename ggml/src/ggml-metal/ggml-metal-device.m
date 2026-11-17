@@ -1448,6 +1448,10 @@ struct ggml_metal_event {
     void * obj; // id<MTLSharedEvent>
 
     atomic_int value;
+
+    // the command buffer that signals the latest value, retained (guarded by obj): a command buffer that fails never
+    // signals, so a wait for the value would never end
+    void * signal_cmd_buf; // id<MTLCommandBuffer>
 };
 
 void ggml_metal_event_encode_signal(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw) {
@@ -1455,7 +1459,12 @@ void ggml_metal_event_encode_signal(ggml_metal_event_t ev, ggml_metal_cmd_buf_t 
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
 
-    [cmd_buf encodeSignalEvent:event value:atomic_fetch_add_explicit(&ev->value, 1, memory_order_relaxed) + 1];
+    @synchronized(event) {
+        [cmd_buf encodeSignalEvent:event value:atomic_fetch_add_explicit(&ev->value, 1, memory_order_relaxed) + 1];
+        [cmd_buf retain];
+        [(id<MTLCommandBuffer>) ev->signal_cmd_buf release];
+        ev->signal_cmd_buf = (__bridge void *) cmd_buf;
+    }
 }
 
 void ggml_metal_event_encode_wait(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw) {
@@ -1479,6 +1488,8 @@ ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev) {
 
 void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev) {
     @autoreleasepool {
+        [(id<MTLCommandBuffer>) ev->signal_cmd_buf release];
+
         id<MTLSharedEvent> event = ev->obj;
         [event release];
 
@@ -1490,6 +1501,24 @@ void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev
 
 void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev) {
     id<MTLSharedEvent> event = ev->obj;
+
+    // wait for the command buffer that signals: it ends either way, and a failed one never signals. Its failure is the
+    // recording backend's (ggml_backend_get_status), which the reader checks before it trusts what the event ordered
+    id<MTLCommandBuffer> signal_cmd_buf = nil;
+    @synchronized(event) {
+        signal_cmd_buf = [(id<MTLCommandBuffer>) ev->signal_cmd_buf retain];
+    }
+    if (signal_cmd_buf) {
+        [signal_cmd_buf waitUntilCompleted];
+        const bool signaled = [signal_cmd_buf status] == MTLCommandBufferStatusCompleted;
+        [signal_cmd_buf release];
+        if (!signaled) {
+            GGML_LOG_ERROR("%s: the command buffer that signals the event failed, so the work it orders is lost\n", __func__);
+            GGML_UNUSED(dev);
+            return;
+        }
+    }
+
     const bool res = [event waitUntilSignaledValue:atomic_load_explicit(&ev->value, memory_order_relaxed) timeoutMS:60000];
     if (!res) {
         GGML_ABORT("%s: failed to wait for event\n", __func__);

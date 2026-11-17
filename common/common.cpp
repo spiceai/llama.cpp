@@ -2441,12 +2441,12 @@ void common_prompt_checkpoint::update_pos(
     this->pos_max  = pos_max;
 }
 
-void common_prompt_checkpoint::update_tgt(
+bool common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) {
     if (ctx == nullptr) {
-        return;
+        return true;
     }
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
@@ -2454,17 +2454,24 @@ void common_prompt_checkpoint::update_tgt(
     data_tgt.resize(ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    // a failed computation (a GPU fault, for one) saves no state, though the state's size does not wait to see it: the
+    // caller fails the request rather than the process aborting
+    if (llama_get_compute_status(ctx) != 0) {
+        data_tgt.clear();
+        return false;
+    }
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
+    return true;
 }
 
-void common_prompt_checkpoint::update_dft(
+bool common_prompt_checkpoint::update_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) {
     if (ctx == nullptr) {
-        return;
+        return true;
     }
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
@@ -2472,9 +2479,16 @@ void common_prompt_checkpoint::update_dft(
     data_dft.resize(ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+    // a failed computation (a GPU fault, for one) saves no state, though the state's size does not wait to see it: the
+    // caller fails the request rather than the process aborting
+    if (llama_get_compute_status(ctx) != 0) {
+        data_dft.clear();
+        return false;
+    }
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
+    return true;
 }
 
 bool common_prompt_checkpoint::load_tgt(

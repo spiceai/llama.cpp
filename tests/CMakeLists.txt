@@ -277,6 +277,63 @@ llama_build_and_test(test-speculative-rejection-sampling.cpp ARGS
     -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
 set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQUIRED speculative-model)
 
+# a graph the device fails (GGML_BACKEND_FAULT_TEST skips it and fails its backend, as a GPU fault does) fails the reads
+# of what it computed: at the prompt's graph, at a later decode's, and past the first few
+llama_build(test-compute-fault.cpp)
+set(COMPUTE_FAULT_REFERENCE "${CMAKE_CURRENT_BINARY_DIR}/test-compute-fault-reference.bin")
+llama_test(test-compute-fault NAME test-compute-fault-reference
+    ARGS -m "${SPEC_TARGET_DIR}/llama-dense.gguf" --write-reference "${COMPUTE_FAULT_REFERENCE}")
+set_tests_properties(test-compute-fault-reference PROPERTIES
+    FIXTURES_REQUIRED speculative-model
+    FIXTURES_SETUP    compute-fault-reference
+)
+foreach (fault_at 1 2 3 7)
+    llama_test(test-compute-fault NAME test-compute-fault-${fault_at}
+        ARGS -m "${SPEC_TARGET_DIR}/llama-dense.gguf" --reference "${COMPUTE_FAULT_REFERENCE}")
+    set_tests_properties(test-compute-fault-${fault_at} PROPERTIES
+        FIXTURES_REQUIRED "speculative-model;compute-fault-reference"
+        ENVIRONMENT       "GGML_BACKEND_FAULT_TEST=${fault_at}"
+    )
+endforeach()
+# the same, from a backend that reports the failure only where the graph is queued (no get_status)
+foreach (fault_at 1 3)
+    llama_test(test-compute-fault NAME test-compute-fault-sync-${fault_at}
+        ARGS -m "${SPEC_TARGET_DIR}/llama-dense.gguf" --reference "${COMPUTE_FAULT_REFERENCE}")
+    set_tests_properties(test-compute-fault-sync-${fault_at} PROPERTIES
+        FIXTURES_REQUIRED "speculative-model;compute-fault-reference"
+        ENVIRONMENT       "GGML_BACKEND_FAULT_TEST=${fault_at};GGML_BACKEND_FAULT_TEST_SYNC=1"
+    )
+endforeach()
+# a prompt checkpoint (common_prompt_checkpoint) taken as the first read after the decode the device failed, or after one
+# refused where it was queued: it reports the failure instead of aborting on a size mismatch
+foreach (fault_at 1 3 7)
+    foreach (fault_sync 0 1)
+        llama_test(test-compute-fault NAME test-compute-fault-checkpoint-${fault_at}-sync-${fault_sync}
+            ARGS -m "${SPEC_TARGET_DIR}/llama-dense.gguf" --checkpoint --reference "${COMPUTE_FAULT_REFERENCE}")
+        set_tests_properties(test-compute-fault-checkpoint-${fault_at}-sync-${fault_sync} PROPERTIES
+            FIXTURES_REQUIRED "speculative-model;compute-fault-reference"
+            ENVIRONMENT       "GGML_BACKEND_FAULT_TEST=${fault_at};GGML_BACKEND_FAULT_TEST_SYNC=${fault_sync}"
+        )
+    endforeach()
+endforeach()
+# a K-shift graph the backend fails (graph 2 under --shift), queued and refused where it is queued: a memory update fails
+# the context like a decode does
+set(COMPUTE_FAULT_SHIFT_REFERENCE "${CMAKE_CURRENT_BINARY_DIR}/test-compute-fault-shift-reference.bin")
+llama_test(test-compute-fault NAME test-compute-fault-shift-reference
+    ARGS -m "${SPEC_TARGET_DIR}/llama-dense.gguf" --shift --write-reference "${COMPUTE_FAULT_SHIFT_REFERENCE}")
+set_tests_properties(test-compute-fault-shift-reference PROPERTIES
+    FIXTURES_REQUIRED speculative-model
+    FIXTURES_SETUP    compute-fault-shift-reference
+)
+foreach (fault_sync 0 1)
+    llama_test(test-compute-fault NAME test-compute-fault-shift-2-sync-${fault_sync}
+        ARGS -m "${SPEC_TARGET_DIR}/llama-dense.gguf" --shift --reference "${COMPUTE_FAULT_SHIFT_REFERENCE}")
+    set_tests_properties(test-compute-fault-shift-2-sync-${fault_sync} PROPERTIES
+        FIXTURES_REQUIRED "speculative-model;compute-fault-shift-reference"
+        ENVIRONMENT       "GGML_BACKEND_FAULT_TEST=2;GGML_BACKEND_FAULT_TEST_SYNC=${fault_sync}"
+    )
+endforeach()
+
 # Test context state handling across all architectures, using the generated dummy models
 llama_test(
     test-llama-context
