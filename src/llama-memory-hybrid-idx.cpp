@@ -361,11 +361,19 @@ struct llama_memory_hybrid_idx_context::kpool_state {
 namespace {
 
 // The last padded pool is always unused. Pools are padded in step with the cells: 64 for every 256, see
-// llama_kv_pad_cells. As the visible cells stop at the cache's size, the padding stops at what the default padding
-// gives a cache of n_pool_max pools, so a large LLAMA_KV_PAD cannot size the pool list past what the cache holds.
+// llama_kv_pad_cells, or with LLAMA_KV_PAD=pow2 to the next power of two of at least 64, as the cells are. As the
+// visible cells stop at the cache's size, the padding stops at what the default padding gives a cache of n_pool_max
+// pools, so a large LLAMA_KV_PAD cannot size the pool list past what the cache holds.
 uint32_t kpool_pad(uint32_t n_pool, uint32_t n_pool_max) {
     const uint32_t step   = 64u * (llama_kv_pad_cells() / 256u);
-    const uint32_t padded = std::max<uint32_t>(step, GGML_PAD(n_pool + 1, step));
+    uint32_t       padded = std::max<uint32_t>(step, GGML_PAD(n_pool + 1, step));
+    if (llama_kv_pad_pow2()) {
+        uint32_t p = 64;
+        while (p < n_pool + 1 && p < (1u << 31)) {
+            p *= 2;
+        }
+        padded = std::max(padded, p);
+    }
     const uint32_t full   = std::max<uint32_t>(64u, GGML_PAD(n_pool_max + 1, 64u));
     return std::max<uint32_t>(std::min(padded, full), GGML_PAD(n_pool + 1, 64u));
 }

@@ -1347,6 +1347,14 @@ uint32_t llama_kv_prompt_tokens(const llama_ubatch & ubatch) {
     return res;
 }
 
+bool llama_kv_pad_pow2() {
+    static const bool on = [] {
+        const char * v = getenv("LLAMA_KV_PAD");
+        return v != nullptr && strcmp(v, "pow2") == 0;
+    }();
+    return on;
+}
+
 uint32_t llama_kv_pad_cells() {
     static const uint32_t pad = [] {
         const char * v = getenv("LLAMA_KV_PAD");
@@ -1377,10 +1385,21 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
         n_pad_cur = std::max(n_pad_cur, prompt_pad);
     }
 
+    const bool pow2 = llama_kv_pad_pow2();
+
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        uint32_t n = std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur));
+        if (pow2) {
+            uint32_t p = 256;
+            while (p < cells.used_max_p1() && p < (1u << 31)) {
+                p *= 2;
+            }
+            n = std::max(n, p);
+        }
+
+        result = std::max(std::min(cells.size(), n), result);
     }
 
     return result;

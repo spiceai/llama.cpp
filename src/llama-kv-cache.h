@@ -26,6 +26,11 @@ struct llama_context;
 // the cost of attending over up to pad - 1 masked cells.
 uint32_t llama_kv_pad_cells();
 
+// LLAMA_KV_PAD=pow2: pad n_kv to the next power of two of at least 256 instead of to a multiple of a fixed pad. A context
+// growing to n cells crosses a boundary about log2(n / 256) times, and attends over fewer than twice the cells it uses,
+// where a fixed pad large enough to cross as seldom wastes most of a short context's attention.
+bool llama_kv_pad_pow2();
+
 //
 // llama_kv_cache
 //
