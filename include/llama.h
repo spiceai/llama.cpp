@@ -1108,8 +1108,10 @@ extern "C" {
     // A failure is found when the computation is waited for: by llama_synchronize, and by every getter of outputs and of
     // state, so call this after the getter, which does not wait twice. Once it fails, the context's outputs and state are
     // not the computation's: the getters return what they return for an output that was not computed (NULL,
-    // LLAMA_TOKEN_NULL, 0), the llama_state_* functions return 0 (false for the file ones), and llama_decode and
-    // llama_encode return -3. Free the context and create another to recover. Does not wait.
+    // LLAMA_TOKEN_NULL, 0), the llama_state_* functions that save or load state return 0 (false for the file ones), and
+    // llama_decode and llama_encode return -3. The llama_state_*get_size* functions do not wait and keep reporting a
+    // size, so a caller that sizes a buffer first learns of the failure from the save that follows (0, or less than the
+    // size). Free the context and create another to recover. Does not wait.
     LLAMA_API int32_t llama_get_compute_status(const struct llama_context * ctx);
 
     // Token logits obtained from the last call to llama_decode()
