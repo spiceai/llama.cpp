@@ -575,7 +575,8 @@ static size_t ggml_backend_meta_inner_extent(const struct ggml_tensor * tensor, 
 // the split dim: every device's elements carry them alike. ggml_backend_meta_buffer_init_tensor_impl() scales a view's
 // offset by each device's share unless it lies inside the first element of the tensor the view's data belongs to
 // (view_src), so an offset inside an element is taken only there, and only when src is that tensor: a reshape of it has
-// other elements. Split along the last axis, a row is the whole tensor. Sets out and returns true for those views; false
+// other elements. A row is the split axis's span over every repetition, whatever stride the dim after it has (a permute
+// can put a larger one there, or none along the last axis). Sets out and returns true for those views; false
 // for any other (one whose dims cut across the repetitions or start inside one, a quantized source, or a source that is
 // itself a view at an offset, or at any offset that is not whole repetitions or rows of it).
 static bool ggml_backend_meta_view_of_repetitions(const struct ggml_tensor * view, const struct ggml_tensor * src,
@@ -591,12 +592,12 @@ static bool ggml_backend_meta_view_of_repetitions(const struct ggml_tensor * vie
     for (size_t j = 0; j < n_bufs; j++) {
         total += ss.ne[j];
     }
-    const size_t nb_axis = src->nb[axis];
-    const size_t nb_row  = axis + 1 < GGML_MAX_DIMS ? src->nb[axis + 1] : src->nb[axis] * src->ne[axis];
-    const size_t extent  = (size_t) total * nb_axis; // one repetition
-    if (total == 0 || nb_row != ss.nr[0] * extent) {
+    if (total == 0 || (int64_t) ss.nr[0] * total != src->ne[axis]) {
         return false;
     }
+    const size_t nb_axis = src->nb[axis];
+    const size_t nb_row  = nb_axis * src->ne[axis]; // every repetition
+    const size_t extent  = (size_t) total * nb_axis; // one repetition
     const size_t offs     = view->view_offs - src->view_offs;
     const size_t in_row   = offs % nb_row;
     const size_t in_elem  = in_row % nb_axis;
