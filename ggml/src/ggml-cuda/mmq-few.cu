@@ -854,6 +854,12 @@ bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * 
     if (min_ncols == 0 || src1->ne[1] < min_ncols || src1->ne[1] > MMQ_FEW_MAX_NCG*MMQ_FEW_NCOLS) {
         return false;
     }
+    // lab only: GGML_CUDA_MMQ_FEW_MIN_NCOLS / GGML_CUDA_MMQ_FEW_MAX_NCOLS narrow the src1 columns few-row MMQ takes
+    static const int lab_min = getenv("GGML_CUDA_MMQ_FEW_MIN_NCOLS") ? atoi(getenv("GGML_CUDA_MMQ_FEW_MIN_NCOLS")) : 0;
+    static const int lab_max = getenv("GGML_CUDA_MMQ_FEW_MAX_NCOLS") ? atoi(getenv("GGML_CUDA_MMQ_FEW_MAX_NCOLS")) : 0;
+    if ((lab_min > 0 && src1->ne[1] < lab_min) || (lab_max > 0 && src1->ne[1] > lab_max)) {
+        return false;
+    }
     // the row must hold a whole number of ring stages of the launched kernel
     const int ncg          = mmq_few_ncg(src1->ne[1]);
     const int nmt          = mmq_few_nmt(src0->type, ncg, src0->ne[1]);
