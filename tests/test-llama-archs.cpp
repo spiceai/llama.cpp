@@ -1650,7 +1650,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
-                        if (nmse_val > 1e-4) {
+                        // a NaN in either row of logits makes the NMSE a NaN, which no threshold is above
+                        if (!(nmse_val <= 1e-4)) {
                             test_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
                         }
@@ -1674,7 +1675,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                                 const double nmse_mixed = nmse(logits_chunks, logits_mixed);
                                 snprintf(mixed_str, sizeof(mixed_str), "(%.2e)", nmse_mixed);
                                 status_mixed = "\033[1;32mOK\033[0m";
-                                if (nmse_mixed > 1e-4) {
+                                if (!(nmse_mixed <= 1e-4)) {
                                     test_ok = false;
                                     status_mixed = "\033[1;31mFAIL\033[0m";
                                 }

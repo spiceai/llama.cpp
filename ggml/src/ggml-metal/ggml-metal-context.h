@@ -19,6 +19,9 @@ const char * ggml_metal_get_name(ggml_metal_t ctx);
 
 void ggml_metal_synchronize(ggml_metal_t ctx);
 
+// GGML_STATUS_FAILED once synchronize found a command buffer that failed, without waiting
+enum ggml_status ggml_metal_get_status(ggml_metal_t ctx);
+
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
 bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);

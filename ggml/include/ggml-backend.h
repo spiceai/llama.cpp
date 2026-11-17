@@ -101,6 +101,11 @@ extern "C" {
     GGML_API void ggml_backend_tensor_memset(      struct ggml_tensor * tensor,     uint8_t value, size_t offset, size_t size);
 
     GGML_API void ggml_backend_synchronize(ggml_backend_t backend);
+    // whether the device failed an operation queued on the backend that has finished (a GPU fault, for one), without waiting:
+    // GGML_STATUS_FAILED from then on, since its results and those of anything that read them are not the computation's;
+    // after ggml_backend_synchronize it covers everything queued before. GGML_STATUS_SUCCESS for a backend that reports
+    // its failures where they are queued
+    GGML_API enum ggml_status ggml_backend_get_status(ggml_backend_t backend);
 
     GGML_API ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph);
     GGML_API void                      ggml_backend_graph_plan_free  (ggml_backend_t backend, ggml_backend_graph_plan_t plan);

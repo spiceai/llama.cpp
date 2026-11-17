@@ -1350,12 +1350,14 @@ struct common_prompt_checkpoint {
             llama_pos pos_min,
             llama_pos pos_max);
 
-    void update_tgt(
+    // save the sequence's state; return false, keeping nothing, if the context failed a computation
+    // (llama_get_compute_status), and abort if the state does not save for another reason
+    bool update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void update_dft(
+    bool update_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags);

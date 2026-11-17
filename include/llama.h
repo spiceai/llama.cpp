@@ -1104,6 +1104,16 @@ extern "C" {
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
 
+    // 0 while every computation the context queued has succeeded, -3 once a backend failed one (a GPU fault, for one).
+    // A failure is found when the computation is waited for: by llama_synchronize, and by every getter of outputs and of
+    // state, so call this after the getter, which does not wait twice. Once it fails, the context's outputs and state are
+    // not the computation's: the getters return what they return for an output that was not computed (NULL,
+    // LLAMA_TOKEN_NULL, 0), the llama_state_* functions that save or load state return 0 (false for the file ones), and
+    // llama_decode and llama_encode return -3. The llama_state_*get_size* functions do not wait and keep reporting a
+    // size, so a caller that sizes a buffer first learns of the failure from the save that follows (0, or less than the
+    // size). Free the context and create another to recover. Does not wait.
+    LLAMA_API int32_t llama_get_compute_status(const struct llama_context * ctx);
+
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
     // in the order they have appeared in the batch.
@@ -1652,7 +1662,7 @@ extern "C" {
     //    auto token = cur_p.data[cur_p.selected].id;
     //    llama_sampler_accept(smpl, token);
     //    return token;
-    // Returns the sampled token
+    // Returns the sampled token, or LLAMA_TOKEN_NULL when a backend failed computing the outputs (llama_get_compute_status)
     LLAMA_API llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx);
 
     // TODO: extend in the future
