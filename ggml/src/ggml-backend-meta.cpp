@@ -573,13 +573,15 @@ static size_t ggml_backend_meta_inner_extent(const struct ggml_tensor * tensor, 
 //    and all; the view's other dims step by whole rows (the columns of every channel a conv state store takes).
 // The view's dims below the split dim, and an offset inside one element of the split axis, must fit inside one element of
 // the split dim: every device's elements carry them alike. ggml_backend_meta_buffer_init_tensor_impl() scales a view's
-// offset by each device's share unless it lies inside the first element, so an offset inside an element is taken only
-// there. Sets out and returns true for those views; false for any other (one whose dims cut across the repetitions or start
-// inside one, a quantized source, or a source that is itself a view at an offset).
+// offset by each device's share unless it lies inside the first element of the tensor the view's data belongs to
+// (view_src), so an offset inside an element is taken only there, and only when src is that tensor: a reshape of it has
+// other elements. Split along the last axis, a row is the whole tensor. Sets out and returns true for those views; false
+// for any other (one whose dims cut across the repetitions or start inside one, a quantized source, or a source that is
+// itself a view at an offset, or at any offset that is not whole repetitions or rows of it).
 static bool ggml_backend_meta_view_of_repetitions(const struct ggml_tensor * view, const struct ggml_tensor * src,
         const struct ggml_backend_meta_split_state & ss, size_t n_bufs, struct ggml_backend_meta_split_state & out) {
     const int axis = ss.axis;
-    if (axis < 0 || axis >= GGML_MAX_DIMS - 1 || ss.n_segments != 1 || ss.nr[0] < 2 || ggml_blck_size(src->type) != 1) {
+    if (axis < 0 || axis >= GGML_MAX_DIMS || ss.n_segments != 1 || ss.nr[0] < 2 || ggml_blck_size(src->type) != 1) {
         return false;
     }
     if (src->view_offs != 0 || view->view_offs < src->view_offs) {
@@ -590,7 +592,7 @@ static bool ggml_backend_meta_view_of_repetitions(const struct ggml_tensor * vie
         total += ss.ne[j];
     }
     const size_t nb_axis = src->nb[axis];
-    const size_t nb_row  = src->nb[axis + 1];
+    const size_t nb_row  = axis + 1 < GGML_MAX_DIMS ? src->nb[axis + 1] : src->nb[axis] * src->ne[axis];
     const size_t extent  = (size_t) total * nb_axis; // one repetition
     if (total == 0 || nb_row != ss.nr[0] * extent) {
         return false;
@@ -599,7 +601,7 @@ static bool ggml_backend_meta_view_of_repetitions(const struct ggml_tensor * vie
     const size_t in_row   = offs % nb_row;
     const size_t in_elem  = in_row % nb_axis;
     const size_t axis_pos = in_row - in_elem;
-    if (in_elem != 0 && offs != in_elem) {
+    if (in_elem != 0 && (offs != in_elem || src->view_src != nullptr)) {
         return false;
     }
     for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
@@ -931,6 +933,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // the rules below split a view in proportion to the whole split axis, which a source split as one segment repeated
         // is not: each device's share of every repetition lies in its own data one after the other
         if (axis >= 0 && axis < GGML_MAX_DIMS && src_ss[0].n_segments == 1 && src_ss[0].nr[0] > 1) {
+            bool same_layout = tensor->view_offs == tensor->src[0]->view_offs;
+            for (int dim = 0; dim < GGML_MAX_DIMS && same_layout; dim++) {
+                same_layout = tensor->ne[dim] == tensor->src[0]->ne[dim] && tensor->nb[dim] == tensor->src[0]->nb[dim];
+            }
+            if (same_layout) {
+                return src_ss[0]; // the view is its source
+            }
             ggml_backend_meta_split_state ret;
             if (ggml_backend_meta_view_of_repetitions(tensor, tensor->src[0], src_ss[0], n_bufs, ret)) {
                 return ret;
