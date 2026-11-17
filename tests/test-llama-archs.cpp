@@ -2119,6 +2119,11 @@ static std::vector<float> get_logits_rollback(
     return ret;
 }
 
+// a NaN NMSE as infinity, so that a running maximum does not drop it and NaN logits fail as compare_kq() makes them
+static double nmse_or_inf(double nmse_val) {
+    return std::isnan(nmse_val) ? INFINITY : nmse_val;
+}
+
 // a rollback of k tokens is correct if the probe after it gives the logits of a decode that never saw those k tokens,
 // on the CPU and in tensor split mode, where every device holds its own part of each snapshot
 static int test_rollback(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
@@ -2147,11 +2152,18 @@ static int test_rollback(const std::string & arch_filter, const size_t seed, con
     if (n_rs_seq == 0) {
         n_rs_seq = 3;
     }
-    const uint32_t n_prefix = 24;
+    // the memory keeps snapshots of a ubatch of at most n_rs_seq + 1 tokens, a draft's verification, so that tail must
+    // be one ubatch; the prefix keeps tokens before the deepest rollback, so no decode starts from an empty one
+    const uint32_t n_ubatch = get_ctx_params(false, 0).n_ubatch;
+    if (n_rs_seq + 1 > n_ubatch) {
+        LOG_ERR("%s: --n-rs-seq %u needs a verification batch of %u tokens, more than the %u of one ubatch this check decodes in\n",
+            __func__, n_rs_seq, n_rs_seq + 1, n_ubatch);
+        return 1;
+    }
+    const uint32_t n_tail   = n_rs_seq + 1;
+    const uint32_t n_prefix = std::max<uint32_t>(24, n_tail + 8);
     const uint32_t n_probe  = 4;
     const double   thold    = 1e-4;
-    // the memory keeps snapshots of a ubatch of at most n_rs_seq + 1 tokens: a draft's verification
-    const uint32_t n_tail   = n_rs_seq + 1;
 
     const std::vector<llama_token> tokens = get_tokens(n_prefix + n_probe, 128, seed);
     const std::vector<llama_token> prefix(tokens.begin(), tokens.begin() + n_prefix);
@@ -2242,11 +2254,11 @@ static int test_rollback(const std::string & arch_filter, const size_t seed, con
                         const std::vector<llama_token> kept(prefix.begin(), prefix.begin() + n_keep);
                         const std::vector<float> fresh  = get_logits_rollback(model, mc.second.get(), kept,   n_tail, n_keep, probe);
                         const std::vector<float> rolled = get_logits_rollback(model, mc.second.get(), prefix, n_tail, n_keep, probe);
-                        worst = std::max(worst, nmse(fresh, rolled));
+                        worst = std::max(worst, nmse_or_inf(nmse(fresh, rolled)));
                         if (label == "CPU") {
                             fresh_cpu.push_back(fresh);
                         } else if (fresh_cpu.size() >= k) {
-                            worst_cpu = std::max(worst_cpu, nmse(fresh_cpu[k - 1], rolled));
+                            worst_cpu = std::max(worst_cpu, nmse_or_inf(nmse(fresh_cpu[k - 1], rolled)));
                         }
                         if (k == 1) {
                             // without the rollback the probe follows the whole prefix: tells if the probe depends on the state
