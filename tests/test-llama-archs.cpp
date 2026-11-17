@@ -2264,14 +2264,14 @@ static int test_rollback(const std::string & arch_filter, const size_t seed, con
                     }
                     status = buf;
                 } catch (const rollback_refused & err) {
-                    if (label == "CPU") {
+                    if (label == "CPU" && llama_n_rs_seq(mc.second.get()) == 0) {
                         // the architecture keeps no snapshots, there is nothing to compare a split against
                         n_tests--;
                         cpu_refused = true;
                         status = std::string("\033[1;33mSKIP\033[0m (") + err.what() + ")";
                     } else {
                         n_failed++;
-                        status = std::string("\033[1;31mFAIL\033[0m (") + err.what() + ", which the CPU did)";
+                        status = std::string("\033[1;31mFAIL\033[0m (") + err.what() + (label == "CPU" ? ")" : ", which the CPU did)");
                     }
                 } catch (const std::exception & err) {
                     n_failed++;
