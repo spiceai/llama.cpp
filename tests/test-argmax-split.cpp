@@ -1326,6 +1326,141 @@ static int test_markov_blocks(ggml_backend_dev_t dev, int64_t v, int64_t n_block
     return n_fail;
 }
 
+// tensors named "*seg0" are split along axis 0 in the segments userdata holds, everything else is mirrored
+static ggml_backend_meta_split_state seg0_state(const ggml_tensor * tensor, void * userdata) {
+    const std::string name = tensor->name;
+    if (name.size() >= 4 && name.compare(name.size() - 4, 4, "seg0") == 0) {
+        return *(const ggml_backend_meta_split_state *) userdata;
+    }
+    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+}
+
+// a view of a source split along axis 0 as one segment repeated, in elements: ne, nb[1..3] (nb[0] is one element) and the
+// offset; whole is the view dim that reads whole rows, or -1 for a view within one repetition
+struct repetitions_view {
+    const char * what;
+    int64_t      ne[4];
+    size_t       nb[3];
+    size_t       offs;
+    int          whole;
+};
+
+// A source split as one segment repeated nr times along axis 0 (a conv state's q, k and v windows one after the other,
+// each split across the devices in one ratio) holds on each device its share of every repetition one after the other, so
+// a view across the repetitions is not a share of the whole axis. Each view, made contiguous and gathered, must equal the
+// device alone's, bit for bit. A view of whole rows stays split into repetitions, so it is gathered a repetition at a time.
+static int test_meta_view_of_repetitions(ggml_backend_dev_t dev, const std::vector<int64_t> & parts, int nr) {
+    const int n_parts = (int) parts.size();
+    int64_t T = 0;
+    bool even = true;
+    for (int64_t n : parts) {
+        T += n;
+        even = even && n % 2 == 0;
+    }
+    const int64_t n_tokens = 3;
+    const size_t  R  = nr*T;
+    const size_t  NT = n_tokens;
+    std::vector<repetitions_view> views = {
+        {"one repetition, permuted, the first",              {1, n_tokens, T, 1},       {R, 1, R*NT},       0,                  -1},
+        {"one repetition, permuted, the last",               {1, n_tokens, T, 1},       {R, 1, R*NT},       (size_t) ((nr-1)*T), -1},
+        {"one repetition, permuted, repetitions as a dim",   {1, n_tokens, T, nr},      {R, 1, (size_t) T}, 0,                  -1},
+        {"one repetition at the source's strides, the last", {T, n_tokens, 1, 1},       {R, R*NT, R*NT},    (size_t) ((nr-1)*T), -1},
+        {"one repetition, contiguous, repetitions as a dim", {T, nr, n_tokens, 1},      {(size_t) T, R, R*NT}, 0,               -1},
+        {"whole rows, permuted",                             {1, n_tokens, (int64_t) R, 1}, {R, 1, R*NT},   0,                   2},
+        {"whole rows, every second token",                   {(int64_t) R, 2, 1, 1},    {2*R, 2*R, 2*R},    0,                   0},
+    };
+    if (even) {
+        views.push_back({"every second element of the last repetition, permuted", {1, n_tokens, T/2, 1}, {R, 2, R*NT}, (size_t) ((nr-1)*T), -1});
+    }
+    ggml_backend_meta_split_state ss = {GGML_BACKEND_SPLIT_AXIS_0, {0}, {(uint32_t) nr}, 1};
+    for (int j = 0; j < n_parts; j++) {
+        ss.ne[j] = parts[j];
+    }
+    std::vector<ggml_backend_dev_t> devs(n_parts, dev);
+    std::vector<float> rf(R*NT); // row r of token t holds 1000*t + r, so a value read from anywhere else shows
+    for (size_t t = 0; t < NT; t++) {
+        for (size_t r = 0; r < R; r++) {
+            rf[t*R + r] = (float) (1000*t + r);
+        }
+    }
+    std::string layout;
+    for (int64_t n : parts) {
+        layout += (layout.empty() ? "" : ",") + std::to_string(n);
+    }
+
+    int n_fail = 0;
+    for (const repetitions_view & rv : views) {
+        auto run = [&](bool split, std::vector<float> & out) {
+            ggml_backend_t backend = split
+                ? ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), seg0_state, &ss), nullptr)
+                : ggml_backend_dev_init(dev, nullptr);
+            GGML_ASSERT(backend != nullptr);
+            ggml_init_params wp = { ggml_tensor_overhead(), nullptr, true };
+            ggml_context * ctx_w = ggml_init(wp);
+            ggml_tensor * r = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, R, n_tokens);
+            ggml_set_name(r, "conv_state_seg0");
+            ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+            GGML_ASSERT(wbuf != nullptr);
+            ggml_backend_tensor_set(r, rf.data(), 0, ggml_nbytes(r));
+
+            ggml_init_params gp = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
+            ggml_context * ctx = ggml_init(gp);
+            const size_t es = sizeof(float);
+            ggml_tensor * v = ggml_cont(ctx, ggml_view_4d(ctx, r, rv.ne[0], rv.ne[1], rv.ne[2], rv.ne[3],
+                rv.nb[0]*es, rv.nb[1]*es, rv.nb[2]*es, rv.offs*es));
+            std::vector<ggml_tensor *> outs;
+            if (rv.whole < 0) {
+                outs.push_back(split ? ggml_backend_meta_gather(ctx, v) : v);
+            } else {
+                int64_t ne[4] = {v->ne[0], v->ne[1], v->ne[2], v->ne[3]};
+                ne[rv.whole] /= nr;
+                for (int i = 0; i < nr; i++) {
+                    ggml_tensor * rep = ggml_cont(ctx, ggml_view_4d(ctx, v, ne[0], ne[1], ne[2], ne[3], v->nb[1], v->nb[2], v->nb[3],
+                        (size_t) i*ne[rv.whole]*v->nb[rv.whole]));
+                    outs.push_back(split ? ggml_backend_meta_gather(ctx, rep) : rep);
+                }
+            }
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            for (ggml_tensor * o : outs) {
+                ggml_set_output(o);
+                ggml_build_forward_expand(gf, o);
+            }
+            ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+            GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+            out.clear();
+            for (ggml_tensor * o : outs) {
+                const size_t at = out.size();
+                out.resize(at + ggml_nelements(o));
+                ggml_backend_tensor_get(o, out.data() + at, 0, ggml_nbytes(o));
+            }
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx);
+            ggml_backend_buffer_free(wbuf);
+            ggml_free(ctx_w);
+            ggml_backend_free(backend);
+        };
+        std::vector<float> ref, got;
+        run(false, ref);
+        run(true,  got);
+        int64_t n_diff = 0, first = -1;
+        for (size_t i = 0; i < ref.size(); i++) {
+            if (!same_float(ref[i], got[i])) {
+                n_diff++;
+                first = first < 0 ? (int64_t) i : first;
+            }
+        }
+        printf("  %s %s, %d repetitions split %s: %lld of %zu values differ from the device alone", ggml_backend_dev_name(dev),
+            rv.what, nr, layout.c_str(), (long long) n_diff, ref.size());
+        if (first >= 0) {
+            printf(" (first at %lld: %g, want %g)", (long long) first, got[first], ref[first]);
+        }
+        printf(" %s\n", n_diff == 0 ? "ok" : "FAIL");
+        n_fail += n_diff != 0;
+    }
+    return n_fail;
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -1365,6 +1500,13 @@ int main() {
     // a view of the heads of a product whose prefix is its own segment of the split
     for (int n_parts : {2, 3}) {
         n_fail += test_meta_view_past_segmented_prefix(dev, n_parts);
+    }
+    // views of a source split as one segment repeated, as a conv state's q, k and v windows: even, uneven, odd shares
+    for (int nr : {2, 3}) {
+        for (const std::vector<int64_t> & parts : {std::vector<int64_t>{6, 6}, std::vector<int64_t>{4, 4, 4},
+                std::vector<int64_t>{5, 7}, std::vector<int64_t>{3, 3}, std::vector<int64_t>{2, 4, 6}}) {
+            n_fail += test_meta_view_of_repetitions(dev, parts, nr);
+        }
     }
     for (int n_parts : {2, 3}) {
         const std::vector<int64_t> parts = even_parts(v, n_parts);
