@@ -2483,10 +2483,15 @@ static int test_graph_slots(const std::string & arch_filter, const size_t seed, 
     const int    n_slots   = slots_env != nullptr ? atoi(slots_env) : 0;
 
     const uint32_t n_prefix = 8;
-    // 1 = one token of sequence 0, 2 = one token of each sequence; runs of 6 outlast GRAPH_SLOTS_IDLE (4)
-    const std::vector<int> pattern = { 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2 };
-    const int n_steps = (int) pattern.size();
-    const std::vector<llama_token> tokens = get_tokens(2*(n_prefix + n_steps), 128, seed);
+    // 1 = one token of sequence 0, 2 = one token of each sequence, 3 = save sequence 1's state, drop and restore it, then
+    // one token of each (a server restoring a cached prompt: an indexer re-pools the restored sequence's pools in that
+    // ubatch). Runs of 6 outlast GRAPH_SLOTS_IDLE (4). The first pattern has two shapes; the second adds restores at two
+    // lengths, whose re-pool counts differ, and with an indexer they are a third shape, so with LLAMA_GRAPH_SLOTS=4 or
+    // more every step after the first of each shape reuses its graph
+    const std::vector<std::vector<int>> patterns = {
+        { 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2 },
+        { 1, 2, 2, 2, 2, 2, 2, 3, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 2, 2 },
+    };
 
     struct dev_config {
         std::string name;
@@ -2507,7 +2512,7 @@ static int test_graph_slots(const std::string & arch_filter, const size_t seed, 
     size_t n_tests  = 0;
     size_t n_failed = 0;
     common_log_flush(common_log_main());
-    LOG("graphs reused over %d decodes going between one sequence and two, LLAMA_GRAPH_SLOTS=%s\n", n_steps, slots_env ? slots_env : "(unset)");
+    LOG("graphs reused over decodes going between one sequence and two, then with restores of one, LLAMA_GRAPH_SLOTS=%s\n", slots_env ? slots_env : "(unset)");
     LOG(template_row.c_str(), "Model arch.", "Config", "Devices", "Status");
 
     for (const llm_arch & arch : llama_arch_all()) {
@@ -2530,9 +2535,14 @@ static int test_graph_slots(const std::string & arch_filter, const size_t seed, 
             }
             const char * config_name = moe ? "MoE" : "Dense";
             for (const dev_config & dc : configs) {
-                if (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llama_arch_supports_sm_tensor(arch)) {
-                    continue;
-                }
+              if (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llama_arch_supports_sm_tensor(arch)) {
+                  continue;
+              }
+              for (size_t ip = 0; ip < patterns.size(); ip++) {
+                const std::vector<int> & pattern = patterns[ip];
+                const int n_steps = (int) pattern.size();
+                const std::vector<llama_token> tokens = get_tokens(2*(n_prefix + n_steps), 128, seed);
+                const std::string devices = dc.name + (ip ? " +r" : "");
                 gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
                 std::string status;
                 try {
@@ -2562,14 +2572,25 @@ static int test_graph_slots(const std::string & arch_filter, const size_t seed, 
                         size_t next = 2*n_prefix;
                         const int32_t reused0 = llama_perf_context(lctx.get()).n_reused;
                         for (int i = 0; i < n_steps; i++) {
+                            if (pattern[i] == 3) {
+                                std::vector<uint8_t> state(llama_state_seq_get_size(lctx.get(), 1));
+                                if (llama_state_seq_get_data(lctx.get(), state.data(), state.size(), 1) != state.size()) {
+                                    throw std::runtime_error("failed to save sequence 1");
+                                }
+                                llama_memory_seq_rm(llama_get_memory(lctx.get()), 1, -1, -1);
+                                if (llama_state_seq_set_data(lctx.get(), state.data(), state.size(), 1) != state.size()) {
+                                    throw std::runtime_error("failed to restore sequence 1");
+                                }
+                            }
+                            const int n_seqs = pattern[i] == 1 ? 1 : 2;
                             common_batch batch(lctx.get());
-                            for (llama_seq_id seq = 0; seq < pattern[i]; seq++) {
+                            for (llama_seq_id seq = 0; seq < n_seqs; seq++) {
                                 batch.add(tokens[next++], pos[seq]++, seq, true);
                             }
                             if (llama_process(lctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
                                 throw std::runtime_error("failed to decode batch");
                             }
-                            for (int k = 0; k < pattern[i]; k++) {
+                            for (int k = 0; k < n_seqs; k++) {
                                 const float * logits_ith = llama_get_logits_ith(lctx.get(), k);
                                 logits[off].insert(logits[off].end(), logits_ith, logits_ith + n_vocab);
                             }
@@ -2577,7 +2598,7 @@ static int test_graph_slots(const std::string & arch_filter, const size_t seed, 
                         reused[off] = llama_perf_context(lctx.get()).n_reused - reused0;
                     }
                     if (reused[0] < 0 || reused[1] < 0) {
-                        LOG(template_row.c_str(), llama_arch_name(arch), config_name, dc.name.c_str(), "\033[1;33mSKIP\033[0m (context)");
+                        LOG(template_row.c_str(), llama_arch_name(arch), config_name, devices.c_str(), "\033[1;33mSKIP\033[0m (context)");
                         continue;
                     }
                     n_tests++;
@@ -2586,8 +2607,10 @@ static int test_graph_slots(const std::string & arch_filter, const size_t seed, 
                     for (size_t j = 0; j < logits[0].size(); j++) {
                         max_diff = std::max(max_diff, std::fabs(logits[0][j] - logits[1][j]));
                     }
-                    // the first decode of each shape follows the prompts' graphs; with three slots every later one reuses
-                    const int32_t want = n_steps - 2;
+                    // the first decode of each shape follows the prompts' graphs; with enough slots every later one reuses
+                    const int     n_shapes   = ip ? 3 : 2;
+                    const int32_t want       = n_steps - n_shapes;
+                    const int     slots_need = n_shapes + 1;
                     if (logits[0].size() != logits[1].size() || max_diff != 0.0f) {
                         n_failed++;
                         snprintf(buf, sizeof(buf), "\033[1;31mFAIL\033[0m (logits differ from never reusing a graph: max |diff| %.3e)", max_diff);
@@ -2596,11 +2619,11 @@ static int test_graph_slots(const std::string & arch_filter, const size_t seed, 
                         snprintf(buf, sizeof(buf), "\033[1;31mFAIL\033[0m (%d reused with reuse disabled)", reused[1]);
                     } else if (reused[0] == 0) {
                         snprintf(buf, sizeof(buf), "\033[1;33mOK\033[0m (never reused: the model's inputs rule it out, logits identical)");
-                    } else if (n_slots >= 3 && reused[0] != want) {
+                    } else if (n_slots >= slots_need && reused[0] < want) {
                         n_failed++;
-                        snprintf(buf, sizeof(buf), "\033[1;31mFAIL\033[0m (%d of %d reused with %d slots)", reused[0], want, n_slots);
+                        snprintf(buf, sizeof(buf), "\033[1;31mFAIL\033[0m (%d of %d decodes reused, %d needed with %d slots)", reused[0], n_steps, want, n_slots);
                     } else {
-                        snprintf(buf, sizeof(buf), "\033[1;32mOK\033[0m (%d of %d reused, logits identical)", reused[0], want);
+                        snprintf(buf, sizeof(buf), "\033[1;32mOK\033[0m (%d of %d decodes reused, %d needed, logits identical)", reused[0], n_steps, want);
                     }
                     status = buf;
                 } catch (const std::exception & err) {
@@ -2609,7 +2632,8 @@ static int test_graph_slots(const std::string & arch_filter, const size_t seed, 
                     n_failed++;
                     status = std::string("\033[1;31mERROR\033[0m (") + err.what() + ")";
                 }
-                LOG(template_row.c_str(), llama_arch_name(arch), config_name, dc.name.c_str(), status.c_str());
+                LOG(template_row.c_str(), llama_arch_name(arch), config_name, devices.c_str(), status.c_str());
+              }
             }
         }
     }

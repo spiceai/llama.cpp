@@ -730,7 +730,16 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     // as the count moves; reserve sizes the list for every pool the cache can hold, so never pad past n_pool_max
     const uint32_t n_pool_max = kv_size / kpool * idx->get_n_seq_max();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
-    st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_new_pad(st.n_pool_real) - 1, n_pool_max})});
+    const uint32_t cap   = std::min(kpool_new_pad(st.n_pool_real) - 1, n_pool_max);
+    st.n_new_g = std::max({st.n_new, 1u, std::min(bound, cap)});
+    // more pools than that bound: a prompt, or the first ubatch after a sequence edit or a restored state staled a
+    // sequence's pools (a server restoring a cached prompt does that at every turn). The count is that of the stale pools,
+    // a new one each time, and each would be a graph of its own: pad it to the 64-pool step instead, under the same cap,
+    // so those ubatches share a few shapes, which graph slots keep (LLAMA_GRAPH_SLOTS). n_new is at most n_pool_real,
+    // which the cap is above, so the padding never drops a pool
+    if (st.n_new > std::min(bound, cap)) {
+        st.n_new_g = std::max(st.n_new, std::min<uint32_t>(GGML_PAD(st.n_new, 64), cap));
+    }
 
     // while a prompt is read, size the pool list for the whole LLAMA_KV_PROMPT_PAD bucket, as the visible KV range is,
     // so the chunks of one prompt share a graph shape (the padded pools point at the sentinel row, like the one pool
