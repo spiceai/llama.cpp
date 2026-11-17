@@ -1461,69 +1461,92 @@ static int test_meta_view_of_repetitions(ggml_backend_dev_t dev, const std::vect
     return n_fail;
 }
 
-// A view of a source split along its last axis as one segment repeated, with the source's shape, strides and offset: a
-// permute that moves the repeated axis last, viewed whole. It is its source, so it keeps the source's split; gathered a
-// repetition at a time, it must equal the device alone's, bit for bit.
-static int test_meta_identity_view_of_repetitions(ggml_backend_dev_t dev) {
+// views of a permute of a source split along axis 1 as one segment repeated: the permute, its views and their offsets
+struct permuted_repetitions_view {
+    const char * what;
+    int          axes[4];  // ggml_permute's
+    int64_t      ne[4];
+    size_t       nb[3];    // nb[1..3], in bytes
+    size_t       offs;     // in bytes
+    int          rep_dim;  // the result's dim that holds the repetitions, gathered one at a time
+};
+
+// A permute keeps a source's split, with the repeated axis moved: last (where no dim follows it) or before a dim whose
+// stride is larger than the bytes the axis takes. A view of it that keeps its layout, or crops dims other than the
+// repeated one, keeps that split; gathered a repetition at a time, each must equal the device alone's, bit for bit.
+static int test_meta_permuted_views_of_repetitions(ggml_backend_dev_t dev) {
     const int nr = 3;
     ggml_backend_meta_split_state ss = {GGML_BACKEND_SPLIT_AXIS_1, {1, 1}, {(uint32_t) nr}, 1};
     std::vector<ggml_backend_dev_t> devs(2, dev);
-    std::vector<float> rf(4*6*2);
+    std::vector<float> rf(4*6*2); // r = [4, 6, 2]: axis 1 holds 3 repetitions of one row per device
     for (size_t i = 0; i < rf.size(); i++) {
         rf[i] = (float) i;
     }
-    auto run = [&](bool split, std::vector<float> & out) {
-        ggml_backend_t backend = split
-            ? ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), seg1_state, &ss), nullptr)
-            : ggml_backend_dev_init(dev, nullptr);
-        GGML_ASSERT(backend != nullptr);
-        ggml_init_params wp = { ggml_tensor_overhead(), nullptr, true };
-        ggml_context * ctx_w = ggml_init(wp);
-        ggml_tensor * r = ggml_new_tensor_3d(ctx_w, GGML_TYPE_F32, 4, 6, 2); // axis 1: 3 repetitions of one row per device
-        ggml_set_name(r, "conv_state_seg1");
-        ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
-        GGML_ASSERT(wbuf != nullptr);
-        ggml_backend_tensor_set(r, rf.data(), 0, ggml_nbytes(r));
-
-        ggml_init_params gp = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
-        ggml_context * ctx = ggml_init(gp);
-        ggml_tensor * p = ggml_permute(ctx, r, 0, 3, 1, 2); // [4, 2, 1, 6]: the repeated axis last
-        ggml_tensor * v = ggml_cont(ctx, ggml_view_4d(ctx, p, p->ne[0], p->ne[1], p->ne[2], p->ne[3], p->nb[1], p->nb[2], p->nb[3], 0));
-        std::vector<ggml_tensor *> outs;
-        for (int i = 0; i < nr; i++) {
-            ggml_tensor * rep = ggml_cont(ctx, ggml_view_4d(ctx, v, 4, 2, 1, 2, v->nb[1], v->nb[2], v->nb[3], (size_t) i*2*v->nb[3]));
-            outs.push_back(split ? ggml_backend_meta_gather(ctx, rep) : rep);
-        }
-        ggml_cgraph * gf = ggml_new_graph(ctx);
-        for (ggml_tensor * o : outs) {
-            ggml_set_output(o);
-            ggml_build_forward_expand(gf, o);
-        }
-        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
-        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
-        out.clear();
-        for (ggml_tensor * o : outs) {
-            const size_t at = out.size();
-            out.resize(at + ggml_nelements(o));
-            ggml_backend_tensor_get(o, out.data() + at, 0, ggml_nbytes(o));
-        }
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx);
-        ggml_backend_buffer_free(wbuf);
-        ggml_free(ctx_w);
-        ggml_backend_free(backend);
+    const permuted_repetitions_view views[] = {
+        {"the repeated axis last, its own layout",          {0, 3, 1, 2}, {4, 2, 1, 6}, {96, 192, 16}, 0,  3},
+        {"the repeated axis last, two values of each row",  {0, 3, 1, 2}, {2, 2, 1, 6}, {96, 192, 16}, 0,  3},
+        {"the repeated axis third, two values of each row", {0, 2, 1, 3}, {2, 2, 6, 1}, {96, 16, 192}, 0,  2},
+        {"the repeated axis third, the second token",       {0, 2, 1, 3}, {4, 1, 6, 1}, {96, 16, 192}, 96, 2},
     };
-    std::vector<float> ref, got;
-    run(false, ref);
-    run(true,  got);
-    int64_t n_diff = 0;
-    for (size_t i = 0; i < ref.size(); i++) {
-        n_diff += !same_float(ref[i], got[i]);
+    int n_fail = 0;
+    for (const permuted_repetitions_view & pv : views) {
+        auto run = [&](bool split, std::vector<float> & out) {
+            ggml_backend_t backend = split
+                ? ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), seg1_state, &ss), nullptr)
+                : ggml_backend_dev_init(dev, nullptr);
+            GGML_ASSERT(backend != nullptr);
+            ggml_init_params wp = { ggml_tensor_overhead(), nullptr, true };
+            ggml_context * ctx_w = ggml_init(wp);
+            ggml_tensor * r = ggml_new_tensor_3d(ctx_w, GGML_TYPE_F32, 4, 6, 2);
+            ggml_set_name(r, "conv_state_seg1");
+            ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+            GGML_ASSERT(wbuf != nullptr);
+            ggml_backend_tensor_set(r, rf.data(), 0, ggml_nbytes(r));
+
+            ggml_init_params gp = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
+            ggml_context * ctx = ggml_init(gp);
+            ggml_tensor * p = ggml_permute(ctx, r, pv.axes[0], pv.axes[1], pv.axes[2], pv.axes[3]);
+            ggml_tensor * v = ggml_cont(ctx, ggml_view_4d(ctx, p, pv.ne[0], pv.ne[1], pv.ne[2], pv.ne[3], pv.nb[0], pv.nb[1], pv.nb[2], pv.offs));
+            int64_t ne[4] = {v->ne[0], v->ne[1], v->ne[2], v->ne[3]};
+            ne[pv.rep_dim] /= nr;
+            std::vector<ggml_tensor *> outs;
+            for (int i = 0; i < nr; i++) {
+                ggml_tensor * rep = ggml_cont(ctx, ggml_view_4d(ctx, v, ne[0], ne[1], ne[2], ne[3], v->nb[1], v->nb[2], v->nb[3],
+                    (size_t) i*ne[pv.rep_dim]*v->nb[pv.rep_dim]));
+                outs.push_back(split ? ggml_backend_meta_gather(ctx, rep) : rep);
+            }
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            for (ggml_tensor * o : outs) {
+                ggml_set_output(o);
+                ggml_build_forward_expand(gf, o);
+            }
+            ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+            GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+            out.clear();
+            for (ggml_tensor * o : outs) {
+                const size_t at = out.size();
+                out.resize(at + ggml_nelements(o));
+                ggml_backend_tensor_get(o, out.data() + at, 0, ggml_nbytes(o));
+            }
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx);
+            ggml_backend_buffer_free(wbuf);
+            ggml_free(ctx_w);
+            ggml_backend_free(backend);
+        };
+        std::vector<float> ref, got;
+        run(false, ref);
+        run(true,  got);
+        int64_t n_diff = 0;
+        for (size_t i = 0; i < ref.size(); i++) {
+            n_diff += !same_float(ref[i], got[i]);
+        }
+        printf("  %s a permute of a source split as %d repetitions, %s: %lld of %zu values differ from the device alone %s\n",
+            ggml_backend_dev_name(dev), nr, pv.what, (long long) n_diff, ref.size(), n_diff == 0 ? "ok" : "FAIL");
+        n_fail += n_diff != 0;
     }
-    printf("  %s a view of a permuted source split along its last axis, %d repetitions, its own layout: %lld of %zu values differ "
-        "from the device alone %s\n", ggml_backend_dev_name(dev), nr, (long long) n_diff, ref.size(), n_diff == 0 ? "ok" : "FAIL");
-    return n_diff != 0;
+    return n_fail;
 }
 
 int main() {
@@ -1573,7 +1596,7 @@ int main() {
             n_fail += test_meta_view_of_repetitions(dev, parts, nr);
         }
     }
-    n_fail += test_meta_identity_view_of_repetitions(dev);
+    n_fail += test_meta_permuted_views_of_repetitions(dev);
     for (int n_parts : {2, 3}) {
         const std::vector<int64_t> parts = even_parts(v, n_parts);
         n_fail += test_meta(dev, GGML_TYPE_Q6_K, 5120, v, 3, parts, false);
