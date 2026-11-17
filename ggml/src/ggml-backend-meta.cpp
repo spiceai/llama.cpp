@@ -562,64 +562,31 @@ static size_t ggml_backend_meta_inner_extent(const struct ggml_tensor * tensor, 
     return extent;
 }
 
-// The bytes along the split axis of src that one repetition of one of its segments takes, when a view of src starts
-// where such a repetition starts within a row and every segment splits between the devices in one ratio; else 0.
+// The bytes along the split axis of src that one repetition of its segment takes, when src is split as one segment
+// repeated (n_segments 1, nr > 1) and a view of src starts where a repetition starts within a row; else 0.
 // A conv state that holds the q, k and v windows one after the other is one segment repeated three times: a view of one
 // window is split the way the window is, and each device's share of it, and of the view's offset, is its share of the
-// whole axis.
+// whole axis. With several segments, or a source that is itself a view at an offset, the offset that
+// ggml_backend_meta_buffer_init_tensor_impl() gives each device is not that share, so such views are not matched.
 static size_t ggml_backend_meta_view_segment_span(const struct ggml_tensor * view, const struct ggml_tensor * src,
         const struct ggml_backend_meta_split_state & ss, int axis, size_t n_bufs) {
-    if (axis < 0 || axis >= GGML_MAX_DIMS - 1 || (ss.n_segments == 1 && ss.nr[0] == 1)) {
+    if (axis < 0 || axis >= GGML_MAX_DIMS - 1 || ss.n_segments != 1 || ss.nr[0] < 2) {
         return 0;
     }
-    // a source that is itself a view at an offset: each device's view offset is scaled whole by its share, which is wrong
-    // for the part of that offset inside an unsplit row, so such a view is not split here
-    if (src->view_offs != 0) {
+    if (src->view_offs != 0 || view->view_offs < src->view_offs) {
         return 0;
     }
-    int64_t total_first = 0;
+    int64_t total = 0;
     for (size_t j = 0; j < n_bufs; j++) {
-        total_first += ss.ne[j];
+        total += ss.ne[j];
     }
-    if (total_first == 0) {
+    const int64_t blck = axis == 0 ? ggml_blck_size(src->type) : 1;
+    if (total == 0 || total % blck != 0) {
         return 0;
     }
-    for (size_t s = 1; s < ss.n_segments; s++) {
-        int64_t total = 0;
-        for (size_t j = 0; j < n_bufs; j++) {
-            total += ss.ne[s*n_bufs + j];
-        }
-        for (size_t j = 0; j < n_bufs; j++) {
-            if (ss.ne[s*n_bufs + j] * total_first != ss.ne[j] * total) {
-                return 0;
-            }
-        }
-    }
-    const int64_t blck    = axis == 0 ? ggml_blck_size(src->type) : 1;
-    const size_t  nb_axis = src->nb[axis];
-    const size_t  nb_next = src->nb[axis + 1];
-    if (view->view_offs < src->view_offs) {
-        return 0;
-    }
-    const size_t offs = (view->view_offs - src->view_offs) % nb_next;
-    size_t start = 0;
-    for (size_t s = 0; s < ss.n_segments; s++) {
-        int64_t total = 0;
-        for (size_t j = 0; j < n_bufs; j++) {
-            total += ss.ne[s*n_bufs + j];
-        }
-        if (total % blck != 0) {
-            return 0;
-        }
-        const size_t extent = (size_t) (total / blck) * nb_axis;
-        for (uint32_t r = 0; r < ss.nr[s]; r++) {
-            if (start == offs) {
-                return extent;
-            }
-            start += extent;
-        }
-    }
-    return 0;
+    const size_t extent = (size_t) (total / blck) * src->nb[axis];
+    const size_t offs   = (view->view_offs - src->view_offs) % src->nb[axis + 1];
+    return offs % extent == 0 && offs / extent < ss.nr[0] ? extent : 0;
 }
 
 // the view dim that holds the split axis of src, or -1
