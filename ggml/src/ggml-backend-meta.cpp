@@ -2311,7 +2311,8 @@ struct ggml_backend_meta_context {
     // two compute buffers here. A scheduler reuses only the graph it allocated last, so one split is kept per compute
     // buffer: the active one in the fields above (graph allocated in active_buf), the others parked here. An LRU of
     // recent graphs would instead evict the split of a graph its scheduler still reuses. Splits are parked only while
-    // graphs keep coming from more than one buffer: GRAPH_SLOTS_IDLE computes from the active buffer drop them.
+    // graphs keep coming from more than one buffer: GRAPH_SLOTS_IDLE computes from the active buffer drop them, unless
+    // two or more are parked (three or more schedulers), see ggml_backend_meta_graph_compute.
     static constexpr int GRAPH_SLOTS_IDLE = 4;
     ggml_backend_buffer_t                                 active_buf = nullptr;
     std::unordered_map<ggml_backend_buffer_t, graph_slot> parked;
@@ -2657,8 +2658,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             } else {
                 backend_ctx->active_buf = compute_buf;
             }
-        } else if (backend_ctx->computes_since_switch < ggml_backend_meta_context::GRAPH_SLOTS_IDLE &&
+        } else if (backend_ctx->parked.size() < 2 &&
+                backend_ctx->computes_since_switch < ggml_backend_meta_context::GRAPH_SLOTS_IDLE &&
                 ++backend_ctx->computes_since_switch == ggml_backend_meta_context::GRAPH_SLOTS_IDLE) {
+            // with three or more schedulers (LLAMA_GRAPH_SLOTS=3 and up) two or more splits are parked, and they stay:
+            // a context runs one graph shape for many steps (a two-sequence verify) and then comes back to another
+            // (a one-sequence verify), which its scheduler reuses, so dropping that split would rebuild it and send it
+            // to every device again. They are still bounded by the context's schedulers, one per compute buffer.
             backend_ctx->parked.clear();
         }
         graph_slots = backend_ctx->computes_since_switch < ggml_backend_meta_context::GRAPH_SLOTS_IDLE;

@@ -420,8 +420,11 @@ private:
     bool backends_failed = false; // see check_backends()
 
     ggml_backend_sched_ptr sched;
-    // LLAMA_GRAPH_SLOTS=2: the scheduler of the graph slot not in use, swapped with sched when the slot changes
-    ggml_backend_sched_ptr sched_alt;
+    // LLAMA_GRAPH_SLOTS: one scheduler per graph slot. The scheduler of the slot in use is sched; the others are parked
+    // here by slot, and the entry of the slot in use is empty. Empty when the context has a single slot.
+    std::vector<ggml_backend_sched_ptr> sched_parked;
+    std::vector<uint64_t>  sched_slot_used; // per slot, when it last ran a graph: the output slots are evicted LRU
+    uint64_t               sched_slot_clock = 0;
     int                    sched_slot = 0;
     bool                   sched_slots_on = false; // the graph slots were on for the last ubatch (one decision per ubatch)
     // whether a backend sampler attached to a sequence binds input tensors to the graph it is built into
@@ -474,12 +477,15 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys. With the graph slots on,
+    // one result per slot (at least two).
+    std::vector<llm_graph_result_ptr> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
-    llm_graph_result * gf_res_prev_active = nullptr;
-    llm_graph_result * gf_res_prev_active_alt = nullptr; // the graph sched_alt last allocated
+    // per slot, the graph result its scheduler last allocated, which only that scheduler can reuse
+    std::vector<llm_graph_result *> gf_res_slot_active;
+    // no scheduler holds a graph it can reuse
+    void graph_slots_forget();
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
