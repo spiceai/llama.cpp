@@ -572,6 +572,11 @@ static size_t ggml_backend_meta_view_segment_span(const struct ggml_tensor * vie
     if (axis < 0 || axis >= GGML_MAX_DIMS - 1 || (ss.n_segments == 1 && ss.nr[0] == 1)) {
         return 0;
     }
+    // a source that is itself a view at an offset: each device's view offset is scaled whole by its share, which is wrong
+    // for the part of that offset inside an unsplit row, so such a view is not split here
+    if (src->view_offs != 0) {
+        return 0;
+    }
     int64_t total_first = 0;
     for (size_t j = 0; j < n_bufs; j++) {
         total_first += ss.ne[j];
