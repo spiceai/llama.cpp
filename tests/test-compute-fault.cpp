@@ -9,9 +9,12 @@
 // where it is queued instead (GGML_STATUS_FAILED, as a backend with no get_status reports an inference error) and reports
 // nothing later: the decode that queued it returns -3, and the context must fail all the same. --shift drops the prompt's
 // first tokens and shifts the rest back after the prompt, so the next decode computes a K-shift graph first: a K-shift
-// the backend refuses must fail the context too, not leave later decodes to read keys it never shifted. A reference run
-// (--write-reference) that sees a failure fails.
+// the backend refuses must fail the context too, not leave later decodes to read keys it never shifted. --checkpoint saves
+// a prompt checkpoint of the sequence (common_prompt_checkpoint, target and draft) as the first read after each decode,
+// before the logits: on a failed context both saves must report it and leave nothing saved, not abort on the size the
+// state's size still reports. A reference run (--write-reference) that sees a failure fails.
 
+#include "common.h"
 #include "llama.h"
 #include "sampling.h"
 
@@ -33,9 +36,14 @@ int main(int argc, char ** argv) {
     std::string reference_path;
     bool        write_reference = false;
     bool        shift           = false;
+    bool        checkpoint      = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--shift") == 0) {
             shift = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--checkpoint") == 0) {
+            checkpoint = true;
             continue;
         }
         if (i + 1 >= argc) {
@@ -51,7 +59,7 @@ int main(int argc, char ** argv) {
         }
     }
     if (model_path.empty() || reference_path.empty()) {
-        fprintf(stderr, "usage: %s -m <model.gguf> [--shift] (--write-reference | --reference) <file>, the latter with GGML_BACKEND_FAULT_TEST=<n>\n", argv[0]);
+        fprintf(stderr, "usage: %s -m <model.gguf> [--shift] [--checkpoint] (--write-reference | --reference) <file>, the latter with GGML_BACKEND_FAULT_TEST=<n>\n", argv[0]);
         return 1;
     }
     const char * fault_at = getenv("GGML_BACKEND_FAULT_TEST");
@@ -132,6 +140,16 @@ int main(int argc, char ** argv) {
         }
         return true;
     };
+    // a prompt checkpoint of the sequence, target and draft: true when both save, false when both report the failure and
+    // keep nothing; anything else (one saved, or a failure that left data) is reported through `bad`
+    auto checkpoint_saves = [&](bool & bad) {
+        common_prompt_checkpoint ckpt;
+        ckpt.clear();
+        const bool tgt = ckpt.update_tgt(ctx, 0, 0);
+        const bool dft = ckpt.update_dft(ctx, 0, 0);
+        bad = tgt != dft || tgt == ckpt.data_tgt.empty() || dft == ckpt.data_dft.empty();
+        return tgt;
+    };
 
     const int n_prompt = 16;
     const int n_steps  = 16;
@@ -172,6 +190,10 @@ int main(int argc, char ** argv) {
             if (llama_get_compute_status(ctx) != -3) {
                 return fail("a decode failed, but the context reports no failure");
             }
+            bool bad = false;
+            if (checkpoint && (checkpoint_saves(bad) || bad)) {
+                return fail("a prompt checkpoint saved, or kept data, after a failed decode");
+            }
             if (!common_picks_nothing()) {
                 return fail("common's sampler picked a token from a failed decode");
             }
@@ -182,6 +204,24 @@ int main(int argc, char ** argv) {
         if (rc != 0) {
             fprintf(stderr, "step %d: decode returned %d\n", step, rc);
             return fail("a decode failed for another reason");
+        }
+        if (checkpoint) {
+            // the checkpoint is the first read after the decode: it finds the failure, or saves a checkpoint
+            bool bad = false;
+            const bool saved = checkpoint_saves(bad);
+            if (bad) {
+                fprintf(stderr, "step %d: status %d\n", step, llama_get_compute_status(ctx));
+                return fail("a prompt checkpoint saved one of target and draft, or kept data after reporting the failure");
+            }
+            if (!saved && llama_get_compute_status(ctx) != -3) {
+                return fail("a prompt checkpoint did not save, but the context reports no failure");
+            }
+            if (!saved && write_reference) {
+                return fail("the reference run failed a checkpoint");
+            }
+            if (!saved) {
+                printf("step %d: the prompt checkpoint reports the failure (-3)\n", step);
+            }
         }
         const float * logits = llama_get_logits_ith(ctx, -1);
         const int32_t status = llama_get_compute_status(ctx);

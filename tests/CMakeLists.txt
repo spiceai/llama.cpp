@@ -304,6 +304,18 @@ foreach (fault_at 1 3)
         ENVIRONMENT       "GGML_BACKEND_FAULT_TEST=${fault_at};GGML_BACKEND_FAULT_TEST_SYNC=1"
     )
 endforeach()
+# a prompt checkpoint (common_prompt_checkpoint) taken as the first read after the decode the device failed, or after one
+# refused where it was queued: it reports the failure instead of aborting on a size mismatch
+foreach (fault_at 1 3 7)
+    foreach (fault_sync 0 1)
+        llama_test(test-compute-fault NAME test-compute-fault-checkpoint-${fault_at}-sync-${fault_sync}
+            ARGS -m "${SPEC_TARGET_DIR}/llama-dense.gguf" --checkpoint --reference "${COMPUTE_FAULT_REFERENCE}")
+        set_tests_properties(test-compute-fault-checkpoint-${fault_at}-sync-${fault_sync} PROPERTIES
+            FIXTURES_REQUIRED "speculative-model;compute-fault-reference"
+            ENVIRONMENT       "GGML_BACKEND_FAULT_TEST=${fault_at};GGML_BACKEND_FAULT_TEST_SYNC=${fault_sync}"
+        )
+    endforeach()
+endforeach()
 # a K-shift graph the backend fails (graph 2 under --shift), queued and refused where it is queued: a memory update fails
 # the context like a decode does
 set(COMPUTE_FAULT_SHIFT_REFERENCE "${CMAKE_CURRENT_BINARY_DIR}/test-compute-fault-shift-reference.bin")

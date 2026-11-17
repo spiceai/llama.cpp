@@ -48,7 +48,10 @@ It also carries these source patches, which each Spice branch must keep until up
   `llama_sampler_sample` and common's `common_sampler_sample` `LLAMA_TOKEN_NULL`, instead of the values the failed work
   left in the buffers. A read an event orders (the MTP draft's hidden states, a DFlash drafter's layer inputs) checks the
   source context too, and common's drafters stop at the first read of a failed context with an exception
-  (`common/speculative.cpp`). A Metal event wait waits on the command buffer that signals it, so a failed one ends the
+  (`common/speculative.cpp`). common's prompt checkpoint (`common_prompt_checkpoint::update_tgt` and `update_dft`,
+  `common/common.cpp`) returns false and keeps nothing on a failed context instead of aborting on the size mismatch.
+  The callers in tools Spice does not ship (llama-server, llama-completion, the mtmd/TTS/realtime examples) do not
+  handle the failure yet. A Metal event wait waits on the command buffer that signals it, so a failed one ends the
   wait instead of aborting after 60 s.
   `GGML_BACKEND_FAULT_TEST=N` (`ggml/src/ggml-backend.cpp`) skips the N-th graph of the process and fails its
   backend, for tests (with `GGML_BACKEND_FAULT_TEST_SYNC=1` the backend refuses that graph where it is queued and
