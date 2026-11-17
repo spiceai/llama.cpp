@@ -2159,9 +2159,9 @@ static int test_graph_reuse(const std::string & arch_filter, const size_t seed, 
                 const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
                 for (int off = 0; off < 2; off++) {
                     if (off) {
-                        setenv("LLAMA_KV_ROWS_DISABLE", "1", 1);
+                        common_set_env("LLAMA_KV_ROWS_DISABLE", "1");
                     } else {
-                        unsetenv("LLAMA_KV_ROWS_DISABLE");
+                        common_set_env("LLAMA_KV_ROWS_DISABLE", "");
                     }
                     llama_context_params ctx_params = get_ctx_params(false, 0);
                     ctx_params.n_seq_max       = 2;
@@ -2171,7 +2171,7 @@ static int test_graph_reuse(const std::string & arch_filter, const size_t seed, 
                     ud.verbosity = LOG_LEVEL_OUTPUT;
                     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
                     ud.verbosity = verbosity;
-                    unsetenv("LLAMA_KV_ROWS_DISABLE");
+                    common_set_env("LLAMA_KV_ROWS_DISABLE", "");
                     if (!lctx || llama_get_memory(lctx.get()) == nullptr) {
                         break;
                     }
