@@ -58,7 +58,14 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // waits for everything queued, then fails the context if a backend failed computing it (check_backends)
     void synchronize();
+
+    // whether a backend failed computing something this context queued (a GPU fault, for one): sticky, since what the
+    // failure left in the outputs, the memory and the state is not the computation's. Reads the backends' status without
+    // waiting, so it covers what the last synchronize of each backend waited for
+    bool check_backends();
+    bool compute_failed() const { return backends_failed; }
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -409,6 +416,8 @@ private:
     bool argmax_ready = false;
     bool logits_ready = true;
     bool argmax_copies_pending = false; // picks copied asynchronously since the last synchronize
+
+    bool backends_failed = false; // see check_backends()
 
     ggml_backend_sched_ptr sched;
     // LLAMA_GRAPH_SLOTS=2: the scheduler of the graph slot not in use, swapped with sched when the slot changes

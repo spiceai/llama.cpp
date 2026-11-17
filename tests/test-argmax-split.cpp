@@ -658,6 +658,368 @@ static int test_meta_flat_quantized_rows(ggml_backend_dev_t dev, ggml_type type,
     return n_diff != 0;
 }
 
+// tensors named "*split1" are split along axis 1 into the element counts userdata holds, everything else is mirrored
+static ggml_backend_meta_split_state split1_state(const ggml_tensor * tensor, void * userdata) {
+    const std::vector<int64_t> & ne = *(const std::vector<int64_t> *) userdata;
+    const std::string name = tensor->name;
+    if (name.size() >= 6 && name.compare(name.size() - 6, 6, "split1") == 0) {
+        ggml_backend_meta_split_state ss = {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+        for (size_t j = 0; j < ne.size(); j++) {
+            ss.ne[j] = ne[j];
+        }
+        return ss;
+    }
+    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+}
+
+// The two parts of each head of an MLA query, as Mistral Large 4 builds them: a product whose rows a tensor split divides
+// by whole heads, viewed per head (a view strided by the head size), the rope part starting past the head's other part.
+// Each device's view must start as far into its heads as the whole view starts into the whole query's: made contiguous
+// and gathered, each part must equal the same part of the product on the device alone, bit for bit (a row's dot product
+// does not depend on which device computes it). Scaling the rope part's offset by the device's share of the heads reads
+// the other part of each head instead, or, when the share does not divide the offset, values from an address no value
+// starts at.
+static int test_meta_view_within_heads(ggml_backend_dev_t dev, const std::vector<int64_t> & heads) {
+    const int     n_parts  = (int) heads.size();
+    const int64_t n_embd   = 64;
+    const int64_t d_nope   = 128;
+    const int64_t d_rope   = 64;
+    const int64_t d_head   = d_nope + d_rope;
+    const int64_t n_tokens = 5;
+    int64_t n_head = 0;
+    std::vector<int64_t> rows; // the weight's rows each device holds: whole heads
+    std::string layout;
+    for (int64_t h : heads) {
+        n_head += h;
+        rows.push_back(h*d_head);
+        layout += (layout.empty() ? "" : "/") + std::to_string(h);
+    }
+    std::vector<ggml_backend_dev_t> devs(n_parts, dev);
+
+    std::mt19937 rng(42);
+    std::normal_distribution<float> nd;
+    std::vector<float> wf(n_embd*n_head*d_head);
+    for (int64_t r = 0; r < n_head*d_head; r++) {
+        for (int64_t i = 0; i < n_embd; i++) {
+            wf[r*n_embd + i] = (float) (r % 97) + 0.25f*nd(rng); // rows apart, so a value read from another row shows
+        }
+    }
+    std::vector<float> xf(n_embd*n_tokens);
+    for (float & x : xf) {
+        x = nd(rng);
+    }
+
+    // each part of each head, on the meta device (gathered) or on the device alone
+    auto run = [&](bool split, std::vector<float> & nope, std::vector<float> & pe) {
+        ggml_backend_t backend = split
+            ? ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), split1_state, &rows), nullptr)
+            : ggml_backend_dev_init(dev, nullptr);
+        GGML_ASSERT(backend != nullptr);
+        ggml_init_params wp = { ggml_tensor_overhead()*2, nullptr, true };
+        ggml_context * ctx_w = ggml_init(wp);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd, n_head*d_head);
+        ggml_set_name(w, "attn_q_split1");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+        GGML_ASSERT(wbuf != nullptr);
+        ggml_backend_tensor_set(w, wf.data(), 0, ggml_nbytes(w));
+        ggml_backend_tensor_set(x, xf.data(), 0, ggml_nbytes(x));
+
+        ggml_init_params gp = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(gp);
+        ggml_tensor * q      = ggml_mul_mat(ctx, w, x); // {n_head*d_head, n_tokens}, split by whole heads along axis 0
+        ggml_tensor * q_nope = ggml_cont(ctx, ggml_view_3d(ctx, q, d_nope, n_head, n_tokens, d_head*sizeof(float), q->nb[1], 0));
+        ggml_tensor * q_pe   = ggml_cont(ctx, ggml_view_3d(ctx, q, d_rope, n_head, n_tokens, d_head*sizeof(float), q->nb[1],
+            d_nope*sizeof(float)));
+        if (split) {
+            q_nope = ggml_backend_meta_gather(ctx, q_nope);
+            q_pe   = ggml_backend_meta_gather(ctx, q_pe);
+        }
+        ggml_set_output(q_nope);
+        ggml_set_output(q_pe);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, q_nope);
+        ggml_build_forward_expand(gf, q_pe);
+        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        nope.resize(ggml_nelements(q_nope));
+        pe.resize(ggml_nelements(q_pe));
+        ggml_backend_tensor_get(q_nope, nope.data(), 0, ggml_nbytes(q_nope));
+        ggml_backend_tensor_get(q_pe,   pe.data(),   0, ggml_nbytes(q_pe));
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(ctx_w);
+        ggml_backend_free(backend);
+    };
+    std::vector<float> ref_nope, ref_pe, got_nope, got_pe;
+    run(false, ref_nope, ref_pe);
+    run(true,  got_nope, got_pe);
+
+    int n_fail = 0;
+    for (const auto & [what, ref, got] : {std::tuple<const char *, const std::vector<float> &, const std::vector<float> &>{"other", ref_nope, got_nope},
+                                          std::tuple<const char *, const std::vector<float> &, const std::vector<float> &>{"rope",  ref_pe,   got_pe}}) {
+        int64_t n_diff = 0, first = -1;
+        for (size_t i = 0; i < ref.size(); i++) {
+            if (!same_float(ref[i], got[i])) {
+                n_diff++;
+                first = first < 0 ? (int64_t) i : first;
+            }
+        }
+        printf("  %s MLA query's %s part of each head, heads %s: %lld of %zu values differ from the device alone", ggml_backend_dev_name(dev),
+            what, layout.c_str(), (long long) n_diff, ref.size());
+        if (first >= 0) {
+            printf(" (first at %lld: %g, want %g)", (long long) first, got[first], ref[first]);
+        }
+        printf(" %s\n", n_diff == 0 ? "ok" : "FAIL");
+        n_fail += n_diff != 0;
+    }
+    return n_fail;
+}
+
+// tensors named "*split1" or "*split2" are split along that axis into the element counts userdata holds, everything
+// else is mirrored
+static ggml_backend_meta_split_state split12_state(const ggml_tensor * tensor, void * userdata) {
+    const std::vector<int64_t> & ne = *(const std::vector<int64_t> *) userdata;
+    const std::string name = tensor->name;
+    for (auto [suffix, axis] : {std::pair<const char *, ggml_backend_meta_split_axis>{"split1", GGML_BACKEND_SPLIT_AXIS_1},
+                                std::pair<const char *, ggml_backend_meta_split_axis>{"split2", GGML_BACKEND_SPLIT_AXIS_2}}) {
+        if (name.size() >= 6 && name.compare(name.size() - 6, 6, suffix) == 0) {
+            ggml_backend_meta_split_state ss = {axis, {0}, {1}, 1};
+            for (size_t j = 0; j < ne.size(); j++) {
+                ss.ne[j] = ne[j];
+            }
+            return ss;
+        }
+    }
+    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+}
+
+// The new state of a gated delta net, split by heads, as build_delta_net views it, and a crop of it with the same strides
+// (the first rows of each head's state). The result packs the attention output before the states, and that output is split
+// too, so each device's states start at the offset scaled by its share of the heads, even for a crop whose offset and
+// extent below the heads fit in one head's state. Made contiguous and gathered, each must equal the device alone's.
+static int test_meta_delta_net_state_views(ggml_backend_dev_t dev, const std::vector<int64_t> & heads) {
+    const int     n_parts  = (int) heads.size();
+    const int64_t S_v      = 16;
+    const int64_t n_tokens = 1;
+    const int64_t n_seqs   = 1;
+    const int64_t n_crop   = 4;
+    int64_t n_head = 0;
+    std::string layout;
+    for (int64_t h : heads) {
+        n_head += h;
+        layout += (layout.empty() ? "" : "/") + std::to_string(h);
+    }
+    std::vector<ggml_backend_dev_t> devs(n_parts, dev);
+    std::vector<int64_t> parts = heads;
+
+    std::mt19937 rng(42);
+    std::normal_distribution<float> nd;
+    auto fill = [&](int64_t n, float scale) {
+        std::vector<float> d(n);
+        for (float & x : d) {
+            x = scale*nd(rng);
+        }
+        return d;
+    };
+    const std::vector<float> qf = fill(S_v*n_head*n_tokens*n_seqs, 0.25f);
+    const std::vector<float> kf = fill(S_v*n_head*n_tokens*n_seqs, 0.25f);
+    const std::vector<float> vf = fill(S_v*n_head*n_tokens*n_seqs, 1.0f);
+    const std::vector<float> gf_ = fill(n_head*n_tokens*n_seqs, 0.1f);
+    const std::vector<float> bf = fill(n_head*n_tokens*n_seqs, 0.1f);
+    const std::vector<float> sf = fill(S_v*S_v*n_head*n_seqs, 1.0f);
+
+    auto run = [&](bool split, std::vector<float> & full, std::vector<float> & crop) {
+        ggml_backend_t backend = split
+            ? ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), split12_state, &parts), nullptr)
+            : ggml_backend_dev_init(dev, nullptr);
+        GGML_ASSERT(backend != nullptr);
+        ggml_init_params wp = { ggml_tensor_overhead()*8, nullptr, true };
+        ggml_context * ctx_w = ggml_init(wp);
+        ggml_tensor * q = ggml_new_tensor_4d(ctx_w, GGML_TYPE_F32, S_v, n_head, n_tokens, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx_w, GGML_TYPE_F32, S_v, n_head, n_tokens, n_seqs);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx_w, GGML_TYPE_F32, S_v, n_head, n_tokens, n_seqs);
+        ggml_tensor * g = ggml_new_tensor_4d(ctx_w, GGML_TYPE_F32, 1, n_head, n_tokens, n_seqs);
+        ggml_tensor * b = ggml_new_tensor_4d(ctx_w, GGML_TYPE_F32, 1, n_head, n_tokens, n_seqs);
+        ggml_tensor * s = ggml_new_tensor_4d(ctx_w, GGML_TYPE_F32, S_v, S_v, n_head, n_seqs);
+        ggml_set_name(q, "q_split1");
+        ggml_set_name(k, "k_split1");
+        ggml_set_name(v, "v_split1");
+        ggml_set_name(g, "g_split1");
+        ggml_set_name(b, "b_split1");
+        ggml_set_name(s, "s_split2");
+        ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+        GGML_ASSERT(wbuf != nullptr);
+        ggml_backend_tensor_set(q, qf.data(),  0, ggml_nbytes(q));
+        ggml_backend_tensor_set(k, kf.data(),  0, ggml_nbytes(k));
+        ggml_backend_tensor_set(v, vf.data(),  0, ggml_nbytes(v));
+        ggml_backend_tensor_set(g, gf_.data(), 0, ggml_nbytes(g));
+        ggml_backend_tensor_set(b, bf.data(),  0, ggml_nbytes(b));
+        ggml_backend_tensor_set(s, sf.data(),  0, ggml_nbytes(s));
+
+        ggml_init_params gp = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(gp);
+        ggml_tensor * result    = ggml_gated_delta_net(ctx, q, k, v, g, b, s, /*K =*/ 1);
+        // build_delta_net's view of the new state
+        ggml_tensor * new_state = ggml_view_4d(ctx, result, S_v, S_v, n_head, n_seqs,
+            ggml_row_size(result->type, S_v), ggml_row_size(result->type, S_v*S_v), ggml_row_size(result->type, S_v*S_v*n_head),
+            ggml_row_size(result->type, S_v*n_head*n_tokens*n_seqs));
+        ggml_tensor * cropped   = ggml_view_4d(ctx, new_state, S_v, n_crop, n_head, n_seqs,
+            new_state->nb[1], new_state->nb[2], new_state->nb[3], 0);
+        ggml_tensor * full_c = ggml_cont(ctx, new_state);
+        ggml_tensor * crop_c = ggml_cont(ctx, cropped);
+        if (split) {
+            full_c = ggml_backend_meta_gather(ctx, full_c);
+            crop_c = ggml_backend_meta_gather(ctx, crop_c);
+        }
+        ggml_set_output(full_c);
+        ggml_set_output(crop_c);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, full_c);
+        ggml_build_forward_expand(gf, crop_c);
+        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        full.resize(ggml_nelements(full_c));
+        crop.resize(ggml_nelements(crop_c));
+        ggml_backend_tensor_get(full_c, full.data(), 0, ggml_nbytes(full_c));
+        ggml_backend_tensor_get(crop_c, crop.data(), 0, ggml_nbytes(crop_c));
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(ctx_w);
+        ggml_backend_free(backend);
+    };
+    std::vector<float> ref_full, ref_crop, got_full, got_crop;
+    run(false, ref_full, ref_crop);
+    run(true,  got_full, got_crop);
+
+    int n_fail = 0;
+    for (const auto & [what, ref, got] : {std::tuple<const char *, const std::vector<float> &, const std::vector<float> &>{"new state", ref_full, got_full},
+                                          std::tuple<const char *, const std::vector<float> &, const std::vector<float> &>{"cropped new state", ref_crop, got_crop}}) {
+        int64_t n_diff = 0, first = -1;
+        for (size_t i = 0; i < ref.size(); i++) {
+            if (!same_float(ref[i], got[i])) {
+                n_diff++;
+                first = first < 0 ? (int64_t) i : first;
+            }
+        }
+        printf("  %s gated delta net's %s, heads %s: %lld of %zu values differ from the device alone", ggml_backend_dev_name(dev),
+            what, layout.c_str(), (long long) n_diff, ref.size());
+        if (first >= 0) {
+            printf(" (first at %lld: %g, want %g)", (long long) first, got[first], ref[first]);
+        }
+        printf(" %s\n", n_diff == 0 ? "ok" : "FAIL");
+        n_fail += n_diff != 0;
+    }
+    return n_fail;
+}
+
+// tensors named "*seg1" are split along axis 1 in the segments userdata holds (ggml_backend_meta_split_state::ne, one
+// entry per segment and device), everything else is mirrored
+static ggml_backend_meta_split_state seg1_state(const ggml_tensor * tensor, void * userdata) {
+    const ggml_backend_meta_split_state & ss = *(const ggml_backend_meta_split_state *) userdata;
+    const std::string name = tensor->name;
+    if (name.size() >= 4 && name.compare(name.size() - 4, 4, "seg1") == 0) {
+        return ss;
+    }
+    return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+}
+
+// A product whose rows are fused: a prefix and then the heads, each its own segment of the split, and a view of the heads
+// strided by the head size whose offset skips the prefix and whose extent below the heads fits in one head. The prefix
+// before each device's heads is that device's share of it, not the whole prefix, so each device's view starts at the
+// offset scaled by its share. Made contiguous and gathered, the view must equal the device alone's, bit for bit.
+static int test_meta_view_past_segmented_prefix(ggml_backend_dev_t dev, int n_parts) {
+    const int64_t n_embd   = 64;
+    const int64_t n_prefix = 96;
+    const int64_t n_head   = 6;
+    const int64_t d_head   = 256;
+    const int64_t d_view   = 16; // the view: [d_view, 4, n_head, n_tokens] of each head's first 64 values
+    const int64_t n_tokens = 5;
+    const int64_t n_rows   = n_prefix + n_head*d_head;
+    GGML_ASSERT(n_prefix % n_parts == 0 && n_head % n_parts == 0);
+    ggml_backend_meta_split_state ss = {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1, 1}, 2};
+    for (int j = 0; j < n_parts; j++) {
+        ss.ne[0*n_parts + j] = n_prefix/n_parts;
+        ss.ne[1*n_parts + j] = n_head/n_parts*d_head;
+    }
+    std::vector<ggml_backend_dev_t> devs(n_parts, dev);
+
+    std::mt19937 rng(42);
+    std::normal_distribution<float> nd;
+    std::vector<float> wf(n_embd*n_rows);
+    for (int64_t r = 0; r < n_rows; r++) {
+        for (int64_t i = 0; i < n_embd; i++) {
+            wf[r*n_embd + i] = (float) (r % 97) + 0.25f*nd(rng); // rows apart, so a value read from another row shows
+        }
+    }
+    std::vector<float> xf(n_embd*n_tokens);
+    for (float & x : xf) {
+        x = nd(rng);
+    }
+
+    auto run = [&](bool split, std::vector<float> & out) {
+        ggml_backend_t backend = split
+            ? ggml_backend_dev_init(ggml_backend_meta_device(devs.data(), devs.size(), seg1_state, &ss), nullptr)
+            : ggml_backend_dev_init(dev, nullptr);
+        GGML_ASSERT(backend != nullptr);
+        ggml_init_params wp = { ggml_tensor_overhead()*2, nullptr, true };
+        ggml_context * ctx_w = ggml_init(wp);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_set_name(w, "attn_fused_seg1");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+        GGML_ASSERT(wbuf != nullptr);
+        ggml_backend_tensor_set(w, wf.data(), 0, ggml_nbytes(w));
+        ggml_backend_tensor_set(x, xf.data(), 0, ggml_nbytes(x));
+
+        ggml_init_params gp = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(gp);
+        ggml_tensor * q = ggml_mul_mat(ctx, w, x); // {n_rows, n_tokens}: the prefix, then the heads
+        ggml_tensor * v = ggml_cont(ctx, ggml_view_4d(ctx, q, d_view, 4, n_head, n_tokens,
+            d_view*sizeof(float), d_head*sizeof(float), q->nb[1], n_prefix*sizeof(float)));
+        if (split) {
+            v = ggml_backend_meta_gather(ctx, v);
+        }
+        ggml_set_output(v);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, v);
+        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc, gf));
+        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        out.resize(ggml_nelements(v));
+        ggml_backend_tensor_get(v, out.data(), 0, ggml_nbytes(v));
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(ctx_w);
+        ggml_backend_free(backend);
+    };
+    std::vector<float> ref, got;
+    run(false, ref);
+    run(true,  got);
+
+    int64_t n_diff = 0, first = -1;
+    for (size_t i = 0; i < ref.size(); i++) {
+        if (!same_float(ref[i], got[i])) {
+            n_diff++;
+            first = first < 0 ? (int64_t) i : first;
+        }
+    }
+    printf("  %s view of the heads past a segmented prefix, %d devices: %lld of %zu values differ from the device alone",
+        ggml_backend_dev_name(dev), n_parts, (long long) n_diff, ref.size());
+    if (first >= 0) {
+        printf(" (first at %lld: %g, want %g)", (long long) first, got[first], ref[first]);
+    }
+    printf(" %s\n", n_diff == 0 ? "ok" : "FAIL");
+    return n_diff != 0;
+}
+
 // a transposed F32 rows view: its split moves to axis 0, whose stride is still the matrix's row stride, so each device's
 // part starts at its rows times that stride. Made contiguous and gathered, it must equal the transposed matrix.
 static int test_meta_transposed_rows(ggml_backend_dev_t dev, const std::vector<int64_t> & parts) {
@@ -991,6 +1353,18 @@ int main() {
         }
         n_fail += test_meta_transposed_rows(dev, even_parts(1000, n_parts));
         n_fail += test_meta_whole_rows(dev, n_parts);
+    }
+    // the MLA query's parts of each head, whole heads per device: even, and uneven over four devices
+    for (const std::vector<int64_t> & heads : {std::vector<int64_t>{3, 3}, std::vector<int64_t>{2, 2, 2}, std::vector<int64_t>{2, 2, 1, 1}}) {
+        n_fail += test_meta_view_within_heads(dev, heads);
+    }
+    // a gated delta net's new state and a same-stride crop of it, split by heads: the attention output before them is split too
+    for (const std::vector<int64_t> & heads : {std::vector<int64_t>{3, 3}, std::vector<int64_t>{2, 2, 2}}) {
+        n_fail += test_meta_delta_net_state_views(dev, heads);
+    }
+    // a view of the heads of a product whose prefix is its own segment of the split
+    for (int n_parts : {2, 3}) {
+        n_fail += test_meta_view_past_segmented_prefix(dev, n_parts);
     }
     for (int n_parts : {2, 3}) {
         const std::vector<int64_t> parts = even_parts(v, n_parts);
