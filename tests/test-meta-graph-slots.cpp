@@ -92,6 +92,46 @@ struct slot_graph {
     }
 };
 
+// Three schedulers of one context (LLAMA_GRAPH_SLOTS=3): a prompt graph once, then runs of six steps of shape A and of shape
+// B, repeatedly. Each graph keeps its uid, as llama.cpp's graph reuse reports it, so a split that is not rebuilt is the
+// reuse that matters: a rebuild makes the split again and, over RPC, serializes the graph to every device again. After
+// one pass of A and B every return to a shape must find its parked split, however many steps the other shape ran.
+static bool test_parked_split_retention(ggml_backend_dev_t meta_dev) {
+    ggml_backend_t backend = ggml_backend_dev_init(meta_dev, nullptr);
+    GGML_ASSERT(backend != nullptr);
+    ggml_backend_cpu_set_n_threads(ggml_backend_meta_simple_backend(backend, 0), 1);
+
+    constexpr int n_steps  = 6; // more than the steps after which an idle split used to be dropped
+    constexpr int n_rounds = 4;
+    slot_graph prompt(backend, 101, 1.0f, 64);
+    slot_graph shape_a(backend, 102, 0.5f, 64);
+    slot_graph shape_b(backend, 103, 2.0f, 64);
+
+    bool ok = prompt.compute_and_check(backend, 1.0f, 2.0f, "prompt");
+    uint64_t warm_builds = 0;
+    for (int round = 0; ok && round < n_rounds; round++) {
+        for (int step = 0; ok && step < n_steps; step++) {
+            ok = shape_a.compute_and_check(backend, 1.0f, 2.0f, "shape A");
+        }
+        for (int step = 0; ok && step < n_steps; step++) {
+            ok = shape_b.compute_and_check(backend, 3.0f, 4.0f, "shape B");
+        }
+        if (round == 0) {
+            warm_builds = ggml_backend_meta_n_split_builds(backend); // the prompt, A and B each built their split once
+        }
+    }
+    const uint64_t total_builds = ggml_backend_meta_n_split_builds(backend);
+    printf("parked split retention: %llu split builds in the first pass of A and B, %llu after %d rounds (%d returns to a shape)\n",
+        (unsigned long long) warm_builds, (unsigned long long) total_builds, n_rounds, 2*(n_rounds - 1));
+    if (ok && total_builds != warm_builds) {
+        fprintf(stderr, "FAIL: %llu splits were built again after the first pass, though every graph kept its uid and its compute buffer\n",
+            (unsigned long long) (total_builds - warm_builds));
+        ok = false;
+    }
+    ggml_backend_free(backend);
+    return ok;
+}
+
 int main() {
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     GGML_ASSERT(cpu_dev != nullptr);
@@ -99,6 +139,10 @@ int main() {
     ggml_backend_dev_t simple_devs[1] = { cpu_dev };
     ggml_backend_dev_t meta_dev = ggml_backend_meta_device(simple_devs, 1, mirrored_split_state, nullptr);
     GGML_ASSERT(meta_dev != nullptr);
+
+    if (!test_parked_split_retention(meta_dev)) {
+        return EXIT_FAILURE;
+    }
 
     // two meta backends of one device, as two models, or a model and its drafter, hold
     ggml_backend_t backend = ggml_backend_dev_init(meta_dev, nullptr);

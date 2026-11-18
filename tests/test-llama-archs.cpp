@@ -2605,7 +2605,9 @@ static int test_graph_slots(const std::string & arch_filter, const size_t seed, 
                     char buf[200];
                     float max_diff = 0.0f;
                     for (size_t j = 0; j < logits[0].size(); j++) {
-                        max_diff = std::max(max_diff, std::fabs(logits[0][j] - logits[1][j]));
+                        const float d = std::fabs(logits[0][j] - logits[1][j]);
+                        // a NaN or Inf difference (a NaN or Inf logit on either side) must fail: std::max would drop a NaN
+                        max_diff = std::isfinite(d) ? std::max(max_diff, d) : INFINITY;
                     }
                     // the first decode of each shape follows the prompts' graphs; with enough slots every later one reuses
                     const int     n_shapes   = ip ? 3 : 2;

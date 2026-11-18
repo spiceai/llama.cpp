@@ -2314,12 +2314,14 @@ struct ggml_backend_meta_context {
     // two compute buffers here. A scheduler reuses only the graph it allocated last, so one split is kept per compute
     // buffer: the active one in the fields above (graph allocated in active_buf), the others parked here. An LRU of
     // recent graphs would instead evict the split of a graph its scheduler still reuses. Splits are parked only while
-    // graphs keep coming from more than one buffer: GRAPH_SLOTS_IDLE computes from the active buffer drop them, unless
-    // two or more are parked (three or more schedulers), see ggml_backend_meta_graph_compute.
+    // graphs come from more than one buffer. They stay until the compute buffer they belong to is freed (forget_buffer),
+    // however many computes the active buffer runs in between; GRAPH_SLOTS_IDLE computes from it only end the
+    // clone-based mode of the active split, see ggml_backend_meta_graph_compute.
     static constexpr int GRAPH_SLOTS_IDLE = 4;
     ggml_backend_buffer_t                                 active_buf = nullptr;
     std::unordered_map<ggml_backend_buffer_t, graph_slot> parked;
     int                                                   computes_since_switch = GRAPH_SLOTS_IDLE;
+    std::atomic<uint64_t>                                 n_split_builds{0}; // splits built from a graph, see ggml_backend_meta_n_split_builds
     // guards active_buf, parked and computes_since_switch: the compute path selects the slot on this context's own
     // thread, while forget_buffer runs on the thread freeing a buffer, which can be another context's compute thread
     std::mutex                                            slots_mutex;
@@ -2661,15 +2663,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             } else {
                 backend_ctx->active_buf = compute_buf;
             }
-        } else if (backend_ctx->parked.size() < 2 &&
-                backend_ctx->computes_since_switch < ggml_backend_meta_context::GRAPH_SLOTS_IDLE &&
-                ++backend_ctx->computes_since_switch == ggml_backend_meta_context::GRAPH_SLOTS_IDLE) {
-            // with three or more schedulers (LLAMA_GRAPH_SLOTS=3 and up) two or more splits are parked, and they stay:
-            // a context runs one graph shape for many steps (a two-sequence verify) and then comes back to another
-            // (a one-sequence verify), which its scheduler reuses, so dropping that split would rebuild it and send it
-            // to every device again. They are still bounded by the context's schedulers, one per compute buffer.
-            backend_ctx->parked.clear();
+        } else if (backend_ctx->computes_since_switch < ggml_backend_meta_context::GRAPH_SLOTS_IDLE) {
+            backend_ctx->computes_since_switch++;
         }
+        // The parked splits are not dropped when graphs stop coming from other buffers: a context runs one graph shape
+        // for many steps (a two-sequence verify) and then comes back to another (a one-sequence verify), which its
+        // scheduler reuses, and dropping that split after any number of idle steps would rebuild it and send it to every
+        // device again (over RPC, serialize the graph again). A split lives as long as the compute buffer it was
+        // allocated in: forget_buffer drops it when that buffer is freed, so they are bounded by the context's schedulers,
+        // one per compute buffer. Only the clone-based rebuild of the active split (graph_slots) stops with the idling.
         graph_slots = backend_ctx->computes_since_switch < ggml_backend_meta_context::GRAPH_SLOTS_IDLE;
     }
 
@@ -2708,6 +2710,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
 
     if (needs_rebuild) {
+        backend_ctx->n_split_builds.fetch_add(1, std::memory_order_relaxed);
         std::set<ggml_backend_buffer_t> used_buffers;
         for (int i = 0; i < cgraph->n_leafs; i++) {
             if (ggml_backend_buffer_is_meta(cgraph->leafs[i]->buffer)) {
@@ -3375,6 +3378,10 @@ size_t ggml_backend_meta_n_backends(ggml_backend_t meta_backend) {
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs.size();
+}
+
+uint64_t ggml_backend_meta_n_split_builds(ggml_backend_t meta_backend) {
+    return ((ggml_backend_meta_context *) meta_backend->context)->n_split_builds.load(std::memory_order_relaxed);
 }
 
 ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index) {
