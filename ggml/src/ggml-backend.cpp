@@ -527,6 +527,12 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
+    // nothing to write, as ggml_backend_tensor_set and the 2D variants already return: a backend need not handle it
+    // (the meta backend has no split state for an empty tensor, such as a recurrent state a model leaves unused)
+    if (size == 0) {
+        return;
+    }
+
     if (backend->iface.set_tensor_async == NULL) {
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_set(tensor, data, offset, size);
@@ -540,6 +546,12 @@ void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_ten
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
+
+    // nothing to read, as ggml_backend_tensor_get and the 2D variants already return: a backend need not handle it
+    // (the meta backend has no split state for an empty tensor, such as a recurrent state a model leaves unused)
+    if (size == 0) {
+        return;
+    }
 
     if (backend->iface.get_tensor_async == NULL) {
         ggml_backend_synchronize(backend);
