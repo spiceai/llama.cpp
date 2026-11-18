@@ -748,6 +748,13 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     if (st.n_new > std::min(bound, cap)) {
         st.n_new_g = std::max(st.n_new, std::min<uint32_t>(GGML_PAD(st.n_new, 64), cap));
     }
+    // set_input_kpool gives each padded entry a cell of its own that is not the last member of a complete pool, and there
+    // are at most n_pool_real of those, so never pad past the cells that leaves: in a cache whose pools' last members
+    // covered nearly every cell (sequences sharing cells but grouped at different offsets) a padded entry would find none
+    // and the run would abort. A ubatch keeps at least one entry, as the graph pools at least one.
+    const uint64_t n_cells = uint64_t(kv_size) * idx->get_n_stream();
+    const uint64_t n_spare = n_cells > st.n_pool_real ? n_cells - st.n_pool_real : 0;
+    st.n_new_g = uint32_t(std::max<uint64_t>(1, std::min<uint64_t>(st.n_new_g, uint64_t(st.n_new) + n_spare)));
 
     // while a prompt is read, size the pool list for the whole LLAMA_KV_PROMPT_PAD bucket, as the visible KV range is,
     // so the chunks of one prompt share a graph shape (the padded pools point at the sentinel row, like the one pool
