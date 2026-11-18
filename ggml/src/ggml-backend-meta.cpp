@@ -861,9 +861,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 }
                 if (src_ss[0].n_segments == 1) {
                     base_ne_in /= src_ss[0].nr[0];
-                    if (src_ss[0].axis == ggml_n_dims(tensor->src[0]) - 1 && src_ss[0].nr[0] == 1) {
-                        return {ggml_backend_meta_split_axis(ggml_n_dims(tensor) - 1), {0}, {1}, 1};
-                    }
+                    // Checked before the last-dimension rule below: a source with one row ([n, 1], a one-token K of a
+                    // single K/V head that one device holds whole) also matches that rule, which would keep the split on
+                    // dim 0, where a per-row op (the K norm) cannot run. Both describe the same partition.
                     if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && tensor->ne[0] == tensor->src[0]->ne[0] &&
                             tensor->ne[1] == 1 && src_ss[0].nr[0] == 1) {
                         bool complete_rows = true;
@@ -875,6 +875,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                             // Move a complete dim-0 split to the following singleton dimension.
                             return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
                         }
+                    }
+                    if (src_ss[0].axis == ggml_n_dims(tensor->src[0]) - 1 && src_ss[0].nr[0] == 1) {
+                        return {ggml_backend_meta_split_axis(ggml_n_dims(tensor) - 1), {0}, {1}, 1};
                     }
                 }
                 // Reshape outputs use one segment; split-state propagation merges source segments.
