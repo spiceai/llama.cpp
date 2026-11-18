@@ -26,10 +26,12 @@ struct llama_context;
 // the cost of attending over up to pad - 1 masked cells.
 uint32_t llama_kv_pad_cells();
 
-// LLAMA_KV_PAD=pow2: pad n_kv to the next power of two of at least 256 instead of to a multiple of a fixed pad. A context
-// growing to n cells crosses a boundary about log2(n / 256) times, and attends over fewer than twice the cells it uses,
-// where a fixed pad large enough to cross as seldom wastes most of a short context's attention.
-bool llama_kv_pad_pow2();
+// Whether a cache of this model pads n_kv to the next power of two of at least 256 instead of to a multiple of
+// llama_kv_pad_cells(). A context growing to n cells then crosses a boundary about log2(n / 256) times and attends over
+// fewer than twice the cells it uses, where a fixed pad large enough to cross as seldom wastes most of a short context's
+// attention. LLAMA_KV_PAD=pow2 turns it on and a number off; unset, a tensor-split qwen4exp model gets it, as its graphs
+// otherwise rebuild over RPC each time the window grows (see llama_kv_cache::get_n_kv), and every other model does not.
+bool llama_kv_pad_pow2(const llama_model & model);
 
 //
 // llama_kv_cache
@@ -215,6 +217,9 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // n_kv goes to the next power of two, see llama_kv_pad_pow2
+    bool get_pad_pow2() const { return pad_pow2; }
+
     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
     // the ubatch splits into n_slices groups of tokens with one sequence each
     // if it cannot (f.ex. interleaved or coupled sequences), it is a single slice over the cells of all its sequences
@@ -286,6 +291,9 @@ public:
     llama_token seq_pos_tok_le(llama_seq_id seq_id, llama_pos p) const;
 
 private:
+    // see llama_kv_pad_pow2
+    const bool pad_pow2;
+
     const llama_model & model;
     const llama_hparams & hparams;
 

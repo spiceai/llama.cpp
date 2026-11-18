@@ -168,7 +168,7 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
-static int llama_graph_slots_count(bool tensor_split); // LLAMA_GRAPH_SLOTS, defined with the graph slot switches
+static int llama_graph_slots_count(const llama_model & model); // LLAMA_GRAPH_SLOTS, defined with the graph slot switches
 
 llama_context::llama_context(
         const llama_model & model,
@@ -461,7 +461,7 @@ llama_context::llama_context(
         const int64_t max_nodes = graph_max_nodes();
 
         gf_res_reserve = std::make_unique<llm_graph_result>(max_nodes);
-        gf_res_prev.resize(std::max(2, llama_graph_slots_count(model.split_mode() == LLAMA_SPLIT_MODE_TENSOR)));
+        gf_res_prev.resize(std::max(2, llama_graph_slots_count(model)));
         for (auto & res : gf_res_prev) {
             res = std::make_unique<llm_graph_result>(max_nodes);
         }
@@ -793,23 +793,28 @@ static const std::string & llama_graph_slots_mode() {
 // The most graph slots LLAMA_GRAPH_SLOTS can ask for.
 static constexpr int LLAMA_GRAPH_SLOTS_MAX = 8;
 
-// How many graph slots a context has: LLAMA_GRAPH_SLOTS=N gives N (one disables them), "flag:<path>" gives two, and
-// unset a tensor split gets two and any other model one. The first slot holds the graphs without outputs; with more
-// than two, the others hold graphs with outputs, a ubatch taking the slot whose graph it can reuse, else the one least
-// recently used, so a context going between a few graph shapes (a speculative verify of one sequence and of two)
-// keeps reusing each of them.
-static int llama_graph_slots_count(bool tensor_split) {
+// How many graph slots a context has: LLAMA_GRAPH_SLOTS=N gives N (one disables them) and "flag:<path>" gives two. Unset,
+// a tensor split gets two, a tensor-split qwen4exp model four, and any other model one. The first slot holds the graphs
+// without outputs; with more than two, the others hold graphs with outputs, a ubatch taking the slot whose graph it can
+// reuse, else the one least recently used, so a context going between a few graph shapes (a speculative verify of one
+// sequence and of two) keeps reusing each of them. Qwen3.8 split over three DGX Sparks goes between more verify shapes
+// than one output slot holds, and with four slots and its K/V padded to powers of two (llama_kv_pad_pow2) its
+// two-request multi-turn throughput rose 94.6 -> 101.8-103.0 tok/s; DeepSeek-V4.1 and GLM-5.3 gained nothing measurable.
+static int llama_graph_slots_count(const llama_model & model) {
     const std::string & mode = llama_graph_slots_mode();
     if (mode.rfind("flag:", 0) == 0) {
         return 2;
     }
     if (mode.empty()) {
-        return tensor_split ? 2 : 1;
+        if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+            return 1;
+        }
+        return model.arch == LLM_ARCH_QWEN4EXP ? 4 : 2;
     }
     return std::clamp(atoi(mode.c_str()), 1, LLAMA_GRAPH_SLOTS_MAX);
 }
 
-static bool llama_graph_slots_on(bool tensor_split) {
+static bool llama_graph_slots_on(const llama_model & model) {
     const std::string & mode = llama_graph_slots_mode();
     if (mode.rfind("flag:", 0) == 0) {
         static std::atomic<int64_t> next_check_us{0};
@@ -821,7 +826,7 @@ static bool llama_graph_slots_on(bool tensor_split) {
         }
         return on.load(std::memory_order_relaxed);
     }
-    return llama_graph_slots_count(tensor_split) >= 2;
+    return llama_graph_slots_count(model) >= 2;
 }
 
 static bool llama_graph_slots_all_outputs() {
@@ -859,7 +864,7 @@ void llama_context::sched_new(const sched_params & params) {
 
     // LLAMA_GRAPH_SLOTS: one scheduler per graph slot, so a context going between a few graphs reuses each of them;
     // the new sched is slot 0's
-    const int n_slots = llama_graph_slots_count(model.split_mode() == LLAMA_SPLIT_MODE_TENSOR);
+    const int n_slots = llama_graph_slots_count(model);
     sched_parked.clear();
     sched_slot = 0;
     graph_slots_forget();
@@ -2035,7 +2040,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // counts) binds them to the graph it is built into, and a slot switch would reuse the other graph without
         // rebinding them, so its inputs would be set in one graph and read in the other: such a chain keeps one
         // graph slot, as without LLAMA_GRAPH_SLOTS (a greedy chain binds none)
-        sched_slots_on = llama_graph_slots_on(model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) && !sampling_binds_inputs();
+        sched_slots_on = llama_graph_slots_on(model) && !sampling_binds_inputs();
         const int n_slots = (int) sched_parked.size();
         int slot = 0;
         if (sched_slots_on && n_outputs > 0 && (!all_outputs || n_outputs == ubatch.n_tokens)) {

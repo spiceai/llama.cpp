@@ -361,13 +361,13 @@ struct llama_memory_hybrid_idx_context::kpool_state {
 namespace {
 
 // The last padded pool is always unused. Pools are padded in step with the cells: 64 for every 256, see
-// llama_kv_pad_cells, or with LLAMA_KV_PAD=pow2 to the next power of two of at least 64, as the cells are. As the
+// llama_kv_pad_cells, or to the next power of two of at least 64 when the cells are (pow2, llama_kv_pad_pow2). As the
 // visible cells stop at the cache's size, the padding stops at what the default padding gives a cache of n_pool_max
 // pools, so a large LLAMA_KV_PAD cannot size the pool list past what the cache holds.
-uint32_t kpool_pad(uint32_t n_pool, uint32_t n_pool_max) {
+uint32_t kpool_pad(uint32_t n_pool, uint32_t n_pool_max, bool pow2) {
     const uint32_t step   = 64u * (llama_kv_pad_cells() / 256u);
     uint32_t       padded = std::max<uint32_t>(step, GGML_PAD(n_pool + 1, step));
-    if (llama_kv_pad_pow2()) {
+    if (pow2) {
         uint32_t p = 64;
         while (p < n_pool + 1 && p < (1u << 31)) {
             p *= 2;
@@ -511,7 +511,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
-        st.n_pool_pad  = kpool_pad(st.n_pool_real, uint32_t(n_pool_max));
+        st.n_pool_pad  = kpool_pad(st.n_pool_real, uint32_t(n_pool_max), mem->get_mem_idx()->get_pad_pow2());
         st.n_new   = st.n_pool_real;
         st.n_new_g = std::max(st.n_new, 1u);
         kpool_st = std::make_unique<kpool_state>(std::move(st));
@@ -637,7 +637,7 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 
     kpool_state st;
     st.n_pool_real = lay.n_pool_real;
-    st.n_pool_pad  = kpool_pad(st.n_pool_real, kpool_n_max(mem));
+    st.n_pool_pad  = kpool_pad(st.n_pool_real, kpool_n_max(mem), mem->get_mem_idx()->get_pad_pow2());
 
     return st;
 }
@@ -752,10 +752,10 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     // while a prompt is read, size the pool list for the whole LLAMA_KV_PROMPT_PAD bucket, as the visible KV range is,
     // so the chunks of one prompt share a graph shape (the padded pools point at the sentinel row, like the one pool
     // kpool_pad always adds); decode steps, batched ones included, keep the tight padding
-    st.n_pool_pad = kpool_pad(st.n_pool_real, n_pool_max);
+    st.n_pool_pad = kpool_pad(st.n_pool_real, n_pool_max, idx->get_pad_pow2());
     const uint32_t prompt_pad = llama_kv_prompt_pad();
     if (prompt_pad > 0 && llama_kv_prompt_tokens(ubatch) > 1) {
-        st.n_pool_pad = std::max(st.n_pool_pad, std::min(kpool_pad(prompt_pad / kpool, n_pool_max), kpool_pad(n_pool_max, n_pool_max)));
+        st.n_pool_pad = std::max(st.n_pool_pad, std::min(kpool_pad(prompt_pad / kpool, n_pool_max, idx->get_pad_pow2()), kpool_pad(n_pool_max, n_pool_max, idx->get_pad_pow2())));
     }
 }
 
@@ -797,7 +797,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     const bool by_order = mem->get_kpool_by_order();
 
     GGML_ASSERT(n_pool == st.n_pool_pad);
-    GGML_ASSERT(st.n_pool_pad >= kpool_pad(st.n_pool_real, kpool_n_max(mem)) && "pool list sized below what the cache holds");
+    GGML_ASSERT(st.n_pool_pad >= kpool_pad(st.n_pool_real, kpool_n_max(mem), mem->get_mem_idx()->get_pad_pow2()) && "pool list sized below what the cache holds");
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);

@@ -82,7 +82,7 @@ llama_kv_cache::llama_kv_cache(
     const  layer_share_cb & share,
                const char * name_tag,
                      bool   is_indexer) :
-    model(model), hparams(hparams), v_trans(v_trans),
+    pad_pow2(llama_kv_pad_pow2(model)), model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_swa(n_swa), is_indexer(is_indexer),
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -1347,12 +1347,15 @@ uint32_t llama_kv_prompt_tokens(const llama_ubatch & ubatch) {
     return res;
 }
 
-bool llama_kv_pad_pow2() {
-    static const bool on = [] {
-        const char * v = getenv("LLAMA_KV_PAD");
-        return v != nullptr && strcmp(v, "pow2") == 0;
-    }();
-    return on;
+bool llama_kv_pad_pow2(const llama_model & model) {
+    const char * v = getenv("LLAMA_KV_PAD");
+    if (v != nullptr && *v != '\0') {
+        return strcmp(v, "pow2") == 0;
+    }
+    // Qwen3.8 split over three DGX Sparks rebuilds its verify graph each time n_kv crosses a 256-cell step, ~80 ms on the
+    // head each. Padding to powers of two raised its two-request multi-turn throughput 94.6 -> 101.8-103.0 tok/s with its
+    // single requests unchanged, where DeepSeek-V4.1 lost ~3% at one and two requests and GLM-5.3 gained nothing at two.
+    return model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.arch == LLM_ARCH_QWEN4EXP;
 }
 
 uint32_t llama_kv_pad_cells() {
@@ -1385,7 +1388,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
         n_pad_cur = std::max(n_pad_cur, prompt_pad);
     }
 
-    const bool pow2 = llama_kv_pad_pow2();
+    const bool pow2 = pad_pow2;
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
