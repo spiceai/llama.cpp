@@ -17,12 +17,20 @@ if(DEFINED LLAMA_WEBUI_HF_BUCKET)
     message(DEPRECATION "LLAMA_WEBUI_HF_BUCKET is deprecated, use LLAMA_UI_HF_BUCKET instead")
 endif()
 
-# Resolve HF asset version: explicit env var > derived from build number > unset
+# The upstream build whose prebuilt UI matches tools/ui and scripts/ui-assets.cmake in this tree (upstream v1.0.0). A commit
+# of this fork has no upstream build of its own: its build number counts its commits (b1 in a shallow CI clone), names no
+# prebuilt UI, and the download falls back to "latest", which follows upstream master and fails this tree's asset check
+# (it no longer ships workbox[hash].js). Move it to the merged release's build with each upstream merge into the fork.
+set(LLAMA_UI_UPSTREAM_VERSION "b12359" CACHE STRING "Upstream build whose prebuilt UI this tree matches (empty: derive from the build number)")
+
+# Resolve HF asset version: explicit env var > the upstream build this tree carries > derived from build number > unset
 if(DEFINED ENV{HF_WEBUI_VERSION})
     set(HF_UI_VERSION "$ENV{HF_WEBUI_VERSION}")
     message(DEPRECATION "HF_WEBUI_VERSION env var is deprecated, use HF_UI_VERSION instead")
 elseif(DEFINED ENV{HF_UI_VERSION})
     set(HF_UI_VERSION "$ENV{HF_UI_VERSION}")
+elseif(NOT "${LLAMA_UI_UPSTREAM_VERSION}" STREQUAL "")
+    set(HF_UI_VERSION "${LLAMA_UI_UPSTREAM_VERSION}")
 elseif(DEFINED LLAMA_BUILD_NUMBER)
     set(HF_UI_VERSION "b${LLAMA_BUILD_NUMBER}")
 else()
