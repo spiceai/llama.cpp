@@ -168,6 +168,8 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static int llama_graph_slots_count(const llama_model & model); // LLAMA_GRAPH_SLOTS, defined with the graph slot switches
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -459,9 +461,11 @@ llama_context::llama_context(
         const int64_t max_nodes = graph_max_nodes();
 
         gf_res_reserve = std::make_unique<llm_graph_result>(max_nodes);
+        gf_res_prev.resize(std::max(2, llama_graph_slots_count(model)));
         for (auto & res : gf_res_prev) {
             res = std::make_unique<llm_graph_result>(max_nodes);
         }
+        gf_res_slot_active.assign(gf_res_prev.size(), nullptr);
     }
 
     if (!hparams.vocab_only) {
@@ -786,7 +790,31 @@ static const std::string & llama_graph_slots_mode() {
     return mode;
 }
 
-static bool llama_graph_slots_on(bool tensor_split) {
+// The most graph slots LLAMA_GRAPH_SLOTS can ask for.
+static constexpr int LLAMA_GRAPH_SLOTS_MAX = 8;
+
+// How many graph slots a context has: LLAMA_GRAPH_SLOTS=N gives N (one disables them) and "flag:<path>" gives two. Unset,
+// a tensor split gets two, a tensor-split qwen4exp model four, and any other model one. The first slot holds the graphs
+// without outputs; with more than two, the others hold graphs with outputs, a ubatch taking the slot whose graph it can
+// reuse, else the one least recently used, so a context going between a few graph shapes (a speculative verify of one
+// sequence and of two) keeps reusing each of them. Qwen3.8 split over three DGX Sparks goes between more verify shapes
+// than one output slot holds, and with four slots and its K/V padded to powers of two (llama_kv_pad_pow2) its
+// two-request multi-turn throughput rose 94.6 -> 101.8-103.0 tok/s; DeepSeek-V4.1 and GLM-5.3 gained nothing measurable.
+static int llama_graph_slots_count(const llama_model & model) {
+    const std::string & mode = llama_graph_slots_mode();
+    if (mode.rfind("flag:", 0) == 0) {
+        return 2;
+    }
+    if (mode.empty()) {
+        if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+            return 1;
+        }
+        return model.arch == LLM_ARCH_QWEN4EXP ? 4 : 2;
+    }
+    return std::clamp(atoi(mode.c_str()), 1, LLAMA_GRAPH_SLOTS_MAX);
+}
+
+static bool llama_graph_slots_on(const llama_model & model) {
     const std::string & mode = llama_graph_slots_mode();
     if (mode.rfind("flag:", 0) == 0) {
         static std::atomic<int64_t> next_check_us{0};
@@ -798,7 +826,7 @@ static bool llama_graph_slots_on(bool tensor_split) {
         }
         return on.load(std::memory_order_relaxed);
     }
-    return mode.empty() ? tensor_split : atoi(mode.c_str()) >= 2;
+    return llama_graph_slots_count(model) >= 2;
 }
 
 static bool llama_graph_slots_all_outputs() {
@@ -834,19 +862,23 @@ void llama_context::sched_new(const sched_params & params) {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
-    // LLAMA_GRAPH_SLOTS=2: one scheduler per graph slot, so a context alternating between two graphs reuses both
-    const std::string & slots_mode = llama_graph_slots_mode();
-    const bool graph_slots = slots_mode.rfind("flag:", 0) == 0 ||
-        (slots_mode.empty() ? model.split_mode() == LLAMA_SPLIT_MODE_TENSOR : atoi(slots_mode.c_str()) >= 2);
-    sched_alt.reset();
+    // LLAMA_GRAPH_SLOTS: one scheduler per graph slot, so a context going between a few graphs reuses each of them;
+    // the new sched is slot 0's
+    const int n_slots = llama_graph_slots_count(model);
+    sched_parked.clear();
     sched_slot = 0;
-    gf_res_prev_active_alt = nullptr;
-    if (graph_slots) {
-        sched_alt.reset(ggml_backend_sched_new(
-                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
-        ggml_backend_sched_set_copy_callback(sched_alt.get(), sched_copy_experts, this);
-        ggml_backend_sched_set_realloc_callback(sched_alt.get(), sched_graph_realloc, this);
+    graph_slots_forget();
+    if (n_slots >= 2) {
+        sched_parked.resize(n_slots);
+        for (int k = 1; k < n_slots; ++k) {
+            sched_parked[k].reset(ggml_backend_sched_new(
+                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
+            ggml_backend_sched_set_copy_callback(sched_parked[k].get(), sched_copy_experts, this);
+            ggml_backend_sched_set_realloc_callback(sched_parked[k].get(), sched_graph_realloc, this);
+        }
     }
+    sched_slot_used.assign(std::max(n_slots, 1), 0);
+    sched_slot_clock = 0;
 
     sched_params_cur = params;
 }
@@ -871,8 +903,7 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    gf_res_prev_active = nullptr;
-    gf_res_prev_active_alt = nullptr;
+    graph_slots_forget();
 
     gf_res_reserve->set_max_nodes(max_nodes);
     gf_res_reserve->reset();
@@ -1161,8 +1192,7 @@ bool llama_context::memory_update(bool optimize) {
         for (auto & res : gf_res_prev) {
             res->reset();
         }
-        gf_res_prev_active = nullptr;
-        gf_res_prev_active_alt = nullptr;
+        graph_slots_forget();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -2000,9 +2030,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const int64_t t_dt0 = g_decode_timing.on ? ggml_time_us() : 0;
 
-    // with LLAMA_GRAPH_SLOTS=2 each graph slot has its own scheduler: switch to this ubatch's
-    if (sched_alt) {
-        // LLAMA_GRAPH_SLOTS_ALL_OUTPUTS=1 (or flag:<path>): the second slot holds only ubatches whose every token is an
+    // with LLAMA_GRAPH_SLOTS each graph slot has its own scheduler: switch to this ubatch's
+    if (!sched_parked.empty()) {
+        // LLAMA_GRAPH_SLOTS_ALL_OUTPUTS=1 (or flag:<path>): the output slots hold only ubatches whose every token is an
         // output (a speculative verify or draft), so a prompt's last chunk, which outputs one token, does not evict the
         // verify
         const bool all_outputs = llama_graph_slots_all_outputs();
@@ -2010,13 +2040,35 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // counts) binds them to the graph it is built into, and a slot switch would reuse the other graph without
         // rebinding them, so its inputs would be set in one graph and read in the other: such a chain keeps one
         // graph slot, as without LLAMA_GRAPH_SLOTS (a greedy chain binds none)
-        sched_slots_on = llama_graph_slots_on(model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) && !sampling_binds_inputs();
-        const int slot = sched_slots_on && n_outputs > 0 && (!all_outputs || n_outputs == ubatch.n_tokens);
+        sched_slots_on = llama_graph_slots_on(model) && !sampling_binds_inputs();
+        const int n_slots = (int) sched_parked.size();
+        int slot = 0;
+        if (sched_slots_on && n_outputs > 0 && (!all_outputs || n_outputs == ubatch.n_tokens)) {
+            // the output slot holding a graph this ubatch can reuse, else the least recently used one
+            slot = -1;
+            int lru = 1;
+            for (int k = 1; k < n_slots; ++k) {
+                llm_graph_result * cand = gf_res_prev[k].get();
+                if (!graph_reuse_disable && gf_res_slot_active[k] == cand &&
+                        cand->can_reuse(graph_params(cand, ubatch, mctx, gtype))) {
+                    slot = k;
+                    break;
+                }
+                if (sched_slot_used[k] < sched_slot_used[lru]) {
+                    lru = k;
+                }
+            }
+            if (slot < 0) {
+                slot = lru;
+            }
+        }
         if (slot != sched_slot) {
-            std::swap(sched, sched_alt);
-            std::swap(gf_res_prev_active, gf_res_prev_active_alt);
+            // sched becomes the slot's scheduler, and the one it held is parked under its own slot
+            std::swap(sched, sched_parked[slot]);
+            std::swap(sched_parked[slot], sched_parked[sched_slot]);
             sched_slot = slot;
         }
+        sched_slot_used[slot] = ++sched_slot_clock;
     }
 
     auto * res = get_gf_res_prev();
@@ -2028,9 +2080,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (getenv("LLAMA_DEBUG_REUSE") && n_outputs > 0) {
         fprintf(stderr, "DBGREUSE arch %s tok %u out %u slot %d prev_active %d can_reuse %d\n", llm_arch_name(model.arch),
-                ubatch.n_tokens, n_outputs, sched_slot, (int) (gf_res_prev_active == res), (int) (gf_res_prev_active == res && res->can_reuse(gparams)));
+                ubatch.n_tokens, n_outputs, sched_slot, (int) (gf_res_slot_active[sched_slot] == res), (int) (gf_res_slot_active[sched_slot] == res && res->can_reuse(gparams)));
     }
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && gf_res_slot_active[sched_slot] == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2042,12 +2094,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        gf_res_prev_active = nullptr;
-        // the graph results are per n_outputs > 0, not per scheduler: with the second slot off this scheduler also
-        // builds the graph the other one last allocated, which that one must not reuse when the slot comes back
-        if (gf_res_prev_active_alt == res) {
-            gf_res_prev_active_alt = nullptr;
+        // the graph results are per n_outputs > 0 while the slots are off, not per scheduler: this scheduler may then
+        // build the graph another slot's scheduler last allocated, which that one must not reuse when its slot comes back
+        for (auto & active : gf_res_slot_active) {
+            if (active == res) {
+                active = nullptr;
+            }
         }
+        gf_res_slot_active[sched_slot] = nullptr;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -2071,7 +2125,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        gf_res_prev_active = res;
+        gf_res_slot_active[sched_slot] = res;
     }
 
     const int64_t t_dt1 = g_decode_timing.on ? ggml_time_us() : 0;
@@ -3264,7 +3318,11 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 llm_graph_result * llama_context::get_gf_res_prev() {
     // with the graph slots on, one result per scheduler slot: a prompt's last chunk outputs a token but runs in the
     // first slot (LLAMA_GRAPH_SLOTS_ALL_OUTPUTS=1), and must not overwrite the verify graph the second slot holds
-    return gf_res_prev[sched_alt && sched_slots_on ? sched_slot : (n_outputs > 0)].get();
+    return gf_res_prev[!sched_parked.empty() && sched_slots_on ? sched_slot : (n_outputs > 0)].get();
+}
+
+void llama_context::graph_slots_forget() {
+    std::fill(gf_res_slot_active.begin(), gf_res_slot_active.end(), nullptr);
 }
 
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
@@ -3340,8 +3398,7 @@ ggml_cgraph * llama_context::graph_reserve(
     for (auto & res : gf_res_prev) {
         res->reset();
     }
-    gf_res_prev_active = nullptr;
-    gf_res_prev_active_alt = nullptr;
+    graph_slots_forget();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -4679,8 +4736,7 @@ void llama_context::opt_epoch_iter(
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
-            gf_res_prev_active = nullptr;
-            gf_res_prev_active_alt = nullptr;
+            graph_slots_forget();
             res->reset();
 
             auto * gf = model.build_graph(gparams);

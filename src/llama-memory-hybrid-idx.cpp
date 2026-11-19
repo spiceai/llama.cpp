@@ -361,11 +361,19 @@ struct llama_memory_hybrid_idx_context::kpool_state {
 namespace {
 
 // The last padded pool is always unused. Pools are padded in step with the cells: 64 for every 256, see
-// llama_kv_pad_cells. As the visible cells stop at the cache's size, the padding stops at what the default padding
-// gives a cache of n_pool_max pools, so a large LLAMA_KV_PAD cannot size the pool list past what the cache holds.
-uint32_t kpool_pad(uint32_t n_pool, uint32_t n_pool_max) {
+// llama_kv_pad_cells, or to the next power of two of at least 64 when the cells are (pow2, llama_kv_pad_pow2). As the
+// visible cells stop at the cache's size, the padding stops at what the default padding gives a cache of n_pool_max
+// pools, so a large LLAMA_KV_PAD cannot size the pool list past what the cache holds.
+uint32_t kpool_pad(uint32_t n_pool, uint32_t n_pool_max, bool pow2) {
     const uint32_t step   = 64u * (llama_kv_pad_cells() / 256u);
-    const uint32_t padded = std::max<uint32_t>(step, GGML_PAD(n_pool + 1, step));
+    uint32_t       padded = std::max<uint32_t>(step, GGML_PAD(n_pool + 1, step));
+    if (pow2) {
+        uint32_t p = 64;
+        while (p < n_pool + 1 && p < (1u << 31)) {
+            p *= 2;
+        }
+        padded = std::max(padded, p);
+    }
     const uint32_t full   = std::max<uint32_t>(64u, GGML_PAD(n_pool_max + 1, 64u));
     return std::max<uint32_t>(std::min(padded, full), GGML_PAD(n_pool + 1, 64u));
 }
@@ -503,7 +511,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
-        st.n_pool_pad  = kpool_pad(st.n_pool_real, uint32_t(n_pool_max));
+        st.n_pool_pad  = kpool_pad(st.n_pool_real, uint32_t(n_pool_max), mem->get_mem_idx()->get_pad_pow2());
         st.n_new   = st.n_pool_real;
         st.n_new_g = std::max(st.n_new, 1u);
         kpool_st = std::make_unique<kpool_state>(std::move(st));
@@ -629,7 +637,7 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 
     kpool_state st;
     st.n_pool_real = lay.n_pool_real;
-    st.n_pool_pad  = kpool_pad(st.n_pool_real, kpool_n_max(mem));
+    st.n_pool_pad  = kpool_pad(st.n_pool_real, kpool_n_max(mem), mem->get_mem_idx()->get_pad_pow2());
 
     return st;
 }
@@ -730,15 +738,31 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     // as the count moves; reserve sizes the list for every pool the cache can hold, so never pad past n_pool_max
     const uint32_t n_pool_max = kv_size / kpool * idx->get_n_seq_max();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
-    st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_new_pad(st.n_pool_real) - 1, n_pool_max})});
+    const uint32_t cap   = std::min(kpool_new_pad(st.n_pool_real) - 1, n_pool_max);
+    st.n_new_g = std::max({st.n_new, 1u, std::min(bound, cap)});
+    // more pools than that bound: a prompt, or the first ubatch after a sequence edit or a restored state staled a
+    // sequence's pools (a server restoring a cached prompt does that at every turn). The count is that of the stale pools,
+    // a new one each time, and each would be a graph of its own: pad it to the 64-pool step instead, under the same cap,
+    // so those ubatches share a few shapes, which graph slots keep (LLAMA_GRAPH_SLOTS). n_new is at most n_pool_real,
+    // which the cap is above, so the padding never drops a pool
+    if (st.n_new > std::min(bound, cap)) {
+        st.n_new_g = std::max(st.n_new, std::min<uint32_t>(GGML_PAD(st.n_new, 64), cap));
+    }
+    // set_input_kpool gives each padded entry a cell of its own that is not the last member of a complete pool, and there
+    // are at most n_pool_real of those, so never pad past the cells that leaves: in a cache whose pools' last members
+    // covered nearly every cell (sequences sharing cells but grouped at different offsets) a padded entry would find none
+    // and the run would abort. A ubatch keeps at least one entry, as the graph pools at least one.
+    const uint64_t n_cells = uint64_t(kv_size) * idx->get_n_stream();
+    const uint64_t n_spare = n_cells > st.n_pool_real ? n_cells - st.n_pool_real : 0;
+    st.n_new_g = uint32_t(std::max<uint64_t>(1, std::min<uint64_t>(st.n_new_g, uint64_t(st.n_new) + n_spare)));
 
     // while a prompt is read, size the pool list for the whole LLAMA_KV_PROMPT_PAD bucket, as the visible KV range is,
     // so the chunks of one prompt share a graph shape (the padded pools point at the sentinel row, like the one pool
     // kpool_pad always adds); decode steps, batched ones included, keep the tight padding
-    st.n_pool_pad = kpool_pad(st.n_pool_real, n_pool_max);
+    st.n_pool_pad = kpool_pad(st.n_pool_real, n_pool_max, idx->get_pad_pow2());
     const uint32_t prompt_pad = llama_kv_prompt_pad();
     if (prompt_pad > 0 && llama_kv_prompt_tokens(ubatch) > 1) {
-        st.n_pool_pad = std::max(st.n_pool_pad, std::min(kpool_pad(prompt_pad / kpool, n_pool_max), kpool_pad(n_pool_max, n_pool_max)));
+        st.n_pool_pad = std::max(st.n_pool_pad, std::min(kpool_pad(prompt_pad / kpool, n_pool_max, idx->get_pad_pow2()), kpool_pad(n_pool_max, n_pool_max, idx->get_pad_pow2())));
     }
 }
 
@@ -780,7 +804,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     const bool by_order = mem->get_kpool_by_order();
 
     GGML_ASSERT(n_pool == st.n_pool_pad);
-    GGML_ASSERT(st.n_pool_pad >= kpool_pad(st.n_pool_real, kpool_n_max(mem)) && "pool list sized below what the cache holds");
+    GGML_ASSERT(st.n_pool_pad >= kpool_pad(st.n_pool_real, kpool_n_max(mem), mem->get_mem_idx()->get_pad_pow2()) && "pool list sized below what the cache holds");
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);

@@ -114,6 +114,9 @@ extern "C" {
 
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+    // how many times a meta backend built a graph split (each one sends the graph to every device, and over RPC serializes it
+    // again) rather than reuse the one it kept; for tests
+    GGML_API uint64_t ggml_backend_meta_n_split_builds(ggml_backend_t meta_backend);
 
     //
     // Backend (stream)

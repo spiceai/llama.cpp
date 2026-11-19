@@ -82,7 +82,7 @@ llama_kv_cache::llama_kv_cache(
     const  layer_share_cb & share,
                const char * name_tag,
                      bool   is_indexer) :
-    model(model), hparams(hparams), v_trans(v_trans),
+    pad_pow2(llama_kv_pad_pow2(model)), model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_swa(n_swa), is_indexer(is_indexer),
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -461,7 +461,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
+        // every cell from used_max_p1() on is empty (position -1), and p0 >= 0, so none of them can match: stopping
+        // there leaves the result as it was, and spares a decode loop that trims rejected drafts every step a scan of
+        // the whole cache (all 131072 cells of a 128k-context unified cache, on every call)
+        const uint32_t n_scan = cells.used_max_p1();
+        for (uint32_t i = 0; i < n_scan; ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
@@ -485,7 +489,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
             uint32_t new_head = cells.size();
 
-            for (uint32_t i = 0; i < cells.size(); ++i) {
+            // as above, the cells from used_max_p1() on are empty and cannot match
+            const uint32_t n_scan = cells.used_max_p1();
+            for (uint32_t i = 0; i < n_scan; ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
                 }
@@ -1341,6 +1347,17 @@ uint32_t llama_kv_prompt_tokens(const llama_ubatch & ubatch) {
     return res;
 }
 
+bool llama_kv_pad_pow2(const llama_model & model) {
+    const char * v = getenv("LLAMA_KV_PAD");
+    if (v != nullptr && *v != '\0') {
+        return strcmp(v, "pow2") == 0;
+    }
+    // Qwen3.8 split over three DGX Sparks rebuilds its verify graph each time n_kv crosses a 256-cell step, ~80 ms on the
+    // head each. Padding to powers of two raised its two-request multi-turn throughput 94.6 -> 101.8-103.0 tok/s with its
+    // single requests unchanged, where DeepSeek-V4.1 lost ~3% at one and two requests and GLM-5.3 gained nothing at two.
+    return model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.arch == LLM_ARCH_QWEN4EXP;
+}
+
 uint32_t llama_kv_pad_cells() {
     static const uint32_t pad = [] {
         const char * v = getenv("LLAMA_KV_PAD");
@@ -1371,10 +1388,21 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
         n_pad_cur = std::max(n_pad_cur, prompt_pad);
     }
 
+    const bool pow2 = pad_pow2;
+
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        uint32_t n = std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur));
+        if (pow2) {
+            uint32_t p = 256;
+            while (p < cells.used_max_p1() && p < (1u << 31)) {
+                p *= 2;
+            }
+            n = std::max(n, p);
+        }
+
+        result = std::max(std::min(cells.size(), n), result);
     }
 
     return result;
