@@ -2107,6 +2107,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
         }
+        // inkling2_loop: the cache slots copied the physical layers before the scale pass, re-share them
+        if (auto * lm = dynamic_cast<llama_model_inkling2_loop *>(this)) {
+            for (int il = lm->n_phys; il < n_layer_all; ++il) {
+                layers[il] = layers[lm->layer_phys(il)];
+            }
+        }
         // output scales
         if (output) {
             // weight scale
