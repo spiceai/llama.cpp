@@ -18,6 +18,14 @@
 #include "llama.h"
 #include "sampling.h"
 
+// spiced decodes with llama_decode, llama_batch_init and llama_batch_free, which upstream deprecated in favor of
+// llama_process and llama_batch_ext; this test guards the reads after a fault on the path spiced takes, so it keeps it
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(disable: 4996)
+#endif
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
