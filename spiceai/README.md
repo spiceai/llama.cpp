@@ -20,11 +20,17 @@ It also carries these source patches, which each Spice branch must keep until up
   byte per value) since. Upstream's offset checks refuse such a tensor only when another tensor follows it; read last,
   it would load with the wrong values. A GGUF opened from a `FILE` may be followed by other data, so that path is not
   checked.
-- **The RPC protocol's major is upstream's plus 100** (`ggml/include/ggml-rpc.h`, 110 at v1.0.0), since this branch's
+- **The RPC protocol's major is upstream's plus 100 or more** (`ggml/include/ggml-rpc.h`: 110 at v1.0.0, and 111 since
+  b12600, where upstream's `GGML_OP_SLEEP` moved this branch's two ops up by one), since this branch's
   ops (`GGML_OP_ARGMAX_PART` and `GGML_OP_ARGMAX_MERGE`, appended after upstream's) and commands differ from
   upstream's: an upstream peer refuses a peer from this branch at the handshake. The HELLO reply's flags byte carries
   upstream's `rpc_dispatcher_flags` in its low bits and this branch's `rpc_op_cap` bits in its high bits. Bump it with
   upstream's, and whenever this branch changes an op or a command.
+- **Inkling 2 Mini's looped layers keep their NVFP4 expert scales** (`src/llama-model.cpp`), upstream PR 32704, picked
+  before upstream merged it. `inkling2_loop` copies each physical core layer into the cache slots of its later passes
+  before the generic pass attaches the optional `.scale` tensors, so without it the second and third passes run the
+  NVFP4 experts unscaled (Unsloth reports perplexity about 130 instead of 7.65 for its UD-Q8_K_XL). Take upstream's
+  once a release has it.
 - **Fixes on top of upstream's DeepSeek-V4.1-Flash (`deepseek41`, ggml-org/llama.cpp#31086)**, not upstream. A GGUF
   whose `attention.output_group_count` is 0 fails its load instead of dividing by zero (`src/models/deepseek4.cpp`,
   which `deepseek41` shares), and `deepseek41`'s output projection applies a LoRA adapter on `output.weight`
@@ -85,7 +91,7 @@ It also carries these source patches, which each Spice branch must keep until up
   upstream's. Drop each once upstream has an equivalent.
 
 Each Spice branch is `spiceai-<release>`: the upstream release tag with the Spice commits on top, made by
-merging the tag into the previous Spice branch (`spiceai-v1.0.0` is `spiceai-b11999` with `v1.0.0` merged in, and
+merging the tag into the previous Spice branch (`spiceai-b12600` is `spiceai-v1.0.0` with `b12600` merged in, `spiceai-v1.0.0` is `spiceai-b11999` with `v1.0.0` merged in, and
 `spiceai-b11999` is `spiceai-b11803` with `b11984`, then `b11999`, merged in). Its tip is tagged `<release>-spiceai.<n>`, a name apart from the
 branch's so neither is ambiguous, with `<n>` counting re-packagings of one release. To move
 to a new release:
