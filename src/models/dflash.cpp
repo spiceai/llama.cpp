@@ -41,6 +41,11 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     const bool has_lilicorr = ml.get_key(LLM_KV_LILICORR_HIDDEN_SIZE, hparams.lilicorr_hidden_size, false);
     if (has_markov) {
         variant = VARIANT_DSPARK;
+        // the Markov head chains over the trained block, which also sizes the mask embeddings (block_size - 1 of them),
+        // so a GGUF without a block size of at least one fails its load rather than a later graph build
+        if (hparams.dflash_block_size == 0) {
+            throw std::runtime_error("DSpark draft requires 'dflash.block_size' of at least 1 in GGUF metadata");
+        }
     } else if (has_selector) {
         variant = VARIANT_DFLASH2;
     } else if (has_lilicorr) {

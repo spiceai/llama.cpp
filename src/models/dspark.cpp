@@ -183,9 +183,8 @@ struct dspark_block_params {
 };
 
 static dspark_block_params dspark_get_block_params(const llama_model & model) {
-    const auto it = model.gguf_kv.find("dflash.block_size");
-    GGML_ASSERT(it != model.gguf_kv.end() && "DSpark draft requires 'dflash.block_size' in GGUF metadata");
-    const int64_t block_size = std::stoi(it->second);
+    // read and checked at load (llama_model_dflash::load_arch_hparams)
+    const int64_t block_size = model.hparams.dflash_block_size;
     GGML_ASSERT(block_size > 0);
 
     // bonus anchor (SpecForge exports): slot 0 is a bonus token, not a prediction slot
