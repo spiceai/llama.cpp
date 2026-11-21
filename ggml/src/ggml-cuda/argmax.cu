@@ -22,8 +22,8 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
 
 #pragma unroll
     for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
-        const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
-        const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
+        const float val = ggml_cuda_shfl_xor(maxval, offset, WARP_SIZE);
+        const int   col = ggml_cuda_shfl_xor(argmax, offset, WARP_SIZE);
         if (val > maxval) {
             maxval = val;
             argmax = col;
@@ -51,8 +51,8 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
             }
 #pragma unroll
             for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
-                const float val = __shfl_xor_sync(0xFFFFFFFF, maxval, offset, WARP_SIZE);
-                const int   col = __shfl_xor_sync(0xFFFFFFFF, argmax, offset, WARP_SIZE);
+                const float val = ggml_cuda_shfl_xor(maxval, offset, WARP_SIZE);
+                const int   col = ggml_cuda_shfl_xor(argmax, offset, WARP_SIZE);
                 if (val > maxval) {
                     maxval = val;
                     argmax = col;
@@ -131,8 +131,8 @@ static __global__ void argmax_part_f32(const float * __restrict__ x, float * __r
 
 #pragma unroll
     for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
-        const float v_other = __shfl_xor_sync(0xFFFFFFFF, best_v, offset, WARP_SIZE);
-        const int   i_other = __shfl_xor_sync(0xFFFFFFFF, best_i, offset, WARP_SIZE);
+        const float v_other = ggml_cuda_shfl_xor(best_v, offset, WARP_SIZE);
+        const int   i_other = ggml_cuda_shfl_xor(best_i, offset, WARP_SIZE);
         argmax_part_combine(best_v, best_i, v_other, i_other);
     }
 
@@ -155,8 +155,8 @@ static __global__ void argmax_part_f32(const float * __restrict__ x, float * __r
             best_i = lane_id < n_warps ? shared_i[lane_id] : -1;
 #pragma unroll
             for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
-                const float v_other = __shfl_xor_sync(0xFFFFFFFF, best_v, offset, WARP_SIZE);
-                const int   i_other = __shfl_xor_sync(0xFFFFFFFF, best_i, offset, WARP_SIZE);
+                const float v_other = ggml_cuda_shfl_xor(best_v, offset, WARP_SIZE);
+                const int   i_other = ggml_cuda_shfl_xor(best_i, offset, WARP_SIZE);
                 argmax_part_combine(best_v, best_i, v_other, i_other);
             }
         }

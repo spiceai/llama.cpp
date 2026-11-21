@@ -154,24 +154,20 @@ int main(int argc, char ** argv) {
     const int n_prompt = 16;
     const int n_steps  = 16;
     const int n_shift  = 4;
-    llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+    common_batch batch(ctx);
     std::vector<float> all; // every step's logits, for --write-reference
     bool failed = false;
     int  rc_fail = 0;
     for (int step = 0; step <= n_steps; step++) {
         const int n = step == 0 ? n_prompt : 1;
-        batch.n_tokens = n;
+        batch.clear();
         for (int i = 0; i < n; i++) {
             // --shift drops the prompt's first n_shift tokens after it and shifts the rest back, so the next decode
             // computes the K-shift first
             const int pos = step == 0 ? i : n_prompt - (shift ? n_shift : 0) + step - 1;
-            batch.token[i]     = (llama_token) (1 + (pos*7) % (n_vocab - 1));
-            batch.pos[i]       = pos;
-            batch.n_seq_id[i]  = 1;
-            batch.seq_id[i][0] = 0;
-            batch.logits[i]    = i == n - 1;
+            batch.add((llama_token) (1 + (pos*7) % (n_vocab - 1)), pos, 0, i == n - 1);
         }
-        const int32_t rc = llama_decode(ctx, batch);
+        const int32_t rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (failed) {
             // a failed context refuses the work instead of computing on what the failure left
             if (rc != -3) {
@@ -269,7 +265,6 @@ int main(int argc, char ** argv) {
             llama_memory_seq_add(mem, 0, n_shift, -1, -n_shift);
         }
     }
-    llama_batch_free(batch);
     common_sampler_free(smpl_g);
     common_sampler_free(smpl);
     llama_free(ctx);

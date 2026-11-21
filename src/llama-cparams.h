@@ -54,6 +54,7 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
+    bool moe_random_routing; // benchmark only: random expert ids in the MoE GEMMs
     bool logits_gather;      // gather a split output head whole onto every device, see llama_tensor_logits_gather
     bool argmax_output = false; // output each row's first max instead of its logits where the head splits, see llama_set_argmax_output
 
