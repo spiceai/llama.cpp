@@ -1,4 +1,7 @@
 #include "models.h"
+
+#include <cstdlib>
+#include <string>
 #include "../llama-memory-hybrid-iswa.h"
 
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
@@ -161,9 +164,20 @@ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const 
 }
 
 // scale each row down to an L2 norm of at most threshold, after the optional per-channel scale
+
+// lab only: INKLING_LAB_SKIP=clip,mix,conv,control (or all) replaces those blocks with a passthrough of the same shape,
+// to time what each costs a decode. The output is wrong by design.
+static bool inkling_lab_skip(const char * block) {
+    static const std::string skip = [] { const char * v = getenv("INKLING_LAB_SKIP"); return std::string(v ? v : ""); }();
+    return skip == "all" || ("," + skip + ",").find("," + std::string(block) + ",") != std::string::npos;
+}
+
 ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold) {
     if (scale) {
         cur = ggml_mul(ctx0, cur, scale);
+    }
+    if (inkling_lab_skip("clip")) {
+        return cur;
     }
 
     ggml_tensor * norm = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, cur)));
@@ -176,6 +190,9 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
+    if (inkling_lab_skip("mix")) {
+        return ggml_repeat(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+    }
     ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     for (ggml_tensor * block : blocks) {
         states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
@@ -200,6 +217,9 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         ggml_tensor * history,
         llm_graph_input_rs * inp,
         int64_t offset) {
+    if (inkling_lab_skip("conv")) {
+        return cur;
+    }
     const int64_t n_conv       = hparams.n_shortconv_l_cache;
     const int64_t n_channels   = cur->ne[0];
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
@@ -238,6 +258,9 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
+    if (inkling_lab_skip("control")) {
+        return cur;
+    }
     ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
