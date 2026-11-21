@@ -7,6 +7,9 @@
 
 #include <type_traits>
 
+#include <cstdlib>
+#include <cstring>
+
 // NVIDIA only: the kernel uses the NVIDIA int8 MMA fragment layout and cp.async.
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
@@ -874,6 +877,12 @@ static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return 0;
 #endif // GGML_CUDA_FORCE_CUBLAS
+    // lab only: GGML_CUDA_DISABLE_MMQ_FEW=id takes MMVQ and MMQ for MUL_MAT_ID as before few-row MMQ took it (upstream
+    // PR 32065); any other value does so for MUL_MAT too
+    static const char * lab_disable = getenv("GGML_CUDA_DISABLE_MMQ_FEW");
+    if (lab_disable != nullptr && (has_ids || strcmp(lab_disable, "id") != 0)) {
+        return 0;
+    }
 
     // NVIDIA Ampere to Blackwell
     if (!ampere_mma_available(cc) || cc >= GGML_CUDA_CC_RUBIN) {
