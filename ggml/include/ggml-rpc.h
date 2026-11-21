@@ -9,13 +9,15 @@ extern "C" {
 // Ops are sent by number, and the handshake compares only the major (and the minor against the client's), never the
 // patch, so peers that differ in their ops or commands must differ in the major to refuse each other at connect rather
 // than run each other's ops as others. This branch's ops (GGML_OP_ARGMAX_PART, GGML_OP_ARGMAX_MERGE) and commands differ
-// from upstream's, so its major is upstream's (10 at v1.0.0) plus 100, and never equals one upstream sends.
-#define RPC_PROTO_MAJOR_VERSION    110
+// from upstream's, so its major is upstream's plus 100 or more, and never equals one upstream sends. It also goes up
+// whenever this branch's op numbers move: 110 at v1.0.0, and 111 since b12600, where upstream's GGML_OP_SLEEP
+// moved GGML_OP_ARGMAX_PART and GGML_OP_ARGMAX_MERGE up by one.
+#define RPC_PROTO_MAJOR_VERSION    111
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    0
+#define RPC_PROTO_PATCH_VERSION    1
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_MAJOR_VERSION (the handshake ignores the patch)");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_MAJOR_VERSION (the handshake ignores the patch)");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16
