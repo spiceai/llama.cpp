@@ -1337,7 +1337,10 @@ public:
             return;
         }
         backend_flag_next_check_us = now + 100000;
-        const bool want = std::filesystem::exists(mode.substr(5));
+        // the non-throwing overload: a path that cannot be checked (a symlink loop, a directory it may not read) counts as
+        // absent, rather than an exception out of draft()
+        std::error_code ec;
+        const bool want = std::filesystem::exists(mode.substr(5), ec);
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr || backend_chains_attached[seq_id] == want) {
                 continue;
