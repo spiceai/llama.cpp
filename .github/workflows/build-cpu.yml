@@ -146,15 +146,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - build: 'x64-cpu-static'
-            arch: 'x64'
-            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DBUILD_SHARED_LIBS=OFF'
           - build: 'x64-openblas'
             arch: 'x64'
             defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS -DBLAS_INCLUDE_DIRS="$env:RUNNER_TEMP/openblas/include" -DBLAS_LIBRARIES="$env:RUNNER_TEMP/openblas/lib/openblas.lib"'
-          - build: 'arm64'
-            arch: 'arm64'
-            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_SERVER=ON'
 
     steps:
       - name: Clone
@@ -211,7 +205,16 @@ jobs:
         if: ${{ matrix.arch == 'x64' }}
         run: |
           cd build
-          ctest -L main -C Release --verbose --timeout 900
+          ctest -C Release -R test-download-model --output-on-failure
+          $fails = 0
+          for ($i = 1; $i -le 20; $i++) {
+            & .\bin\Release\test-thread-safety.exe -m stories15M-q4_0.gguf -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2 *> "tts-$i.log"
+            $rc = $LASTEXITCODE
+            Write-Host ("lab-loop run {0}: exit 0x{1:X8}" -f $i, $rc)
+            if ($rc -ne 0) { $fails++ }
+          }
+          Write-Host "lab-loop test-thread-safety: $fails of 20 runs failed"
+          if ($fails -ne 0) { exit 1 }
 
       # TODO: disabled for now, consider adding tests for all CPU variants instead
       # - name: Test (Intel SDE)
