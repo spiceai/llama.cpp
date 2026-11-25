@@ -165,6 +165,15 @@ int main()
         root ::= "a"{5000,6000}
     )""");
 
+    // A repetition whose max is below its min fails to parse instead of looping (CVE-2026-137057)
+    verify_failure(R"""(
+        root ::= "x"{3,1}
+    )""");
+
+    verify_failure(R"""(
+        root ::= ("ab" [c-d]){10,2}
+    )""");
+
     // Recursion depth limit exceeded (Issue #29495)
     {
         std::string deep_grammar = "root ::= ";
