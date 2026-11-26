@@ -2737,7 +2737,16 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
     uint64_t dst_base   = (uint64_t) ggml_backend_buffer_get_base(dst->buffer);
     uint64_t dst_buf_sz = (uint64_t) ggml_backend_buffer_get_size(dst->buffer);
 
-    if (dst_data + src_size > dst_base + dst_buf_sz) {
+    // deserialize_tensor checks only a tensor with elements against its buffer, so a dst with none may point anywhere:
+    // the copy must fit in dst itself, which then lies inside its buffer (upstream's rpc_check_region in copy_tensor,
+    // ggml-org/llama.cpp#32651, CVE-2026-137567)
+    if (dst->data == nullptr || src_size > (uint64_t) ggml_nbytes(dst)) {
+        LOG_ERROR("[%s] copy of %" PRIu64 " bytes does not fit in dst tensor '%s' (%" PRIu64 " bytes)\n",
+                  __func__, src_size, dst->name, (uint64_t) ggml_nbytes(dst));
+        return false;
+    }
+
+    if (dst_data < dst_base || dst_data + src_size < dst_data || dst_data + src_size > dst_base + dst_buf_sz) {
         LOG_ERROR("[%s] out-of-bounds write in rpc_server::copy_tensor:\n"
                          "    write range : [0x%" PRIx64 ", 0x%" PRIx64 "]\n"
                          "    buffer base: [0x%" PRIx64 ", 0x%" PRIx64 "]\n",

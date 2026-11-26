@@ -46,6 +46,14 @@ It also carries these source patches, which each Spice branch must keep until up
   this branch's upstream release has it. Without it `S{3,1}` passes `max - min`, which underflows, to
   `handle_repetitions`, which then loops without end (CVE-2026-137057). `tests/test-grammar-parser.cpp` checks that
   such grammars fail. Take upstream's once the branch moves to b12604 or later.
+- **An RPC `COPY_TENSOR` must fit in its destination tensor** (`ggml/src/ggml-rpc/ggml-rpc.cpp`,
+  `rpc_server::copy_tensor`), the copy check of upstream's 03813c56e (ggml-org/llama.cpp#32651, in b12658), ported
+  rather than picked: that commit rewrites the whole RPC server (+513 -747), which this branch's RPC patches conflict
+  with. The server checks a tensor's data against its buffer only when the tensor has elements, so a destination with
+  none could point anywhere, and the copy was checked only against the end of the destination's buffer: a client that
+  learned an address with `BUFFER_GET_BASE` could write below it (CVE-2026-137567). `tests/test-rpc-copy-tensor.cpp`
+  sends such a copy over the wire. The wire format is unchanged. Take upstream's once the branch moves to b12658 or
+  later.
 - **DFlash drafters over GLM-5.3-Flash (`glm5-next`)**, `src/models/glm5-next.cpp`, not upstream. The same
   layer-input recording for `glm5-next`, which has no hook for it, so a DFlash draft over it aborts in
   `llm_graph_result::set_outputs` (layer input tensor is null).
