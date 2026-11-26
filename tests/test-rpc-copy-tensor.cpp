@@ -78,6 +78,7 @@ static constexpr uint64_t BUF_SIZE   = 4096;
 static constexpr uint32_t N_FLOATS   = 64;
 static constexpr uint64_t T_BYTES    = N_FLOATS * sizeof(float);  // 256
 static constexpr uint64_t CACHE_HASH = 0x5eed5eed5eed5eedULL;
+static constexpr uint64_t WRAP       = 0 - T_BYTES;  // an offset that wraps data + offset back by one tensor
 
 static bool send_all(const socket_ptr & sock, const void * msg, uint64_t size) {
     return sock->send_data(msg, size);
@@ -261,7 +262,6 @@ int main() {
         f.write(data.data(), (std::streamsize) data.size());
     }
 
-    const uint64_t WRAP = 0 - T_BYTES;  // an offset that wraps data + offset back by one tensor
     std::string note;
 
     // controls: requests inside the tensor are done
@@ -297,7 +297,7 @@ int main() {
 
     // the commands whose `data + offset` wrapped: a tensor one tensor into the buffer, an offset back by one tensor
     note.clear();
-    expect("SET_TENSOR with an offset that wraps before the tensor", run_case([WRAP](session & s, std::string & n) {
+    expect("SET_TENSOR with an offset that wraps before the tensor", run_case([](session & s, std::string & n) {
         auto msg = set_tensor_msg(f32_tensor(s.lo.remote_ptr, s.lo_base + T_BYTES, N_FLOATS), WRAP, T_BYTES, 0xCD);
         std::vector<uint8_t> lo;
         if (!send_cmd(s.sock, CMD_SET_TENSOR, msg.data(), msg.size()) || !read_lo(s, lo)) return false;
@@ -306,7 +306,7 @@ int main() {
     }, note), outcome::refused, note);
 
     note.clear();
-    expect("SET_TENSOR_MULTI with an offset that wraps before the tensor", run_case([WRAP](session & s, std::string & n) {
+    expect("SET_TENSOR_MULTI with an offset that wraps before the tensor", run_case([](session & s, std::string & n) {
         auto one = set_tensor_msg(f32_tensor(s.lo.remote_ptr, s.lo_base + T_BYTES, N_FLOATS), WRAP, T_BYTES, 0xCD);
         std::vector<uint8_t> msg(sizeof(uint32_t) + sizeof(uint64_t) + one.size());
         const uint32_t n_writes = 1;
@@ -321,7 +321,7 @@ int main() {
     }, note), outcome::refused, note);
 
     note.clear();
-    expect("SET_TENSOR_HASH with an offset that wraps before the tensor", run_case([WRAP](session & s, std::string & n) {
+    expect("SET_TENSOR_HASH with an offset that wraps before the tensor", run_case([](session & s, std::string & n) {
         hash_req req = {f32_tensor(s.lo.remote_ptr, s.lo_base + T_BYTES, N_FLOATS), WRAP, CACHE_HASH};
         hash_rsp rsp = {};
         std::vector<uint8_t> lo;
@@ -331,7 +331,7 @@ int main() {
     }, note), outcome::refused, note);
 
     note.clear();
-    expect("GET_TENSOR with an offset that wraps before the tensor", run_case([WRAP](session & s, std::string & n) {
+    expect("GET_TENSOR with an offset that wraps before the tensor", run_case([](session & s, std::string & n) {
         get_req req = {f32_tensor(s.lo.remote_ptr, s.lo_base + T_BYTES, N_FLOATS), WRAP, T_BYTES};
         std::vector<uint8_t> out(T_BYTES);
         if (!send_cmd(s.sock, CMD_GET_TENSOR, &req, sizeof(req)) || !recv_rsp(s.sock, out.data(), out.size())) return false;
@@ -378,7 +378,7 @@ int main() {
         for (int wrap = 0; wrap < 2; wrap++) {
             note.clear();
             const std::string what = std::string(checked[k]) + (wrap ? " with an offset that wraps before the tensor" : " past the end of the tensor");
-            expect(what.c_str(), run_case([k, wrap, WRAP](session & s, std::string &) {
+            expect(what.c_str(), run_case([k, wrap](session & s, std::string &) {
                 const wire_tensor t = f32_tensor(s.lo.remote_ptr, s.lo_base + (wrap ? T_BYTES : 0), N_FLOATS);
                 const uint64_t offset = wrap ? WRAP : T_BYTES;
                 const uint64_t size   = wrap ? T_BYTES : 16;
