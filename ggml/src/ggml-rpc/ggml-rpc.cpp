@@ -2046,6 +2046,32 @@ static bool rpc_backends_run_bf16_mul_mat(const std::vector<ggml_backend_t> & ba
     });
 }
 
+// Whether a client's region [data + offset, data + offset + size) of `tensor` lies in its buffer and in the tensor, with no
+// step that can wrap: data not below the buffer's base, offset and size each checked against what is left. A region in
+// the buffer but past the tensor is refused too, since ggml_backend_tensor_set/get assert on it, which would end the
+// server. (The region checks of upstream's rpc_check_region, ggml-org/llama.cpp#32651, for the commands that take one.)
+static bool rpc_check_tensor_region(const char * func, const ggml_tensor * tensor, uint64_t data, uint64_t offset,
+                                    uint64_t size) {
+    if (tensor == nullptr || tensor->buffer == nullptr || data == 0) {
+        LOG_ERROR("[%s] invalid or unallocated tensor\n", func);
+        return false;
+    }
+    const uint64_t p0     = (uint64_t) ggml_backend_buffer_get_base(tensor->buffer);
+    const uint64_t bsize  = (uint64_t) ggml_backend_buffer_get_size(tensor->buffer);
+    const uint64_t nbytes = (uint64_t) ggml_nbytes(tensor);
+    if (data < p0 || data - p0 > bsize || offset > bsize - (data - p0) || size > bsize - (data - p0) - offset) {
+        LOG_ERROR("[%s] region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%" PRIu64 ") out of buffer bounds [0x%" PRIx64
+                  ", +%" PRIu64 ")\n", func, data, offset, size, p0, bsize);
+        return false;
+    }
+    if (offset > nbytes || size > nbytes - offset) {
+        LOG_ERROR("[%s] region (offset=%" PRIu64 ", size=%" PRIu64 ") out of tensor '%s' bounds (%" PRIu64 ")\n", func,
+                  offset, size, tensor->name, nbytes);
+        return false;
+    }
+    return true;
+}
+
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
     response.minor = RPC_PROTO_MINOR_VERSION;
@@ -2325,16 +2351,8 @@ bool rpc_server::set_tensor(socket_ptr sock, uint64_t input_size) {
             __func__, rpc_log_format_tensor(tensor).c_str(), (void*)tensor->buffer, tensor->data, offset,
             rpc_log_format_size(size).c_str());
 
-    // sanitize tensor->data
-    {
-        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
-        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
-
-        if (in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 || size > (p1 - in_tensor->data - offset)) {
-            LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
-                           __func__, in_tensor->data, offset, size, p0, p1);
-            return false;
-        }
+    if (!rpc_check_tensor_region(__func__, tensor, in_tensor->data, offset, size)) {
+        return false;
     }
 
     if (cache_dir && cache_flag) {
@@ -2428,16 +2446,8 @@ bool rpc_server::set_tensor_impl(const uint8_t * input, size_t input_size) {
             __func__, rpc_log_format_tensor(tensor).c_str(), (void*)tensor->buffer, tensor->data, offset,
             rpc_log_format_size(size).c_str());
 
-    // sanitize tensor->data
-    {
-        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
-        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
-
-        if (in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 || size > (p1 - in_tensor->data - offset)) {
-            LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
-                           __func__, in_tensor->data, offset, size, p0, p1);
-            return false;
-        }
+    if (!rpc_check_tensor_region(__func__, tensor, in_tensor->data, offset, size)) {
+        return false;
     }
 
     const void * data = input + header_size;
@@ -2566,18 +2576,8 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
             __func__, rpc_log_format_tensor(tensor).c_str(), (void*)tensor->buffer, tensor->data, request.offset,
             rpc_log_format_size(size).c_str(), request.hash);
 
-    // sanitize tensor->data
-    {
-        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
-        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
-
-        if (request.tensor.data + request.offset < p0
-         || request.tensor.data + request.offset >= p1
-         || size > (p1 - request.tensor.data - request.offset)) {
-            LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu, hash=0x%" PRIx64 ") out of buffer bounds [0x%zx, 0x%zx)\n",
-                           __func__, request.tensor.data, request.offset, size, request.hash, p0, p1);
-            return false;
-        }
+    if (!rpc_check_tensor_region(__func__, tensor, request.tensor.data, request.offset, size)) {
+        return false;
     }
     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
     response.result = 1;
@@ -2643,18 +2643,8 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
              rpc_log_format_tensor(tensor).c_str(), (void*)tensor->buffer, tensor->data, request.offset,
              rpc_log_format_size(request.size).c_str());
 
-    // sanitize tensor->data
-    {
-        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
-        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
-
-        if (request.tensor.data + request.offset < p0 ||
-            request.tensor.data + request.offset >= p1 ||
-            request.size > (p1 - request.tensor.data - request.offset)) {
-                LOG_ERROR("[%s] requested tensor region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%" PRIu64 ") out of buffer bounds [0x%zx, 0x%zx)\n",
-                               __func__, request.tensor.data, request.offset, request.size, p0, p1);
-                return false;
-        }
+    if (!rpc_check_tensor_region(__func__, tensor, request.tensor.data, request.offset, request.size)) {
+        return false;
     }
 
     response.resize(request.size, 0);
@@ -2732,29 +2722,10 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
         return false;
     }
 
-    uint64_t src_size   = (uint64_t) ggml_nbytes(src);
-    uint64_t dst_data   = (uint64_t) dst->data;
-    uint64_t dst_base   = (uint64_t) ggml_backend_buffer_get_base(dst->buffer);
-    uint64_t dst_buf_sz = (uint64_t) ggml_backend_buffer_get_size(dst->buffer);
-
     // deserialize_tensor checks only a tensor with elements against its buffer, so a dst with none may point anywhere:
-    // the copy must fit in dst itself, which then lies inside its buffer (upstream's rpc_check_region in copy_tensor,
+    // the copy must fit in dst itself, inside its buffer (upstream's rpc_check_region in copy_tensor,
     // ggml-org/llama.cpp#32651, CVE-2026-137567)
-    if (dst->data == nullptr || src_size > (uint64_t) ggml_nbytes(dst)) {
-        LOG_ERROR("[%s] copy of %" PRIu64 " bytes does not fit in dst tensor '%s' (%" PRIu64 " bytes)\n",
-                  __func__, src_size, dst->name, (uint64_t) ggml_nbytes(dst));
-        return false;
-    }
-
-    if (dst_data < dst_base || dst_data + src_size < dst_data || dst_data + src_size > dst_base + dst_buf_sz) {
-        LOG_ERROR("[%s] out-of-bounds write in rpc_server::copy_tensor:\n"
-                         "    write range : [0x%" PRIx64 ", 0x%" PRIx64 "]\n"
-                         "    buffer base: [0x%" PRIx64 ", 0x%" PRIx64 "]\n",
-                         __func__,
-                         dst_data,
-                         dst_data + src_size,
-                         dst_base,
-                         dst_base + dst_buf_sz);
+    if (!rpc_check_tensor_region(__func__, dst, (uint64_t) dst->data, 0, (uint64_t) ggml_nbytes(src))) {
         return false;
     }
 

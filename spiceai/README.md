@@ -52,8 +52,11 @@ It also carries these source patches, which each Spice branch must keep until up
   with. The server checks a tensor's data against its buffer only when the tensor has elements, so a destination with
   none could point anywhere, and the copy was checked only against the end of the destination's buffer: a client that
   learned an address with `BUFFER_GET_BASE` could write below it (CVE-2026-137567). `tests/test-rpc-copy-tensor.cpp`
-  sends such a copy over the wire. The wire format is unchanged. Take upstream's once the branch moves to b12658 or
-  later.
+  sends such a copy over the wire. The same commit's region check is taken for `SET_TENSOR`, `SET_TENSOR_MULTI`,
+  `SET_TENSOR_HASH` and `GET_TENSOR` (`rpc_check_tensor_region`): they checked `data + offset`, a sum that wraps, and a
+  region inside the buffer but past the tensor reached `ggml_backend_tensor_set`/`get`'s assert, which ended the
+  server. The test covers each, and that `MEMSET_TENSOR`, `SET_TENSOR_2D` and `GET_TENSOR_2D` still refuse both.
+  The wire format is unchanged. Take upstream's once the branch moves to b12658 or later.
 - **DFlash drafters over GLM-5.3-Flash (`glm5-next`)**, `src/models/glm5-next.cpp`, not upstream. The same
   layer-input recording for `glm5-next`, which has no hook for it, so a DFlash draft over it aborts in
   `llm_graph_result::set_outputs` (layer input tensor is null).
